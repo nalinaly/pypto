@@ -26,10 +26,14 @@ import struct
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pypto.runtime.device_tensor import DeviceTensor
 
 # Mirrors comm_context.h. Do not reorder without coordinating pto-isa.
 COMM_CONTEXT_SIZE = 1056
+COMM_CTX_SLOT = "_comm_ctx"
 COMM_MAX_RANK_NUM = 64
 _OFF_RANK_ID = 16
 _OFF_RANK_NUM = 20
@@ -112,6 +116,14 @@ class ShmemWindow:
     device_ctx_tensor: Any
     device_ctx_ptr: int
 
+    def as_device_tensor(self, slot: str, shape: Sequence[int], dtype: Any) -> DeviceTensor:
+        """Wrap a carved SHMEM slice as a worker-resident :class:`DeviceTensor`."""
+        from pypto.runtime.device_tensor import DeviceTensor
+
+        if slot not in self.offsets:
+            raise KeyError(f"unknown SHMEM slot {slot!r}; have {sorted(self.offsets)}")
+        return DeviceTensor(self.local_base + self.offsets[slot], shape, dtype)
+
 
 def acquire_gloo_shmem_window(
     *,
@@ -135,9 +147,15 @@ def acquire_gloo_shmem_window(
         raise ValueError("slot_names and slot_nbytes length mismatch")
     if len(set(slot_names)) != len(slot_names):
         raise ValueError(f"duplicate slot names: {slot_names}")
+    if COMM_CTX_SLOT in slot_names:
+        raise ValueError(f"{COMM_CTX_SLOT!r} is reserved for the packed CommContext")
 
-    offsets_list, window_bytes = carve_window_layout(slot_nbytes)
-    offsets = dict(zip(slot_names, offsets_list, strict=True))
+    # CommContext lives in the SHMEM heap so TSTORE/TPUT can load windowsIn[]
+    # from the same GVA space as the data slices (not a private torch.empty).
+    all_names = (COMM_CTX_SLOT, *slot_names)
+    all_nbytes = (COMM_CONTEXT_SIZE, *slot_nbytes)
+    offsets_list, window_bytes = carve_window_layout(all_nbytes)
+    offsets = dict(zip(all_names, offsets_list, strict=True))
 
     if group_name is None:
         group_name = dist.group.WORLD.group_name
@@ -152,8 +170,9 @@ def acquire_gloo_shmem_window(
     local_base = peer_bases[rank]
 
     ctx_host = pack_comm_context(rank, world_size, window_bytes, peer_bases)
-    device_ctx_tensor = torch.empty((COMM_CONTEXT_SIZE,), dtype=torch.uint8, device=device)
-    device_ctx_tensor.copy_(torch.frombuffer(bytearray(ctx_host), dtype=torch.uint8))
+    ctx_off = offsets[COMM_CTX_SLOT]
+    device_ctx_tensor = tensor[ctx_off : ctx_off + COMM_CONTEXT_SIZE]
+    device_ctx_tensor.copy_(torch.frombuffer(bytearray(ctx_host), dtype=torch.uint8).to(device))
     torch.npu.synchronize()
 
     return ShmemWindow(

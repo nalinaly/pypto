@@ -31,6 +31,7 @@ from pypto.backend import BackendType
 from pypto.pypto_core import DataType
 from pypto.pypto_core import backend as _backend_core
 from pypto.pypto_core.ir import (
+    CommCtxType,
     ConstInt,
     Function,
     FunctionType,
@@ -213,10 +214,14 @@ def _extract_func_param_infos(func: Function) -> tuple[list[_ParamInfo], list[in
             shape = _to_runtime_shape(logical_shape, dtype)
         elif isinstance(param_type, ScalarType):
             dtype = param_type.dtype
+        elif isinstance(param_type, CommCtxType):
+            # MaterializeDistTensorCtx appends one GM pointer per DistributedTensor.
+            # ChipWorker / build_orch_args pass it as a uint64 scalar.
+            dtype = DataType.UINT64
         else:
             raise TypeError(
                 f"Unsupported parameter type for {param.name_hint!r}: {type(param_type).__name__}. "
-                f"Expected ShapedType or ScalarType."
+                f"Expected ShapedType, ScalarType, or CommCtxType."
             )
 
         param_infos.append(_ParamInfo(name=param.name_hint, direction=direction, shape=shape, dtype=dtype))

@@ -10,8 +10,11 @@
 """Unit tests for Gloo + torch_npu SHMEM window helpers and live-input goldens."""
 
 import torch
+from pypto.runtime.device_tensor import DeviceTensor
 from pypto.runtime.shmem_gloo import (
     COMM_CONTEXT_SIZE,
+    COMM_CTX_SLOT,
+    ShmemWindow,
     align_up,
     allreduce_sum_expected,
     carve_window_layout,
@@ -57,6 +60,32 @@ def test_import_window_buffer_is_exported() -> None:
 
     assert hasattr(pld, "import_window_buffer")
     assert hasattr(pld.tensor, "import_window_buffer")
+
+
+def test_comm_ctx_slot_is_first_carved_region() -> None:
+    offsets, total = carve_window_layout([COMM_CONTEXT_SIZE, 2048])
+    assert offsets[0] == 0
+    assert offsets[1] == align_up(COMM_CONTEXT_SIZE)
+    assert COMM_CTX_SLOT == "_comm_ctx"
+    assert total == align_up(COMM_CONTEXT_SIZE) + 2048
+
+
+def test_as_device_tensor_uses_slot_offset() -> None:
+    window = ShmemWindow(
+        tensor=None,
+        handle=None,
+        window_bytes=4096,
+        local_base=0x1000,
+        peer_bases=[0x1000, 0x2000],
+        offsets={"data_buf": 32},
+        device_ctx_tensor=None,
+        device_ctx_ptr=0x1000,
+    )
+    dt = window.as_device_tensor("data_buf", (1, 8), torch.float16)
+    assert isinstance(dt, DeviceTensor)
+    assert dt.data_ptr == 0x1000 + 32
+    assert dt.shape == (1, 8)
+    assert dt.dtype == torch.float16
 
 
 def test_allreduce_sum_golden_from_live_inputs() -> None:
