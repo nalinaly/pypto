@@ -31,6 +31,7 @@ from .log_config import _ensure_configured as _ensure_log_configured
 from .log_config import configure_log
 from .log_config import current_level as log_level
 from .runner import RunConfig, RunResult, compile_program, execute_compiled, run
+from . import shmem_gloo
 from .runtime_base import Worker
 from .tensor_spec import ScalarSpec, TensorSpec
 from .worker import ChipWorker, RegistrationHandle
@@ -59,6 +60,7 @@ __all__ = [
     "RunConfig",
     "RunResult",
     "ScalarSpec",
+    "shmem_gloo",
     "TensorSpec",
     "Worker",
 ]

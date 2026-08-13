@@ -1622,7 +1622,9 @@ class ASTParser:
         # The printer adds a ``pl.Ptr`` annotation for clarity; route the
         # annotated form through the same dedicated alloc parser as the
         # unannotated form.
-        if is_ptr_type_annotation and _is_pld_call(stmt.value, "alloc_window_buffer"):
+        if is_ptr_type_annotation and (
+            _is_pld_call(stmt.value, "alloc_window_buffer") or _is_pld_call(stmt.value, "import_window_buffer")
+        ):
             self._parse_alloc_window_buffer_assignment(stmt.target, stmt.value)
             return
 
@@ -1851,7 +1853,9 @@ class ASTParser:
         # Intercept ``buf = pld.[tensor.]alloc_window_buffer(...)``: the alloc
         # op derives its ``name`` kwarg from the LHS, and the LHS name must be
         # globally unique within the @pl.program.
-        if len(stmt.targets) == 1 and _is_pld_call(stmt.value, "alloc_window_buffer"):
+        if len(stmt.targets) == 1 and (
+            _is_pld_call(stmt.value, "alloc_window_buffer") or _is_pld_call(stmt.value, "import_window_buffer")
+        ):
             self._parse_alloc_window_buffer_assignment(stmt.targets[0], stmt.value)
             return
 
@@ -2206,8 +2210,14 @@ class ASTParser:
 
         # Route through invoke_dsl — same path as _dispatch_op. Arity, size
         # type, unknown kwargs are validated by the DSL wrapper / IR / C++.
+        # import_window_buffer is a runtime-backing alias of the same IR marker.
+        dsl_fn = (
+            _dsl_pld.import_window_buffer
+            if _is_pld_call(value, "import_window_buffer")
+            else _dsl_pld.alloc_window_buffer
+        )
         alloc_call = invoke_dsl(
-            _dsl_pld.alloc_window_buffer,
+            dsl_fn,
             args,
             {**user_kwargs, "name": name},
             span,
@@ -8500,13 +8510,13 @@ class ASTParser:
         """
         span = self.span_tracker.get_span(call)
 
-        if op_name == "alloc_window_buffer":
+        if op_name in ("alloc_window_buffer", "import_window_buffer"):
             raise ParserSyntaxError(
-                "pld.tensor.alloc_window_buffer must appear as the RHS of a simple assignment "
+                f"pld.tensor.{op_name} must appear as the RHS of a simple assignment "
                 "(its result must be bound to a named variable)",
                 span=span,
-                hint="Write 'buf = pld.tensor.alloc_window_buffer(N)' "
-                "(or the short form 'buf = pld.alloc_window_buffer(N)')",
+                hint=f"Write 'buf = pld.tensor.{op_name}(N)' "
+                f"(or the short form 'buf = pld.{op_name}(N)')",
             )
 
         if op_name == "world_size":

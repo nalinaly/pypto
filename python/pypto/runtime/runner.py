@@ -258,6 +258,10 @@ class RunConfig:
     distributed_config: "DistributedConfig | None" = None
     analyze_auto_scopes_for_deps: bool = False
     memory_planner: MemoryPlanner | None = None
+    # Runtime-only: replaces orch.allocate_domain in generated host orch.
+    # Compile ignores this field. Typical value is
+    # pypto.runtime.shmem_gloo.make_shmem_domain_provider(...).
+    domain_provider: Callable[..., Any] | None = None
 
     def __post_init__(self) -> None:
         if self.platform not in ("a2a3sim", "a2a3", "a5sim", "a5"):

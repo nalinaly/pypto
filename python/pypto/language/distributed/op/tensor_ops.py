@@ -263,6 +263,32 @@ def alloc_window_buffer(  # type: ignore[no-redef]
     return Ptr(expr=call)
 
 
+@overload
+def import_window_buffer(size: IntLike, *, name: str = "") -> Ptr: ...
+
+
+@overload
+def import_window_buffer(shape: Sequence[IntLike], *, dtype: DataType, name: str = "") -> Ptr: ...
+
+
+def import_window_buffer(  # type: ignore[no-redef]
+    size: IntLike | Sequence[IntLike], *, dtype: DataType | None = None, name: str = ""
+) -> Ptr:
+    """Declare a window-buffer slot backed by an external address at runtime.
+
+    Compile-time this is the same IR marker as :func:`alloc_window_buffer`
+    (so ``MaterializeCommDomainScopes`` still builds the domain). Runtime
+    backing must come from ``RunConfig.domain_provider`` — typically
+    :func:`pypto.runtime.shmem_gloo.make_shmem_domain_provider` over a
+    torch_npu symmetric-memory window. The HCCL/HCCP
+    ``orch.allocate_domain`` path is not used when that provider is set.
+
+    The assignment LHS name must match a key in the provider's buffer
+    layout (same parser injection as ``alloc_window_buffer``).
+    """
+    return alloc_window_buffer(size, dtype=dtype, name=name)
+
+
 def window(
     buf: Ptr,
     shape: Sequence[IntLike],
@@ -277,8 +303,11 @@ def window(
     in later.
 
     Args:
-        buf: A :class:`pl.Ptr` produced by :func:`alloc_window_buffer` (or a
-            raw :class:`ir.Expr` of type :class:`ir.PtrType`).
+        buf: A :class:`pl.Ptr` produced by :func:`alloc_window_buffer` or
+            :func:`import_window_buffer` (or a raw :class:`ir.Expr` of type
+            :class:`ir.PtrType`). An integer host address is not a compile-time
+            input — bind the slot with :func:`import_window_buffer` and supply
+            the bytes through ``RunConfig.domain_provider``.
         shape: Per-rank shape (list / tuple of ints, DSL ``Scalar``s, or raw
             ``ir.Expr``s — anything :data:`IntLike` accepts).
         dtype: Element data type. Kwarg-only.
@@ -1067,6 +1096,7 @@ __all__ = [
     "all_to_all_v",
     "alloc_window_buffer",
     "allgather",
+    "import_window_buffer",
     "allreduce",
     "barrier",
     "broadcast",
