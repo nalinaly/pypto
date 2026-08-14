@@ -15,8 +15,9 @@ codegen 再用它降低 `pld.system.rank`、`pld.system.nranks`、`notify`、`wa
 
 1. 对每个带 `DistributedTensorType` 参数的函数，按分布式 tensor 参数顺序在签名
    末尾追加 `CommCtxType` 参数，方向为 `ParamDirection::In`。
-2. 对每个调用点追加对应 ctx 实参。若 distributed tensor 是调用者自己的参数，
-   则转发调用者已有的 ctx 参数；否则在调用前插入
+2. 对每个调用点追加对应 ctx 实参。若 distributed tensor 是调用者自己的参数或其
+   SSA alias，则转发调用者已有的 ctx 参数。alias 追踪覆盖 user call 显式返回的
+   参数 writeback，以及经 `ForStmt` / `WhileStmt` 携带的 tensor；否则在调用前插入
    `pld.system.get_comm_ctx(dist)` 绑定并传递该结果。
 3. 若调用点已有 `arg_directions`，同步追加 `ArgDirection::Scalar`，让后续
    codegen 把 ctx 当作普通 scalar task payload 处理。

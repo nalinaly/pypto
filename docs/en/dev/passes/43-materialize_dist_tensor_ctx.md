@@ -17,8 +17,10 @@ sites. This pass makes the ctx flow explicit in IR instead:
    `CommCtxType` parameters at the tail of the signature, in distributed-tensor
    parameter order. The appended parameters are `ParamDirection::In`.
 2. For every `Call` / `Submit` to such a function, append matching ctx args.
-   If the distributed tensor arg is a caller parameter, forward the caller's
-   materialized ctx parameter. Otherwise, bind
+   If the distributed tensor arg is a caller parameter or an SSA alias of one,
+   forward the caller's materialized ctx parameter. Alias tracking includes
+   explicit parameter writebacks returned by user calls and tensor values
+   carried through `ForStmt` / `WhileStmt`. Otherwise, bind
    `pld.system.get_comm_ctx(dist)` immediately before the call and pass that
    result.
 3. If call-site `arg_directions` are already resolved, append matching

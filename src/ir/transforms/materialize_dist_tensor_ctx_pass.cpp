@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -31,6 +32,7 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
+#include "pypto/ir/transforms/utils/return_lineage_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -41,6 +43,7 @@ namespace {
 struct FunctionCtxPlan {
   std::vector<size_t> dist_param_indices;
   std::unordered_map<const Var*, VarPtr> param_to_ctx;
+  std::vector<std::optional<size_t>> returned_param_indices;
 };
 
 [[nodiscard]] bool IsDistTensor(const ExprPtr& expr) {
@@ -94,6 +97,7 @@ class LocalNameCollector : public IRVisitor {
 [[nodiscard]] FunctionCtxPlan BuildFunctionCtxPlan(const FunctionPtr& func) {
   FunctionCtxPlan plan;
   if (!func) return plan;
+  plan.returned_param_indices = return_lineage::ExplicitReturnedParamIndices(func);
   std::unordered_set<std::string> used_names;
   for (const auto& param : func->params_) {
     used_names.insert(param->name_hint_);
@@ -124,23 +128,36 @@ class LocalNameCollector : public IRVisitor {
 
 class DistParamAliasCollector : public IRVisitor {
  public:
-  explicit DistParamAliasCollector(const FunctionCtxPlan* plan) : plan_(plan) {}
+  DistParamAliasCollector(ProgramPtr program, const std::unordered_map<std::string, FunctionCtxPlan>* plans,
+                          const FunctionCtxPlan* plan)
+      : program_(std::move(program)), plans_(plans), plan_(plan) {}
   std::unordered_map<const Var*, VarPtr> alias_to_ctx;
 
  protected:
   void VisitStmt_(const AssignStmtPtr& op) override {
     if (op && op->var_ && As<DistributedTensorType>(op->var_->GetType())) {
-      if (auto src = AsVarLike(op->value_)) {
-        if (auto ctx = LookupCtx(src.get())) {
-          alias_to_ctx[op->var_.get()] = ctx;
-        }
+      if (auto ctx = LookupCtx(op->value_)) {
+        alias_to_ctx[op->var_.get()] = ctx;
       }
+    } else if (op && op->var_ && As<TupleType>(op->var_->GetType())) {
+      auto returned_ctxs = ReturnedCtxs(op->value_);
+      if (!returned_ctxs.empty()) tuple_to_ctx_[op->var_.get()] = std::move(returned_ctxs);
     }
     IRVisitor::VisitStmt_(op);
   }
 
+  void VisitStmt_(const ForStmtPtr& op) override {
+    RecordLoopCarries(op->iter_args_, op->return_vars_);
+    IRVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const WhileStmtPtr& op) override {
+    RecordLoopCarries(op->iter_args_, op->return_vars_);
+    IRVisitor::VisitStmt_(op);
+  }
+
  private:
-  VarPtr LookupCtx(const Var* var) const {
+  VarPtr LookupVarCtx(const Var* var) const {
     if (!plan_) return nullptr;
     auto param_it = plan_->param_to_ctx.find(var);
     if (param_it != plan_->param_to_ctx.end()) return param_it->second;
@@ -149,7 +166,70 @@ class DistParamAliasCollector : public IRVisitor {
     return nullptr;
   }
 
+  VarPtr LookupCtx(const ExprPtr& expr) const {
+    if (auto var = AsVarLike(expr)) return LookupVarCtx(var.get());
+    auto get_item = As<TupleGetItemExpr>(expr);
+    if (get_item && get_item->index_ >= 0) {
+      auto tuple_var = AsVarLike(get_item->tuple_);
+      if (!tuple_var) return nullptr;
+      auto tuple_it = tuple_to_ctx_.find(tuple_var.get());
+      if (tuple_it == tuple_to_ctx_.end()) return nullptr;
+      const auto index = static_cast<size_t>(get_item->index_);
+      if (index >= tuple_it->second.size()) return nullptr;
+      return tuple_it->second[index];
+    }
+    if (As<Call>(expr)) {
+      auto returned_ctxs = ReturnedCtxs(expr);
+      if (returned_ctxs.size() == 1) return returned_ctxs[0];
+    }
+    return nullptr;
+  }
+
+  std::vector<VarPtr> ReturnedCtxs(const ExprPtr& expr) const {
+    if (auto tuple_var = AsVarLike(expr)) {
+      auto it = tuple_to_ctx_.find(tuple_var.get());
+      return it == tuple_to_ctx_.end() ? std::vector<VarPtr>{} : it->second;
+    }
+
+    // A Submit result is augmented with runtime-created outputs and TASK_ID,
+    // so its tuple positions do not match the callee's flat returns. Keep the
+    // existing get_comm_ctx fallback for that distinct layout until it has an
+    // explicit result-position map.
+    auto call = As<Call>(expr);
+    auto gvar = call ? As<GlobalVar>(call->op_) : nullptr;
+    if (!gvar || !program_ || !plans_) return {};
+    auto callee = program_->GetFunction(gvar->name_);
+    if (!callee) return {};
+    auto plan_it = plans_->find(callee->name_);
+    if (plan_it == plans_->end()) return {};
+
+    std::vector<VarPtr> result(plan_it->second.returned_param_indices.size());
+    for (size_t result_idx = 0; result_idx < result.size(); ++result_idx) {
+      const auto& param_idx = plan_it->second.returned_param_indices[result_idx];
+      if (!param_idx || *param_idx >= call->args_.size() || *param_idx >= callee->params_.size()) continue;
+      if (!As<DistributedTensorType>(callee->params_[*param_idx]->GetType())) continue;
+      result[result_idx] = LookupCtx(call->args_[*param_idx]);
+    }
+    return result;
+  }
+
+  void RecordLoopCarries(const std::vector<IterArgPtr>& iter_args, const std::vector<VarPtr>& return_vars) {
+    for (size_t i = 0; i < iter_args.size(); ++i) {
+      const auto& iter_arg = iter_args[i];
+      if (!iter_arg || !As<DistributedTensorType>(iter_arg->GetType())) continue;
+      auto ctx = LookupCtx(iter_arg->initValue_);
+      if (!ctx) continue;
+      alias_to_ctx[iter_arg.get()] = ctx;
+      if (i < return_vars.size() && As<DistributedTensorType>(return_vars[i]->GetType())) {
+        alias_to_ctx[return_vars[i].get()] = ctx;
+      }
+    }
+  }
+
+  ProgramPtr program_;
+  const std::unordered_map<std::string, FunctionCtxPlan>* plans_;
   const FunctionCtxPlan* plan_;
+  std::unordered_map<const Var*, std::vector<VarPtr>> tuple_to_ctx_;
 };
 
 class MaterializeDistTensorCtxMutator : public IRMutator {
@@ -171,7 +251,7 @@ class MaterializeDistTensorCtxMutator : public IRMutator {
     auto it = plans_.find(func->name_);
     if (it != plans_.end()) {
       current_plan_ = &it->second;
-      DistParamAliasCollector alias_collector(current_plan_);
+      DistParamAliasCollector alias_collector(program_, &plans_, current_plan_);
       alias_collector.VisitStmt(func->body_);
       current_alias_to_ctx_ = std::move(alias_collector.alias_to_ctx);
     }

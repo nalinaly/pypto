@@ -695,6 +695,49 @@ class TestMultiFuncIntegration:
         assert "add_incore" in func_names
         assert "add_entry" in func_names
 
+    def test_repeated_distributed_incore_dispatch_reuses_comm_ctx(self):
+        """JIT call-return rebinding must not materialize ctx inside orchestration."""
+
+        @jit.incore
+        def comm(
+            data: pl.InOut[pld.DistributedTensor[[4], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[2], pl.INT32]],
+        ) -> tuple[pld.DistributedTensor[[4], pl.FP32], pld.DistributedTensor[[2], pl.INT32]]:
+            return data, signal
+
+        @jit.incore
+        def compute(value: pl.InOut[pl.Tensor[[4], pl.FP32]]) -> pl.Tensor[[4], pl.FP32]:
+            return value
+
+        @jit
+        def entry(
+            data: pl.InOut[pld.DistributedTensor[[4], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[2], pl.INT32]],
+            value: pl.InOut[pl.Tensor[[4], pl.FP32]],
+        ) -> pl.Tensor[[4], pl.FP32]:
+            data, signal = comm(data, signal)
+            value = compute(value)
+            data, signal = comm(data, signal)
+            return value
+
+        post = entry.lower()
+        entry_func = post.get_function("entry")
+        assert entry_func is not None
+
+        calls: dict[str, list[ir.Call]] = {}
+
+        class _Collector(ir.IRVisitor):
+            def visit_call(self, op: ir.Call) -> None:
+                calls.setdefault(op.op.name, []).append(op)
+                super().visit_call(op)
+
+        _Collector().visit_stmt(entry_func.body)
+        comm_calls = calls.get("comm", [])
+
+        assert len(comm_calls) == 2
+        assert calls.get("pld.system.get_comm_ctx", []) == []
+        assert all(list(call.args[-2:]) == list(entry_func.params[-2:]) for call in comm_calls)
+
     def test_multi_func_cache_hit(self, monkeypatch, tmp_path):
         """Two multi-function JIT calls with same shapes reuse the cached program."""
         torch = pytest.importorskip("torch")

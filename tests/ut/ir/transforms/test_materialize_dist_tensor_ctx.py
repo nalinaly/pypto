@@ -315,11 +315,18 @@ def test_materialized_local_comm_ctx_name_avoids_existing_local():
 
     data = ir.Var("data", data_ty, span)
     source_data = ir.Var("source_data", data_ty, span)
+    produced_data = ir.Var("produced_data", data_ty, span)
     producer = ir.Function(
         "producer",
         [(source_data, ir.ParamDirection.In)],
         [data_ty],
-        ir.ReturnStmt([source_data], span),
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(produced_data, source_data, span),
+                ir.ReturnStmt([produced_data], span),
+            ],
+            span,
+        ),
         span,
         ir.FunctionType.InCore,
     )
@@ -437,17 +444,146 @@ def test_param_alias_forwards_materialized_comm_ctx_param():
     assert call_after.args[-1] is main_after.params[-1]
 
 
+def test_repeated_inout_dispatch_reuses_materialized_comm_ctx_params():
+    """A returned InOut DistributedTensor keeps its caller-side CommCtx.
+
+    The second ``comm`` call mirrors a fused tensor-parallel layer: the same
+    communication kernel runs on both sides of an unrelated compute kernel.
+    NormalizeReturnOrder has made the communication kernel's writeback
+    lineage explicit, so rebinding its returned DistributedTensor must not
+    synthesize an InCore-only ``pld.system.get_comm_ctx`` in orchestration.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def comm(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[4], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[2], pl.INT32]],
+        ) -> tuple[pld.DistributedTensor[[4], pl.FP32], pld.DistributedTensor[[2], pl.INT32]]:
+            return data, signal
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(self, value: pl.InOut[pl.Tensor[[4], pl.FP32]]) -> pl.Tensor[[4], pl.FP32]:
+            return value
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[4], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[2], pl.INT32]],
+            value: pl.InOut[pl.Tensor[[4], pl.FP32]],
+        ) -> pl.Tensor[[4], pl.FP32]:
+            data, signal = self.comm(data, signal)
+            value = self.compute(value)
+            data, signal = self.comm(data, signal)
+            return value
+
+    result = _apply(passes.convert_to_ssa()(P))
+    main = _get_func(result, "main")
+    comm_calls = _collect_calls(main.body, "comm")
+
+    assert len(comm_calls) == 2
+    assert _collect_calls(main.body, "pld.system.get_comm_ctx") == []
+    assert list(comm_calls[0].args[-2:]) == list(main.params[-2:])
+    assert list(comm_calls[1].args[-2:]) == list(main.params[-2:])
+
+
+def test_repeated_single_result_dispatch_reuses_materialized_comm_ctx_param():
+    """A directly bound DistributedTensor call result keeps its CommCtx."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def comm(
+            self, data: pl.InOut[pld.DistributedTensor[[4], pl.FP32]]
+        ) -> pld.DistributedTensor[[4], pl.FP32]:
+            return data
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(self, value: pl.InOut[pl.Tensor[[4], pl.FP32]]) -> pl.Tensor[[4], pl.FP32]:
+            return value
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[4], pl.FP32]],
+            value: pl.InOut[pl.Tensor[[4], pl.FP32]],
+        ) -> pl.Tensor[[4], pl.FP32]:
+            data = self.comm(data)
+            value = self.compute(value)
+            data = self.comm(data)
+            return value
+
+    result = _apply(passes.convert_to_ssa()(P))
+    main = _get_func(result, "main")
+    comm_calls = _collect_calls(main.body, "comm")
+
+    assert len(comm_calls) == 2
+    assert _collect_calls(main.body, "pld.system.get_comm_ctx") == []
+    assert comm_calls[0].args[-1] is main.params[-1]
+    assert comm_calls[1].args[-1] is main.params[-1]
+
+
+def test_loop_carried_dispatch_reuses_materialized_comm_ctx_params():
+    """SSA loop iter-args and return-vars preserve DistributedTensor contexts."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def comm(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[4], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[2], pl.INT32]],
+        ) -> tuple[pld.DistributedTensor[[4], pl.FP32], pld.DistributedTensor[[2], pl.INT32]]:
+            return data, signal
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def compute(self, value: pl.InOut[pl.Tensor[[4], pl.FP32]]) -> pl.Tensor[[4], pl.FP32]:
+            return value
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[4], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[2], pl.INT32]],
+            value: pl.InOut[pl.Tensor[[4], pl.FP32]],
+        ) -> pl.Tensor[[4], pl.FP32]:
+            for _layer in pl.range(2):
+                data, signal = self.comm(data, signal)
+                value = self.compute(value)
+            data, signal = self.comm(data, signal)
+            return value
+
+    result = _apply(passes.convert_to_ssa()(P))
+    main = _get_func(result, "main")
+    comm_calls = _collect_calls(main.body, "comm")
+
+    assert len(comm_calls) == 2
+    assert _collect_calls(main.body, "pld.system.get_comm_ctx") == []
+    assert list(comm_calls[0].args[-2:]) == list(main.params[-2:])
+    assert list(comm_calls[1].args[-2:]) == list(main.params[-2:])
+
+
 def test_unsupported_expression_context_rejects_synthesized_prefix():
     span = _span()
     data_ty = _dist_ty()
     bool_ty = ir.ScalarType(DataType.BOOL)
 
     producer_data = ir.Var("data", data_ty, span)
+    produced_data = ir.Var("produced_data", data_ty, span)
     producer = ir.Function(
         "producer",
         [(producer_data, ir.ParamDirection.In)],
         [data_ty],
-        ir.ReturnStmt([producer_data], span),
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(produced_data, producer_data, span),
+                ir.ReturnStmt([produced_data], span),
+            ],
+            span,
+        ),
         span,
         ir.FunctionType.InCore,
     )
@@ -545,7 +681,7 @@ def test_submit_prefix_runtime_out_keeps_ctx_after_passed_args():
     assert list(submit_after.arg_directions) == [ir.ArgDirection.Input, ir.ArgDirection.Scalar]
 
 
-def test_return_call_materializes_local_ctx_prefix():
+def test_return_call_reuses_returned_param_ctx():
     span = _span()
     data_ty = _dist_ty()
     ret_ty = ir.ScalarType(DataType.INDEX)
@@ -611,7 +747,6 @@ def test_return_call_materializes_local_ctx_prefix():
     exp_main_source_data = ir.Var("source_data", data_ty, span)
     exp_main_source_ctx_param = ir.Var("source_data_ctx", ir.CommCtxType.get(), span)
     exp_local_data = ir.Var("data", data_ty, span)
-    exp_local_ctx = ir.Var("data_ctx", ir.CommCtxType.get(), span)
     exp_producer_call_ty = ir.TupleType([])
     exp_producer_call = ir.Call(
         ir.GlobalVar("producer"),
@@ -621,10 +756,9 @@ def test_return_call_materializes_local_ctx_prefix():
         exp_producer_call_ty,
         span,
     )
-    exp_get_ctx = ir.create_op_call("pld.system.get_comm_ctx", [exp_local_data], {}, span)
     exp_call = ir.Call(
         ir.GlobalVar("callee"),
-        [exp_local_data, exp_local_ctx],
+        [exp_local_data, exp_main_source_ctx_param],
         {},
         {"arg_directions": [ir.ArgDirection.Input, ir.ArgDirection.Scalar]},
         ret_ty,
@@ -637,7 +771,6 @@ def test_return_call_materializes_local_ctx_prefix():
         ir.SeqStmts(
             [
                 ir.AssignStmt(exp_local_data, exp_producer_call, span),
-                ir.AssignStmt(exp_local_ctx, exp_get_ctx, span),
                 ir.ReturnStmt([exp_call], span),
             ],
             span,
