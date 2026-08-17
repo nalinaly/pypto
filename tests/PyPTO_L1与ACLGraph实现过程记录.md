@@ -1911,6 +1911,8 @@ strong `build_l1_hbg_graph_plan_impl` 的输入包括：
 
 #### 10.30.5 external tensor只借用，host view强制read-only
 
+> **10.35后的实现修正：** 本节记录的是 `2873feae` 当时的过渡方案。`74d0ff65` 已进一步取消HBG L1 host build中的全部device-tensor host mapping：read-only mapping也不够，因为host launch时caller stream上的predecessor可能尚未完成，地址可映射不等于数据已经按stream语义可读。当前L1 builder不注册任何host tensor region，`get_tensor_data/set_tensor_data`都会fail-closed，只允许metadata、device address、host scalar和拓扑参与构图。L2 HBG原有staging/mapping路径不变。后续应以10.39的现行结论为准。
+
 L1约束要求输入输出storage由调用方拥有。HBG host orchestration又可能调用 `get_tensor_data/set_tensor_data`，这两者必须和graph payload lifetime分开处理。
 
 本轮strong build hook采取保守规则：
@@ -2818,3 +2820,480 @@ runtime阶段提交：
 8. capability继续关闭，直到device 1完成同graph多次replay、A/B captured node交替、host owner释放压力和large-args边界实证。
 
 这里尤其不能把 `l1_hbg_execution_slot_registration_enqueued_`当作task package lease。它只保护context registration与其引用window；每个graph blob的lifetime仍必须由CANN task/graph或显式package lease独立承担。
+
+### 10.35 HBG任务级graph package正式接入L1 launch主线
+
+#### 10.35.1 本阶段回答的核心问题
+
+用户补充的第二阶段原则是：每次动态build出来并H2D到device的graph，本质上是本次HBG task的tiling-like入参。AscendC的tiling data由CANN runtime随launch task管理；HBG graph bytes也应尽量获得同样的task/captured-node lifetime，而不是由PyPTO维护一块会被下一次host调用覆盖的“current graph device buffer”。
+
+这个类比成立，但不能停在“把一个graph pointer传给kernel”这一层。HBG与普通只读tiling data有一个决定性的差异：
+
+- tiling bytes通常只读；
+- 当前HBG SM/runtime-arena image会被scheduler执行原地修改；
+- `runtime_destroy`还会清理queue pointer、mailbox、runtime attachment等字段；
+- 因此task-owned graph bytes必须是immutable pristine source，不能直接作为working state执行；
+- 每次eager execution和每次ACLGraph replay都必须先把这份source恢复到mutable execution slot，再允许scheduler工作。
+
+本阶段把下面这条所有权链真正接进了源码：
+
+```text
+一次Python/native L1 host call
+  -> 当前callable + 当前tensor/scalar snapshot
+  -> immutable HbgGraphPlan
+  -> fresh writable HbgSerializedLaunchBlob
+  -> aclrtLaunchKernelWithHostArgs + placeholder
+  -> CANN runtime-owned task args（候选的task/node lifetime source）
+  -> 每次task execution/replay由AICPU leader restore
+  -> context-owned mutable HbgExecutionSlot
+  -> peer classify/dispatch + hidden AICore execution
+```
+
+这里没有把workspace改为外部入参。GM heap、working SM、working runtime arena、outer Runtime、KernelArgs、handshake和workspace仍由PyPTO context在prepare阶段分配、冻结并持有。由于v1占用全部AICore并禁止并发，多个task/captured node可以顺序共享这一份mutable slot；它们不能共享或覆盖彼此的immutable source。
+
+#### 10.35.2 五类内存在当前实现中的落点
+
+本阶段之后，五层对象不再只是设计名词，而是可以对应到具体代码和owner：
+
+| 层 | 当前对象 | owner与生命周期 | 当前可变性 |
+| --- | --- | --- | --- |
+| canonical host plan | `std::unique_ptr<const HbgGraphPlan>` | 仅覆盖本次host build到launch序列enqueue；plan已deep-copy，不依赖builder临时arena | immutable |
+| writable host launch scratch | `std::vector<uint8_t> hbg_launch_blob` | 本次 `launch_l1_callable` 栈帧持有到WithHostArgs API返回 | placeholder可原地patch |
+| runtime-owned task source | CANN从完整HostArgs复制出的device args blob | eager应到task消费结束；capture应到captured node不再replay，仍待device 1实证 | AICPU只读 |
+| mutable execution slot | frozen GM SM + runtime arena + GM heap等 | L1 context持有到graph销毁、外部quiescence并成功close | 每次execution会被修改，下一次必须restore |
+| lifetime roots | slot/callable registrations、binary、KernelArgs、external tensor owner、stream/event | PyPTO context与调用方分别持有 | registration immutable，working state mutable |
+
+这张表也说明了为什么CANN拥有HostArgs bytes仍不等于CANN拥有整个算子状态：blob中的external tensor地址、working slot地址和child binary地址只是pointer value。CANN复制该数值，不会替PyPTO保活pointee。调用方仍必须持有graph-bound tensors；PyPTO context仍必须持有working slot、workspace、binary、Runtime/KernelArgs和hidden stream/events。
+
+#### 10.35.3 本阶段提交和范围
+
+runtime提交：
+
+```text
+18b1fde9 Add: 建立HBG调用身份注册协议
+74d0ff65 Add: 接通HBG任务级图快照恢复链路
+```
+
+`18b1fde9`完成per-callable trust root；`74d0ff65`完成host launch、独立AICPU run entry和leader/peer restore的整条静态链。两次提交都没有翻转HBG capability，没有改Python公开支持面，也没有声称ACLGraph已上板通过。
+
+### 10.36 callable-global身份与callable-local函数表
+
+#### 10.36.1 为什么不能继续使用context-global `func_id -> addr`
+
+每个独立编译的 `@pl.program` 都可能从 `func_id=0` 开始编号。若HBG host builder从context-wide `Runtime::func_id_to_addr_`直接取表，第二个callable会与第一个callable发生数值ID冲突；即使host侧临时覆盖全局表，已经capture的旧node也可能在replay时看到最后一次build留下的地址。
+
+最终协议明确区分：
+
+- `callable_id`：context-global，append-only，不允许改指另一份callable identity；
+- `func_id`：callable-local，只要求在同一callable内唯一、有效且地址非零；
+- `function_binding_hash`：对完整固定长度1024项表计算，零项也参与identity；
+- restored runtime arena中的 `HbgPrebuiltInvocationState`：task-owned，携带本次完整表、实际task数和同一hash；
+- outer `Runtime::func_id_to_addr_`：只可作为旧L2暂存/历史状态，不能作为L1 task的execution source。
+
+新增 `hbg_callable_function_binding.h` 的transactional builder每次都先创建全零1024项candidate，再写入本callable的 `(func_id, device_addr)`。它拒绝：
+
+1. output/table/hash空指针；
+2. table capacity不是精确1024；
+3. func ID负数或越界；
+4. device地址为0；
+5. 同一callable内重复func ID；
+6. 最终hash为0。
+
+只有全部校验成功才commit output table和hash。这样从callable A切到B时，A独有的func ID一定回到0；两个callable都使用 `func_id=0` 且地址不同是合法场景，而不是全局冲突。
+
+#### 10.36.2 callable registration的device trust root
+
+host-orchestration callable现在持有独立 `HbgCallableRegistration`，其核心字段包括：
+
+- `callable_id`；
+- callable/content hash；
+- function binding hash；
+- tensor count与scalar count；
+- registration自身的magic/version/size/hash。
+
+prepare在host所有字段稳定后生成immutable owner，再通过独立 `simpler_aicpu_l1_hbg_register_callable` entry发布到AICPU binary-lifetime registry。device registry只允许：
+
+- Empty到Publishing再到Ready的一次性发布；
+- 已Ready时逐byte相同的重复注册返回幂等成功；
+- 同一ID内容冲突、未知phase、中间态或坏hash全部fail-closed；
+- run只能按本次header中的 `callable_id` acquire已经Ready的registration。
+
+slot registration回答“恢复到哪一组persistent device window”；callable registration回答“哪一个compiled callable、签名和函数绑定有权使用该slot”。两者都不能代替per-task package owner。
+
+#### 10.36.3 invocation identity不依赖launch次数规格
+
+`HbgInvocationIdentity`当前包含：
+
+```text
+callable_hash
+argument_snapshot_hash
+function_binding_hash
+tensor_count
+scalar_count
+host_total_tasks
+callable_id
+```
+
+三个hash分别描述三个不同ownership domain：compiled callable、会固化进graph image的本次参数语义、实际child function binding。`argument_snapshot_hash`现在必须非零；tensor/scalar count必须同时与native args、callable registration和plan结果一致；host builder负责在构图后把真实 `host_total_tasks`填回plan identity。
+
+`plan_generation`是L1 context内独立单调 `uint64_t`。0保留为invalid；溢出后停止接受新plan。它不使用、不查询也不推断CANN kernel-launch内部可能存在的约2048等实现规格。generation是PyPTO task identity，不是slot recycle计数或CANN参数池索引。
+
+### 10.37 每次host launch生成runtime-owned候选package
+
+#### 10.37.1 DeviceRunner中的HBG分支
+
+`DeviceRunnerBase::launch_l1_callable`完成通用device、phase、stream、tensor/scalar count与静态layout校验后，根据callable是否持有host orchestration entry选择TRB或HBG：
+
+- TRB继续构造固定 `L1AicpuInvocationArgs`；
+- HBG要求slot registration与本callable registration都已生成且enqueue；
+- HBG构造callable-local完整函数表和hash；
+- 对本次 `ChipStorageTaskArgs`计算argument snapshot hash；
+- 生成初始identity与非零plan generation；
+- 调用架构strong `build_l1_hbg_graph_plan_impl`；
+- 交叉检查builder返回的callable、args、binding和真实task数；
+- 校验serialized size不超过prepare冻结的package capacity；
+- 从immutable plan生成fresh writable blob；
+- 生成只指向本blob inline payload的placeholder；
+- 在统一fork/join序列的AICPU节点调用 `LaunchWithMutableHostArgs`。
+
+`hbg_plan`和 `hbg_launch_blob`都活到完整enqueue函数返回。WithHostArgs返回后PyPTO不保留该host scratch；当前设计依赖CANN的task-args snapshot成为device source。正因为这一点尚未板上证明，capability仍关闭。
+
+#### 10.37.2 strong host builder的输入与事务边界
+
+A2/A3、A5的 `build_l1_hbg_graph_plan_impl` 现在额外接收显式的callable-local函数表和精确count，不再读取context-global函数表。它按以下顺序工作：
+
+1. 拒绝null runtime/API/args/host entry/binding/identity/function table/out owner与零generation；
+2. 校验binding精确命中prepare冻结的GM heap、SM、runtime arena和runtime offset；
+3. 校验tensor/scalar count、非零identity字段和初始 `host_total_tasks == 0`；
+4. 重新计算ring/heap layout，要求host image大小与frozen slot capacity精确一致；
+5. 只commit临时host `DeviceArena`，不commit或改写device working slot；
+6. 建立host runtime/host orchestration binding并运行host builder；
+7. 捕获host orchestration fatal，失败不发布半成品plan；
+8. 将显式callable-local函数表和真实task数写入host runtime-arena image；
+9. 重算/校验 `HbgPrebuiltInvocationState`的function hash与header identity；
+10. 把完整SM image和完整runtime-arena image作为required immutable regions deep-copy进 `HbgGraphPlan`；
+11. 只有所有步骤成功才transactionally替换out owner。
+
+builder不执行H2D，不调用stream/device sync，也不读取capture状态。它生成的是destination-bound pristine bytes：image内已经带有working SM/runtime arena/GM heap/external tensor/binary的最终device地址，因此只能恢复到registration指明的同一slot，不能复制到任意新slot后直接执行。
+
+#### 10.37.3 canonical plan、writable scratch和placeholder
+
+`HbgGraphPlan`私有持有canonical `HostUnpatched` bytes。每次 `serialize()`都deep-copy为新vector，避免：
+
+- CANN placeholder原地patch污染plan cache；
+- 第二次host launch覆盖第一次尚未被device消费的bytes；
+- graph A/B交替capture时共享同一writable staging；
+- caller释放builder临时vector后plan引用悬空。
+
+当前variable blob布局是：
+
+```text
+HbgLaunchBlobHeader
+HbgLaunchRegion[region_count]
+alignment padding through header_size
+pristine SM bytes
+per-region alignment padding
+pristine runtime-arena bytes
+future optional initializer spans
+```
+
+placeholder把header中的 `inline_payload_addr`改写为runtime device args base加 `header_size`。region的source offset都相对这个地址。capacity计算已经修正为使用与serializer完全相同的padding规则，而不是简单相加payload size；反例固定覆盖 `240 + align_up(15, 8) + 9 = 265`，防止slot registration低估最大package。
+
+当前header ABI是major保持、minor 2；固定类型仍使用8-byte alignment，AICPU不假设CANN args allocation满足更强C++对齐。`argsSize`和placeholder offset的32位carrier在host桥接前做lossless/overflow/bounds校验，但32位carrier本身不能被解释成已验证的产品最大payload规格。
+
+### 10.38 AICPU从task package恢复共享working slot
+
+#### 10.38.1 独立run entry的fixed-prefix校验
+
+A2/A3与A5 HBG AICPU DSO都导出：
+
+```text
+simpler_aicpu_l1_hbg_register_execution_slot
+simpler_aicpu_l1_hbg_register_callable
+simpler_aicpu_l1_hbg_exec
+```
+
+`simpler_aicpu_l1_hbg_exec`不复用TRB fixed invocation parser。它先：
+
+1. acquire当前device对应的slot registration；
+2. 用 `memcpy`把可能未对齐的HostArgs fixed header复制到对齐local；
+3. 校验header magic、ABI、header/total size、region count、非零generation和identity；
+4. 以header `callable_id` acquire callable registration；
+5. 校验package size未超过slot capacity；
+6. 校验placeholder patched地址精确等于 `blob_base + header_size`；
+7. 校验header binding与registered slot逐项相等；
+8. 校验callable id/hash/function hash/tensor count/scalar count与registration相等；
+9. 校验registered device KernelArgs仍指向registered outer Runtime；
+10. 通过平台bridge进入现有AICPU affinity/executor。
+
+这一阶段只扫fixed prefix，目的是在进入多线程平台路径前选择可信Runtime/KernelArgs。完整descriptor table、payload hash、region overlap和restore span由唯一leader校验，避免每个AICPU peer重复扫描大package。
+
+#### 10.38.2 exactly-one leader restore和peer barrier
+
+当前HBG AICPU executor把最后一个AICPU worker作为boot leader。L1 invocation存在时，leader在wire、attach、classify和dispatch之前：
+
+1. 调用full `restore_hbg_launch_blob`；
+2. 以slot registration而不是blob自身作为destination trust root；
+3. 重新校验header、全部region descriptor、source/destination window、hash、capacity与identity；
+4. 将pristine SM region复制到registered working SM；
+5. 将pristine runtime-arena region复制到registered working arena；
+6. 对每个destination span执行架构cache publish；
+7. 只有全部copy/publish成功才形成 `HbgRestoreCommit`；
+8. 定位restored `PTO2Runtime`，校验prebuilt invocation magic/version/count/task数和完整函数表hash；
+9. 比较restored state的task数/hash与runtime-owned header identity；
+10. 成功后wire arena pointer、attach populated SM并初始化device-only字段；
+11. 把统一 `hbg_restore_error_`以release语义发布，再放行classify-ready。
+
+非leader peer等待classify-ready后，对完整working SM/runtime arena做cache invalidate，再以acquire读取统一restore verdict。任何restore error都会阻止所有peer执行classify/dispatch；不能出现leader失败但某个peer继续消费半恢复graph的情况。
+
+#### 10.38.3 为什么每次replay都必须走这条restore
+
+一次HBG执行会修改至少以下状态：
+
+- ready queue头尾与slot；
+- wake list与fanin/fanout完成状态；
+- task state与completion flags；
+- completed subtasks与watermark；
+- scheduler queue pointer；
+- runtime mailbox、SM handle和attach字段；
+- `runtime_destroy`清理的若干runtime pointer。
+
+因此第一次capture-time execution、第一次replay和第N次replay不能共享“执行后的working bytes”。每次CANN重新执行同一个AICPU captured node时，entry仍会收到该node自己的RuntimeOwnedHbgPayload，并再次完整restore。无硬件UT中的两类反例已经锁定这一点：
+
+- 同一个package在第一次restore后把working state全部poison，再restore仍回到原pristine bytes；
+- A/B两个package交替恢复到一个slot，A、B、A每次都得到各自image与generation，不落入“最后一次host build覆盖所有node”。
+
+这正是“graph package像tiling参数一样随task管理”与“graph working state必须单独恢复”两条原则的结合，而不是二选一。
+
+#### 10.38.4 单算子stream边界没有为HBG破例
+
+HBG launch仍使用与TRB相同的外层顺序：
+
+```text
+caller stream:
+  optional wait PrepareTail（仅第一次完整成功launch）
+  async memset handshake
+  record Start
+  launch HBG AICPU WithHostArgs
+  wait AicoreDone
+  record SerialTail
+
+hidden AICore stream:
+  wait Start
+  launch prepared AICore executor handle
+  record AicoreDone
+```
+
+HBG restore是caller-stream AICPU task内部的第一阶段；它没有提前于本算子入口启动，也不会在capture外预跑orchestrator。代码中没有：
+
+- private AICPU run stream；
+- `rtStreamAddToModel`；
+- capture/model query；
+- capture-only early launch；
+- launch-time device allocation/free；
+- launch-time binary registration；
+- PyPTO内部stream/device synchronize或reset。
+
+host build本身在host launch调用中执行一次；ACLGraph replay不会再次进入Python/PyPTO host builder。replay执行的是已capture的AICPU task和其runtime-owned参数，因此每个captured node必须已经持有自己完整的pristine source。
+
+### 10.39 HBG host build禁止读取device tensor contents
+
+#### 10.39.1 为什么“read-only host mapping”仍然越过L1边界
+
+`2873feae`阶段曾保守地允许：平台若同时提供register/unregister，就为external device tensor建立临时read-only host view；写入统一拒绝。继续把这条路径放进真实异步launch后，发现它仍然不正确。
+
+典型时序是：
+
+```text
+caller stream:
+  predecessor writes control/input tensor
+  PyPTO L1 op entry
+     host thread executes dynamic HBG build
+     device stream尚未必执行完predecessor
+```
+
+L1禁止内部stream sync；PyPTO也不允许为了host builder查询capture或偷建等待流。因此即便某平台能把device allocation映射到host地址，host也没有证据证明前序device write已经对CPU可见。读取该地址会越过单算子entry的stream happens-before。A2/A3能否map、A5能否map不是关键；关键是映射不提供caller-stream completion。
+
+#### 10.39.2 当前实现的fail-closed规则
+
+`74d0ff65`在A2/A3和A5 strong HBG builder中统一采用：
+
+- external tensor device地址原样进入descriptor；
+- 不为input/output重新分配storage；
+- 不做H2D/D2H；
+- 不调用tensor register/unregister；
+- 不建立任何host access region；
+- 进入no-registration read-only access模式，因此read和write都会因region不存在而失败；
+- host orchestration若触发data access fatal，builder返回失败，不生成或launch半成品plan；
+- 只依赖shape、dtype、stride、device address、host scalar与拓扑的program可继续build。
+
+L2 HBG原有staging/mapping路径不改。L2掌控资源并能在自己的whole-run生命周期里完成数据搬运；L1不能因为复用同一host orchestration实现就继承这套同步/所有权假设。
+
+#### 10.39.3 长期支持device-produced control data需要新协议
+
+当前运行时fail-closed是安全底线，但长期还应把unsupported要求前移到compile/prepare：final transformed orchestration metadata需要标记是否调用 `get_tensor_data/set_tensor_data`，或更直接记录 `requires_device_tensor_value`。这样在任何host graph build和plan allocation前即可拒绝不支持callable。
+
+如果未来HBG必须读取前序device task产生的control/tiling数据，需要单独设计异步协议，例如让device侧builder或受caller stream排序的专用task消费control data。不能采用：
+
+- host HAL map后直接读；
+- capture中暗中D2H；
+- PyPTO内部stream/device sync；
+- private AICPU stream提前构图；
+- 用“capture时scalar稳定”替代真实device-value ordering。
+
+显式CPU control tensor将来若开放，也必须有独立参数类型、snapshot语义和graph lifetime契约，不能混在普通NPU tensor输入里猜测。
+
+### 10.40 当前验证、明确关闭的capability与剩余硬门槛
+
+#### 10.40.1 无硬件验证结果
+
+`74d0ff65`完成后执行了以下验证：
+
+- runtime editable全量构建通过；
+- A2/A3与A5、onboard与sim、TRB与HBG相关host/AICPU/AICore目标均完成编译/链接；
+- no-hardware CTest：**95/95 passed**；
+- PyPTO L1与simpler ChipWorker Python回归：**51/51 passed**；
+- HBG定向测试：**7/7 passed**，覆盖launch blob、execution slot、slot/callable registry、callable-local function binding、fixed AICPU invocation、prebuilt invocation和tensor-access边界；
+- `git diff --check`与相关格式检查通过。
+
+新增或加强的关键反例包括：
+
+1. 两个callable均使用 `func_id=0`但地址不同，完整表和hash互不污染；
+2. table输出只在全部binding合法后commit；
+3. bad callable ID/hash/count、bad slot binding/capacity在restore前拒绝；
+4. `argument_snapshot_hash == 0`拒绝；
+5. serializer padding计入package capacity；
+6. fixed prefix从未对齐HostArgs地址先copy再typed access；
+7. same package重复restore；
+8. A/B package交替restore；
+9. copy/cache publish中途失败不发布commit；
+10. restored function table/task count/hash与header identity不一致时拒绝；
+11. HBG L1 host builder无device tensor mapping，data read/write失败而metadata-only路径可构图；
+12. host orchestration entry bundle在失败与close路径有显式destructor，不依赖仅 `dlclose`回收C++ owner。
+
+这些结果证明源码协议、ABI、transaction边界和双架构构建自洽，不证明CANN runtime/ACLGraph设备行为。
+
+#### 10.40.2 device 1本轮没有运行NPU任务
+
+本轮只读检查发现当前逻辑device 1对应 `/dev/davinci15`，`npu-smi`观察到约2873 MiB HBM占用、AICore 100%、AIVector 90%。仓库约定空闲设备必须满足HBM为0；即使进程列表未显示普通用户进程，也不能据此抢占。
+
+因此本轮：
+
+- 没有向device 1提交ACL/NPU task；
+- 没有触碰device 0；
+- 没有用device 0作为fallback；
+- 没有把collect-only、host lowering或sim结果写成onboard结果；
+- `task-submit`当前不在PATH，仓库mandatory arch precheck还硬编码card 0，而本机card ID为7；正式上板前还要通过合规调度并修正/绕开错误预检入口。
+
+已经新增但未执行的ST是 `tests/st/runtime/l1/test_l1_aclgraph.py`。它使用显式device参数、普通warmup stream和独立capture stream，覆盖：
+
+1. `context.prepare()`与eager warmup数值；
+2. warmup/capture raw stream确实不同；
+3. caller外部synchronize后capture；
+4. graph内 `torch.add(out=) -> L1(out=) -> torch.mul(out=)`顺序；
+5. 三组输入连续replay并逐次验数；
+6. teardown严格执行外部device sync、`graph.reset()`、`context.close()`；
+7. `pypto_init`失败时接管 `cleanup_context`并保证close retry owner可达。
+
+该ST已通过A2/A3与A5纯host lowering、collect-only、ruff等静态检查，但**尚未在任何NPU上执行**。
+
+#### 10.40.3 HBG capability被显式strong关闭
+
+此前HBG依赖common weak unsupported hook。随着HBG源码路径逐步接通，只依赖weak default容易让未来链接或symbol变动意外翻转capability。当前A2/A3和A5 HBG `runtime_maker.cpp`都显式定义：
+
+```cpp
+extern "C" int l1_runtime_supported_impl(void) { return 0; }
+```
+
+对应注释列出未满足门槛：
+
+- large variable HostArgs和placeholder真实行为；
+- hidden-stream event-only capture/replay；
+- runtime-owned source在同graph反复replay中的lifetime；
+- repeated pristine restore和跨cache可见性；
+- HBG AICPU/AICore no-reset错误收尾；
+- Python高层当前仍只允许TRB。
+
+所以当前正确表述是：
+
+```text
+TRB L1 native/Python path: 源码实现完成，等待device 1 ACLGraph Phase-0实证
+HBG L1 native path: 源码链已接通但capability显式false
+HBG Python path: 未开放，仍fail-closed
+HBG L1 + ACLGraph: unsupported
+```
+
+#### 10.40.4 HBG开放前仍必须解决的P0/P1
+
+第一组是CANN task-args/ACLGraph事实：
+
+1. `aclrtLaunchKernelWithHostArgs`对实际HBG大小是否完整deep-copy，不能只测小header；
+2. placeholder是否在A2/A3与A5都把pointer patch到runtime-owned inline payload；
+3. API返回后立即poison/free/reuse host scratch，device仍读取原bytes；
+4. capture/instantiate后，graph多次replay期间runtime-owned source不被参数池回收或串包；
+5. device args base至少满足当前8-byte parser要求；若不能，所有variable table也必须byte-copy解析；
+6. 同graph至少连续replay两次、A/B不同package交替replay，证明restore每次执行；
+7. hidden AICore event-only branch无需model attach也确实进入captured graph。
+
+第二组是HBG executor no-reset错误收尾：
+
+- HBG `AicpuExecutor::init()`仍有若干早退路径，需要证明所有有效AICPU participant exactly-once进入共同completion/shutdown协议；
+- HBG scheduler对invalid physical core ID、范围内但register address为0等异常仍没有TRB已经实现的WAIT/CANCEL同等级闭环；
+- `emergency_shutdown`只能关闭已经打开register window的core，不能把“未打开window但仍在AICore等待”的情况交给L2时代的host device reset；
+- restore failure、handshake failure、scheduler failure都必须保证hidden AICore kernel结束、caller tail最终可完成，不能让borrowed L1 context依赖reset恢复；
+- 完全不report的硬件core属于更外层driver/op-timeout/fault-containment边界，但必须在support矩阵中明确，不得静默挂死。
+
+第三组是graph state完整性：
+
+- 当前package完整恢复SM与runtime arena；
+- GM heap暂时只作为冻结capacity/address root；
+- 如果某类HBG program在GM heap中存在每次execution必须重置的initializer bytes，必须增加明确的 `GmHeapInitializer` region manifest；
+- 不能每次把整个workspace清零，因为workspace可能包含无需初始化或具有不同语义的scratch；
+- 也不能假设heap永远无初始语义，必须由builder/runtime结构审计和poison test证明。
+
+第四组是上层生命周期与无并发契约：
+
+- graph不自动持有PyPTO context；调用方必须强引用context、graph-bound tensors和external/custom storage owner；
+- default torch_npu allocator的 `recordStream`只覆盖实际stream use，不替代graph owner；
+- external/from-blob/custom storage owner必须活到graph销毁且最后一次device use真正完成；
+- teardown必须是外部quiescence、`graph.reset()`、`context.close()`；
+- v1禁止同一context的并发replay。host mutex只能串行host enqueue，不能侦测未来两个graph的并发device replay；长期若要支持并发，需要per-node execution slot或device execution gate。
+
+#### 10.40.5 HBG graph package的长期内存管理原则
+
+结合用户关于AscendC tiling data的补充，长期策略按以下优先级执行：
+
+1. **首选：Runtime-owned inline package。** 每个WithHostArgs task/captured node拥有自己的immutable pristine source；PyPTO不实现看不见completion的device task-args pool。
+2. **共享的只有working slot。** v1无并发时，context可以只有一份mutable SM/runtime arena/GM heap/workspace；每次task必须restore，不能把共享slot误当作package owner。
+3. **binary继续context-lifetime pin。** child/incore binary地址进入task-owned函数表，但allocation本身由context append-only持有；本阶段不做binary device内存复用。
+4. **若Runtime-owned路径板上失败，才评估external immutable source。** 每个captured node必须有独立device source或显式graph lease，不能退化为一份可覆盖buffer。
+5. **没有graph retain/release hook时，fallback只能append-only pin到context close。** 必须有memory accounting和limit；宁可明确内存增长，也不能在不知道graph是否未来replay时回收。
+6. **任何source方案都不取消per-replay restore。** source lifetime和working-state reset是两个正交问题。
+7. **不依赖固定launch数量。** 2048、args pool环大小或任何源码内部常量都不能作为回收条件；只有CANN task/graph owner或显式外部lifetime协议可以证明回收安全。
+
+如果未来HBG通过 `host_build_graph`获得性能优化，也仍必须保持一个算子边界：host build可以把更大范围的调度变成一个明确graph operator，但不能在当前L1 op到达caller stream之前，借private stream/model attach提前启动orchestrator。性能方案必须改变公开抽象，而不是悄悄越过已有抽象。
+
+#### 10.40.6 当前阶段结论
+
+现在可以准确新增的结论是：
+
+- HBG每次dynamic build的graph已经在代码中被建模为task-local、tiling-like immutable package；
+- callable identity、argument snapshot、callable-local函数表和真实task数都进入该package的identity或pristine arena；
+- fresh writable host scratch已经接到独立HBG WithHostArgs run entry；
+- AICPU run entry会acquire slot/callable trust roots，unique leader每次完整restore，peer只在统一success verdict后dispatch；
+- HBG restore仍处于同一个caller-stream AICPU op节点内，外层AICPU/AICore fork/join没有破坏单算子边界；
+- HBG L1不再读取或写入device tensor contents；
+- A2/A3和A5保持同构，TRB fixed invocation和L2/L3旧路径没有被泛化成variable package；
+- HBG capability仍显式false，Python仍拒绝HBG。
+
+现在仍然不能宣称：
+
+- CANN已经以captured-node lifetime可靠持有真实大小HBG package；
+- HBG L1在device 1 eager执行成功；
+- HBG ACLGraph capture/replay成功；
+- A2/A3或A5真实cache/order已验证；
+- HBG no-reset错误路径已完整闭环；
+- GM heap initializer manifest对所有program完整；
+- 同一context并发graph replay得到支持。
+
+本阶段的正确定位是：**源码已经具备进入HBG device capability probe的结构，不再缺“task package如何传到device并在replay前restore”的主链；但产品capability必须保持关闭，直到device 1和错误路径证据完成。**
