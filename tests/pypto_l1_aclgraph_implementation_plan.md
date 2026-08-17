@@ -2,7 +2,7 @@
 
 <!-- markdownlint-disable MD036 MD060 -->
 
-> 状态：TRB L1实现和无硬件回归已完成，已具备Phase-0 ST，但device 1 ACLGraph真实上板尚未通过；HBG第二阶段已经落下host-build/H2D边界和variable launch blob的H1/H2 host基础，但尚未接入CANN placeholder launch、AICPU per-replay restore或高层L1 capability，仍保持unsupported。本文是指导性设计记录，完整上下文优先，不以篇幅压缩为目标。
+> 状态：TRB L1实现和无硬件回归已完成，已具备Phase-0 ST，但device 1 ACLGraph真实上板尚未通过；HBG第二阶段已经落下host-build/H2D边界、variable launch blob和CANN mutable HostArgs/placeholder host bridge，但尚未注册HBG AICPU entry、实现per-replay restore或接入高层L1 capability，仍保持unsupported。本文是指导性设计记录，完整上下文优先，不以篇幅压缩为目标。
 >
 > 首期范围：onboard、`tensormap_and_ringbuffer`（TRB）、`@pl.program`、静态 shape、PyTorch 直接调用验证。
 >
@@ -2445,7 +2445,7 @@ P0: WithHostArgs inline payload完整copy且随captured graph存活？
 
 ### N.9 第二阶段建议实施顺序
 
-> **2026-08-18实施快照：** runtime提交 `11b7a4b1` 已完成一笔不依赖device的H1/H2基础改造：A2/A3和A5都把host orchestration的SM image构建与同步H2D拆开；common层新增destination-bound variable launch blob、deep-copy serializer和byte-safe validator，并以slot generation/address/capacity、callable/argument/function identity、full-image/overlap/hash规则约束输入。它尚未形成完整owning `HbgGraphPlan`，也没有把blob接到 `aclrtLaunchKernelWithHostArgs` placeholder、AICPU leader restore或stable execution slot，所以H1/H2只能标记为“host基础已落地、device闭环未完成”，HBG L1 capability继续为unsupported。详细代码、测试和未完成边界见过程记录10.25。
+> **2026-08-18实施快照：** runtime提交 `11b7a4b1` 完成第一笔不依赖device的H1/H2基础：A2/A3和A5拆开host orchestration SM image构建与同步H2D；common层新增destination-bound variable launch blob、deep-copy serializer和byte-safe validator。随后 `10e69df6` 增加mutable HostArgs + placeholder真实ACL API bridge，并在CANN调用前校验所有lossy carrier和pointer write。当前仍未形成完整owning `HbgGraphPlan`，也没有独立HBG AICPU entry、leader restore或stable execution slot，所以H1/H2只能标记为“host/launch桥接基础已落地、device闭环未完成”，HBG L1 capability继续为unsupported。详细代码、测试和未完成边界见过程记录10.25～10.26。
 
 当前进度不能解释成跳过H0：host-only ABI和边界拆分可以先写、先做无硬件fail-closed测试；任何关于CANN snapshot时点、captured-node lifetime、large args、cache可见性和replay恢复正确性的产品结论，仍必须由空闲device 1上的H0/P0实证给出。
 
@@ -2476,7 +2476,7 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 - 保留TRB fixed WithHostArgs ABI不变；
 - 对host patch污染canonical plan、截断blob、交叉span、错误placeholder做无硬件UT。
 
-当前已完成：独立 `HbgLaunchBlobHeader/HbgLaunchRegion/HbgExecutionBinding/HbgInvocationIdentity` ABI、深拷贝serializer、host-unpatched/device-patched pointer状态、严格size/alignment/overflow/full-image/overlap/hash校验以及10项无硬件UT。当前尚未完成：CANN placeholder array与writable per-launch blob的真实launch helper、AICPU侧parser/restore入口、host原地patch与runtime snapshot时点的device 1实证。这里的“device-patched”测试只是ABI状态机测试，不是CANN已经按预期持有payload的证据。
+当前已完成：独立 `HbgLaunchBlobHeader/HbgLaunchRegion/HbgExecutionBinding/HbgInvocationIdentity` ABI、深拷贝serializer、host-unpatched/device-patched pointer状态、严格size/alignment/overflow/full-image/overlap/hash校验；runtime `10e69df6` 又增加CANN-independent placeholder ABI、silent-narrowing/8-byte pointer-write校验、`LoadAicpuOp::LaunchWithMutableHostArgs`真实ACL API bridge，以及合计13项无硬件UT。当前尚未完成：把该helper接到独立HBG AICPU symbol、AICPU侧parser/restore入口，以及host patch、runtime snapshot时点和captured lifetime的device 1实证。这里的“device-patched”测试只是等价字节状态测试，不是CANN已经按预期持有payload的证据。
 
 #### N.9.4 HBG Phase H3：stable execution slot和capacity freeze
 

@@ -310,6 +310,11 @@ python -m pytest tests/ut -q
   - 增加destination-bound variable HBG launch blob、pristine SM/runtime-arena/heap manifest、slot binding和invocation identity；
   - 用完整镜像覆盖、容量、generation、地址、身份、区间重叠与content hash做fail-closed校验；
   - runtime完整pre-commit、editable build、无硬件C++ 86/86和HBG相关Python 112 passed/4 skipped通过；HBG L1 capability未开启。
+- runtime `10e69df66a71ce752bf1ef58c8dd9147a8de775e`：`Add: 建立HBG可写HostArgs占位符桥接`
+  - 增加CANN-independent placeholder POD及args-size/count/offset/alignment/overlap校验；
+  - `LoadAicpuOp`新增无分配、无同步的mutable HostArgs + placeholder入口，并静态锁定CANN ABI布局；
+  - HBG blob生成单一inline payload placeholder，不修改canonical bytes，13项定向UT覆盖runtime-patched和全部负例；
+  - 完整pre-commit、editable build、无硬件C++ 86/86和相关Python 112 passed/4 skipped通过；仍未注册HBG L1 AICPU entry。
 
 每次后续HBG提交继续补充顶层/runtime SHA、中文提交主题、完整变更范围和对应验证；不 push。
 
@@ -1345,7 +1350,7 @@ runtime阶段提交为：
 这一阶段不能被表述为“HBG已经支持L1/ACLGraph”。仍未完成的关键闭环是：
 
 1. current HBG host builder尚未把SM、runtime arena和heap initializers发布成正式、可缓存、带owner的 `HbgGraphPlan`；新serializer当前是common基础设施，尚未接入production HBG bind；
-2. 尚未新增writable args + placeholder array的CANN launch helper，未证明CANN何时原地patch host blob、何时完成snapshot、captured graph销毁时何时释放runtime-owned device args；
+2. 当时尚未新增writable args + placeholder array的CANN launch helper；该host bridge随后已由10.26和runtime `10e69df6`补齐，但仍未接入HBG AICPU entry，也未证明CANN何时patch/snapshot或何时释放captured runtime-owned args；
 3. 尚未有HBG独立AICPU L1 entry，也未把parser放到device侧，更没有exactly-one leader在每次eager/replay前恢复working SM/runtime arena/initializer；
 4. 尚未建立HBG stable execution slot、prepare-time capacity freeze、generation owner、outer Runtime/KernelArgs/handshake的per-execution reset清单；
 5. 尚未解决host orchestration读取tensor data时，L1 direct external NPU tensor如何在不D2H、不sync的前提下提供host-known control data；
@@ -1353,3 +1358,109 @@ runtime阶段提交为：
 7. device 1上的placeholder/large-args/capture lifetime、AICPU restore cache/order、同图第二次及后续replay、graph A/B交替replay和memory accounting全部还是发布硬门槛。
 
 当前可以确认的只是：代码中已经有一个与用户“graph像tiling参数随task管理”原则一致的host表示——每次launch的writable blob深拷贝并封装自己的pristine graph bytes、identity和destination generation，working slot则明确属于context且必须per replay restore。谁最终拥有runtime-owned source、什么时候可释放、device如何恢复，仍由后续H0与H3/H4实现回答，不能从本轮host UT推断。
+
+### 10.26 HBG H2继续实现：writable HostArgs与placeholder bridge
+
+#### 10.26.1 现有TRB helper为什么不能直接复用
+
+现有 `LoadAicpuOp::LaunchWithHostArgs` 面向固定大小TRB结构体：参数类型是 `const void *`，内部对CANN做 `const_cast`，placeholder array固定传null。它适合不含inline pointer的 `InitArgs/L1RegisterCallableArgs/L1AicpuInvocationArgs`，不适合HBG variable blob，原因有四个：
+
+1. HBG必须明确要求每次launch使用fresh writable serialization，不能让CANN可能的原地patch污染canonical graph plan；
+2. `aclrtPlaceHolderInfo.addrOffset`指向一个8-byte pointer字段，CANN公开检查只保证offset小于args size；PyPTO还必须保证完整8 bytes不越界且正确对齐；
+3. 本机CANN 9.2.0 public API的 `argsSize/placeHolderNum` 是 `size_t`，实现中分别窄化到 `uint32_t`，后续内部descriptor又以 `uint16_t`携带placeholder数量。调用前不校验会允许静默截断；
+4. HBG capture launch路径不能为了转换placeholder临时分配vector，也不能做同步或capture query。
+
+因此没有把TRB方法改成一个含HBG分支的大入口，而是保留固定overload并新增显式mutable bridge。
+
+#### 10.26.2 CANN-independent placeholder ABI与通用校验
+
+新增 `runtime/src/common/task_interface/host_args_launch.h`，定义8-byte `HostArgsPlaceholder{addr_offset, data_offset}`。它不include ACL头文件，因此serializer、parser和no-hardware UT可独立编译；onboard `load_aicpu_op.cpp`再用static assertions逐项比对：
+
+- `sizeof(HostArgsPlaceholder) == sizeof(aclrtPlaceHolderInfo)`；
+- alignment一致；
+- `addr_offset`与CANN `addrOffset`的 `offsetof`一致；
+- `data_offset`与CANN `dataOffset`的 `offsetof`一致。
+
+`validate_host_args_launch_layout`在CANN调用之前拒绝：
+
+- null或empty host args；
+- `args_size > UINT32_MAX`；
+- placeholder pointer/count不一致；
+- placeholder count不能由当前runtime carrier无损表示；
+- pointer field offset未按8 bytes对齐；
+- `addr_offset + sizeof(uint64_t)`越界；
+- `data_offset >= args_size`；
+- 两个pointer write ranges重叠。
+
+这里的32/16-bit检查只是防止本机已核对ABI发生silent narrowing，不被写成HBG产品size/count规格。HBG当前只用一个placeholder；large args真正可用边界仍必须扫描device 1，不能从 `UINT32_MAX`反推出CANN一定支持这么大。
+
+#### 10.26.3 实际runtime launch桥接
+
+`LoadAicpuOp`新增：
+
+```cpp
+int LaunchWithMutableHostArgs(
+    rtStream_t stream,
+    void *host_args,
+    size_t args_size,
+    HostArgsPlaceholder *placeholders,
+    size_t placeholder_count,
+    int aicpu_num,
+    const char *func_name);
+```
+
+它先执行全部纯host layout validation，再沿已有不构造临时 `std::string` 的function-handle查找，最后直接调用：
+
+```cpp
+aclrtLaunchKernelWithHostArgs(
+    func_handle, num_blocks, caller_stream, nullptr,
+    writable_host_args, args_size,
+    acl_placeholders, placeholder_count);
+```
+
+该路径没有host/device allocation、stream/event创建、synchronize、capture-state query或model attach。原 `LaunchWithHostArgs(const void *)`委托到同一实现但传零placeholder，所以TRB launch拓扑和参数ABI不变，同时也获得args-size不截断检查。
+
+四个onboard产物都实际包含新symbol：A2/A3和A5的TRB/HBG `libhost_runtime.so`经 `nm -C`确认同时导出fixed和mutable两个C++方法。sim不编译该onboard loader，不受ACL header依赖影响。
+
+#### 10.26.4 HBG单placeholder生成与canonical immutability
+
+`make_hbg_launch_placeholder`先以host-unpatched模式全量验证blob，并可同时比较expected execution binding与expected invocation identity；成功后只输出一个descriptor：
+
+```text
+addr_offset = offsetof(HbgLaunchBlobHeader, inline_payload_addr)
+data_offset = header.header_size
+```
+
+函数不修改blob，失败也不修改caller提供的output descriptor。CANN拿到的必须是canonical plan深拷贝得到的fresh writable blob；canonical plan继续保持 `inline_payload_addr == 0`。UT模拟runtime-owned copy后按这两个offset写入 `runtime_args_base + data_offset`，再用device-patched模式验证，证明host/device两种ABI状态能够闭合；这只是等价字节行为测试，不是CANN lifetime实证。
+
+#### 10.26.5 验证和提交
+
+定向HBG target从10项增至13项，新增覆盖：
+
+1. placeholder生成不修改canonical bytes；
+2. expected identity不匹配和null output fail-closed且保留原output；
+3. runtime-owned copy的pointer patch结果可按device模式解析；
+4. null/empty/too-large args、pointer/count mismatch、过多placeholder、misaligned/OOB address field、OOB data offset和overlapping pointer writes全部返回精确错误。
+
+验证结果：
+
+- runtime editable全量build通过，A2/A3与A5的onboard TRB/HBG host runtime均重编；
+- runtime完整pre-commit通过；
+- 定向13/13通过；
+- no-hardware C++全量仍为 **86/86 passed**；
+- HBG/runtime相关Python仍为 **112 passed, 4 skipped, 14 warnings**；
+- `git diff --check`通过；未执行NPU任务。
+
+runtime阶段提交：
+
+```text
+10e69df66a71ce752bf1ef58c8dd9147a8de775e Add: 建立HBG可写HostArgs占位符桥接
+```
+
+#### 10.26.6 H2完成到哪里、下一步为什么仍是H3/H4
+
+现在host侧已经能构造fresh writable package、生成严格placeholder，并通过真实CANN API入口enqueue；但production HBG尚无调用者，因为还没有独立HBG L1 AICPU symbol和stable execution slot。此时若直接把mutable helper接到现有HBG L2 `simpler_aicpu_exec`，AICPU会把blob误解释成arch-specific `KernelArgs`，属于明确ABI错误。
+
+下一阶段必须先定义HBG prepare-time stable slot与可信expected binding，再定义独立AICPU entry：device侧先把固定header复制到对齐local、比较slot generation/address/capacity/callable identity，exactly-one leader从runtime-owned inline source恢复full SM/runtime arena和initializer spans，所有peer看到同一restore verdict后才attach/classify/dispatch。只有这条路径存在，mutable HostArgs helper才有合法production call site。
+
+因此当前HBG capability继续为false；不能因为“已经调用得了带placeholder的runtime API”就忽略per-replay restore，也不能把CANN会复制args的源码行为扩大成captured graph lifetime已经通过。
