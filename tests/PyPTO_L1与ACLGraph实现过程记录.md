@@ -1682,4 +1682,117 @@ runtime阶段提交：
 f6ad61df Add: 建立HBG稳定执行槽可信注册协议
 ```
 
-这份提交是H3的共享ABI/校验基础，不是H3 production完成。当前DeviceRunner尚未在HBG L1 prepare中一次性分配五个window，也尚未把注册bytes通过独立AICPU registration task发布到device。现有HBG L2 `setup_static_arena` 遇到更大request仍可以release/recommit，不能直接当成capture-safe H3 owner。下一步必须在HBG L1专用prepare路径中先commit容量、再生成registration，并在第一个package可能被capture后把所有增容/换址请求变成fail-closed。HBG capability仍继续为false。
+这份提交是H3的共享ABI/校验基础，不是H3 production完成。截至 `f6ad61df`，DeviceRunner尚未在HBG L1 prepare中一次性分配五个window，也尚未把注册bytes通过独立AICPU registration task发布到device；当时现有HBG L2 `setup_static_arena` 遇到更大request仍可以release/recommit，不能直接当成capture-safe H3 owner。后续10.29已经补上三块working arena的真实分配/冻结，但完整registration与AICPU发布仍未完成。HBG capability继续为false。
+
+### 10.29 HBG H3继续实现：由DeviceRunner冻结真实working slot，而不是让graph package自报地址
+
+#### 10.29.1 本次解决的是mutable destination所有权，不是pristine source所有权
+
+用户对第二阶段HBG内存管理给出的核心原则是：每次dynamic host build得到并H2D到device的graph，本质上是本次task类似AscendC `tiling_data` 的入参。它必须随launch task或captured node保活，不能放在下一次host build会原地覆盖的context-wide `current_graph` 中。
+
+这个原则同时要求另一块独立内存：HBG scheduler会原地消费SM、runtime arena和GM heap中的ready queue、task state、completion flags与runtime指针，所以runtime-owned pristine source不能直接作为执行区。每次eager调用或ACLGraph replay必须先把当前node自己的source恢复到一个地址稳定的mutable working slot，再放行scheduler。
+
+因此10.29只实现后半条生命周期：
+
+```text
+task/captured-node-owned pristine graph package
+  -- 每次调用/replay restore，尚未接入AICPU -->
+context-owned mutable HBG working slot
+  = GM heap + shared memory + runtime arena
+```
+
+本提交没有把pristine graph塞入这三块context arena，也没有因此宣称CANN已经替PyPTO管理了graph source。source的WithHostArgs inline snapshot、capture lifetime和destroy回收点仍必须由H0/device 1证明。
+
+#### 10.29.2 为什么旧 `setup_static_arena` 不能直接作为capture-safe owner
+
+原有L2/L3 arena语义允许后续更大的request触发release/recommit。这对一次native run绑定是合理的，因为pipeline lease和同步finalize能界定使用期；对可能已经被ACLGraph node记录的L1地址则不成立：
+
+1. graph package中的SM、arena和heap绝对地址已经在host relocation时固化；
+2. captured node可能在任意未来replay，PyPTO看不到最后一次replay完成时点；
+3. 如果后续prepare静默增容并换址，旧node会把pristine bytes恢复到已经释放或属于新generation的地址；
+4. 只比较request size不能证明调用方拿到的base仍然由当前DeviceRunner arena bank持有。
+
+所以 `HostApi` 新增 `freeze_static_arena`，参数不是单纯三个size，而是三组精确的 `{base, capacity}`。platform owner只有在以下条件全部成立时才冻结：
+
+- 三个region都已经commit且base非空；
+- caller提供的base与当前arena bank实际base逐项相等；
+- caller提供的capacity与DeviceRunner缓存capacity逐项相等且非0；
+- 三个region属于当前选中的同一arena bank。
+
+冻结后，`setup_static_arena` 只接受完全相同的容量三元组；任何增容、缩容、将某个region改为0或间接换址都在修改任何arena前返回失败。相同请求保持幂等且不重新分配。L1显式close和L2/L3 finalize释放arena时同步清除freeze状态，使owner状态与实际allocation生命周期一致。
+
+#### 10.29.3 common helper的transaction边界
+
+新增 `runtime/src/common/task_interface/hbg_static_execution_slot.h`，把platform-independent顺序固定为：
+
+1. 检查三块capacity非0、可无损转换为 `size_t`，且 `runtime_offset < runtime_arena_capacity`；
+2. 检查HostApi确实提供setup、三项acquire和freeze能力；
+3. 一次setup三块arena，再分别取得实际base；
+4. 用checked device-window规则拒绝地址加法溢出和三块window互相重叠；
+5. 把刚取得的精确base/capacity交回platform owner冻结；
+6. 只有freeze成功后才把candidate `HbgExecutionBinding` 发布给caller。
+
+失败事务不假装撤销已经完成的device allocation：setup成功而后续acquire/layout/freeze失败时，allocation仍由context持有并由显式close回收；但helper绝不发布半可信binding。这个边界与10.27 restore失败的处理一致——物理bytes可能已经存在或部分变化，逻辑ready/registration必须保持未发布。
+
+`HbgPreparedStaticExecutionSlot::binding.slot_generation`在这一层故意保持0。generation不是arena helper可以自行发明的值；它必须由DeviceRunner在outer Runtime、device KernelArgs、AICore binary和所有callable function binding都准备完成后统一生成，并与完整 `HbgExecutionSlotRegistration` 一起seal。
+
+#### 10.29.4 A2/A3与A5 HBG prepare现在真实做了什么
+
+A2/A3和A5的 `host_build_graph/host/runtime_maker.cpp` 都新增同名strong `prepare_l1_runtime_impl`，两份实现保持逐行同构：
+
+1. 按现有优先级解析 `ring_task_window/ring_heap`（task config覆盖环境变量，环境变量覆盖编译默认值）；
+2. overflow-safe累加全部ring heap容量；
+3. 通过 `PTO2SharedMemoryHandle::calculate_size_per_ring` 计算完整working SM容量；
+4. 只在host `DeviceArena` 上重放 `runtime_reserve_layout` 以得到runtime arena容量与inner runtime offset，不commit host image、不做H2D；
+5. 调用common helper分配、核对并冻结三块真实device working region；
+6. 将三个base、runtime offset和精确capacity写入host `Runtime`；
+7. 保持空的orchestration args和 `host_total_tasks == 0`，等待后续每个invocation自己的host build/package。
+
+这里没有构建某个callable的graph，更没有把某次graph同步上传到working slot。prepare只建立地址和容量稳定的destination。以后HBG host builder必须针对这些最终base做relocation并序列化pristine package；AICPU必须在每次调用/replay从该package恢复，二者不能颠倒。
+
+#### 10.29.5 与L2/L3、TRB和当前公开capability的隔离
+
+- `freeze_static_arena` 是HostApi内部能力，onboard与sim platform都提供同一签名；A2/A3、A5、TRB、HBG四类host runtime在同一次editable build中重新编译，避免一侧按旧struct offset读取函数指针。
+- 既有TRB bind继续只调用setup/acquire，不调用freeze；对应fake HostApi显式保留空freeze callback，原有temp-buffer测试继续通过。
+- HBG L2/L3仍走原有per-run bind/build/H2D和pipeline lease，不会因为新增callback自动进入L1 freeze协议。
+- HBG strong `prepare_l1_runtime_impl` 已存在，但public `simpler_l1_supported()`仍为false；common L1 registration也仍对 `host_dlopen_handle` 返回unsupported。因此当前用户入口不会半途进入“slot已分配但AICPU entry不存在”的错误形态。
+- 本阶段没有创建stream/event，没有sync/reset，没有capture query/model attach，也没有触碰TRB fixed `L1AicpuInvocationArgs`。
+
+#### 10.29.6 无硬件验证、提交与仍未完成的H3部分
+
+新增 `test_hbg_static_execution_slot` 七组反例：
+
+1. 成功路径只在setup、三项acquire和exact freeze都成功后发布base/capacity；
+2. runtime offset越界在任何platform side effect前拒绝；
+3. 缺少freeze callback在setup前拒绝；
+4. setup失败后不acquire、不freeze；
+5. 任一arena base为空时不freeze；
+6. 三个device window重叠时不freeze；
+7. freeze失败时保留caller原有sentinel output，不发布candidate binding。
+
+验证结果：
+
+- 先确认新测试在HostApi尚无freeze字段时编译失败，再补齐实现；
+- runtime editable build通过，A2/A3与A5的onboard/sim HBG/TRB host runtime全部完成增量重编；
+- runtime完整pre-commit通过，包括LLVM 18 clang-tidy、clang-format、cpplint和header检查；
+- `test_hbg_static_execution_slot` **7/7 passed**，TRB temp-buffer定向回归通过；
+- no-hardware C++全量：**88/88 passed**，其中71项标记 `no_hardware`；
+- HBG/runtime相关Python：**112 passed, 4 skipped, 14 warnings**；
+- `git diff --check`通过；没有运行NPU任务，没有使用device 0。
+
+runtime阶段提交：
+
+```text
+ee29203770b1a71d89747a216283c937b9b02ccc Add: 建立HBG L1稳定执行槽分配与冻结边界
+```
+
+10.29仍不是H3 production完成。剩余关键闭环是：
+
+1. DeviceRunner在所有callable prepare完成后生成process内不复用的slot generation和binary generation；
+2. 把working slot、outer Runtime、device KernelArgs和capacity ceiling组合成完整registration并seal；
+3. 通过独立HBG AICPU registration entry发布同一份immutable registration；
+4. 由每次host build生成owning `HbgGraphPlan`与fresh writable task package，而不是直接写working slot；
+5. AICPU exactly-one leader在每次调用/replay执行full restore，peers只在统一success verdict后进入scheduler；
+6. device 1证明CANN确实按task/captured-node持有inline graph source，并确定large-args上限和graph destroy回收行为。
+
+这些完成前，HBG capability继续保持false；本次提交只能表述为“真实working destination已经在prepare阶段可分配且可冻结”，不能表述为“dynamic graph已经被ACLGraph安全管理”。

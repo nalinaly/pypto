@@ -2,7 +2,7 @@
 
 <!-- markdownlint-disable MD036 MD060 -->
 
-> 状态：TRB L1实现和无硬件回归已完成，已具备Phase-0 ST，但device 1 ACLGraph真实上板尚未通过；HBG第二阶段已经落下host-build/H2D边界、variable launch blob和CANN mutable HostArgs/placeholder host bridge，但尚未注册HBG AICPU entry、实现per-replay restore或接入高层L1 capability，仍保持unsupported。本文是指导性设计记录，完整上下文优先，不以篇幅压缩为目标。
+> 状态：TRB L1实现和无硬件回归已完成，已具备Phase-0 ST，但device 1 ACLGraph真实上板尚未通过；HBG第二阶段已经落下host-build/H2D边界、variable launch blob、CANN mutable HostArgs/placeholder host bridge、common per-replay restore核心，以及真实working arena的prepare-time分配/冻结基础；尚未注册HBG AICPU entry、接入device leader restore或开放高层L1 capability，仍保持unsupported。本文是指导性设计记录，完整上下文优先，不以篇幅压缩为目标。
 >
 > 首期范围：onboard、`tensormap_and_ringbuffer`（TRB）、`@pl.program`、静态 shape、PyTorch 直接调用验证。
 >
@@ -2445,7 +2445,7 @@ P0: WithHostArgs inline payload完整copy且随captured graph存活？
 
 ### N.9 第二阶段建议实施顺序
 
-> **2026-08-18实施快照：** runtime提交 `11b7a4b1` 完成第一笔不依赖device的H1/H2基础：A2/A3和A5拆开host orchestration SM image构建与同步H2D；common层新增destination-bound variable launch blob、deep-copy serializer和byte-safe validator。随后 `10e69df6` 增加mutable HostArgs + placeholder真实ACL API bridge，并在CANN调用前校验所有lossy carrier和pointer write。`de2aa0f9` 又将H4的正确性核心落为common层：每次从runtime-owned pristine source完整恢复working image，仅在全部region copy/cache-publish成功后提交新epoch，并用重复replay、A/B package交替和中途失败反例锁定语义。`f6ad61df` 再建立144-byte prepare-time slot registration trust root，freeze device、SM/arena/heap、outer Runtime、device KernelArgs、slot/binary generation、package capacity和serial-only契约，restore不再允许blob用自己的binding自证。当前仍未形成完整owning `HbgGraphPlan`、DeviceRunner真实stable slot分配/冻结、独立HBG AICPU entry或leader/peer发布协议；因此H1/H2是host/launch桥接基础，H3/H4也只完成共享ABI与无硬件原语，device闭环未完成，HBG L1 capability继续为unsupported。详细代码、测试和未完成边界见过程记录10.25～10.28。
+> **2026-08-18实施快照：** runtime提交 `11b7a4b1` 完成第一笔不依赖device的H1/H2基础：A2/A3和A5拆开host orchestration SM image构建与同步H2D；common层新增destination-bound variable launch blob、deep-copy serializer和byte-safe validator。随后 `10e69df6` 增加mutable HostArgs + placeholder真实ACL API bridge，并在CANN调用前校验所有lossy carrier和pointer write。`de2aa0f9` 又将H4的正确性核心落为common层：每次从runtime-owned pristine source完整恢复working image，仅在全部region copy/cache-publish成功后提交新epoch，并用重复replay、A/B package交替和中途失败反例锁定语义。`f6ad61df` 再建立144-byte prepare-time slot registration trust root，freeze device、SM/arena/heap、outer Runtime、device KernelArgs、slot/binary generation、package capacity和serial-only契约，restore不再允许blob用自己的binding自证。`ee292037` 进一步让A2/A3和A5 HBG strong prepare真实计算并分配GM heap/SM/runtime arena，通过DeviceRunner按精确base/capacity冻结working arena，且冻结后拒绝任何增容、缩容或换址。当前仍未形成完整owning `HbgGraphPlan`、完整slot registration生成/发布、独立HBG AICPU entry或leader/peer发布协议；因此working destination已有真实prepare-time owner，但task/captured-node source与device replay闭环仍未完成，HBG L1 capability继续为unsupported。详细代码、测试和未完成边界见过程记录10.25～10.29。
 
 当前进度不能解释成跳过H0：host-only ABI和边界拆分可以先写、先做无硬件fail-closed测试；任何关于CANN snapshot时点、captured-node lifetime、large args、cache可见性和replay恢复正确性的产品结论，仍必须由空闲device 1上的H0/P0实证给出。
 
@@ -2485,7 +2485,7 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 - 加入binding/capacity/generation fail-closed；
 - 不对外暴露workspace pointer，延续当前“workspace由PyPTO内部prepare-time管理”结论。
 
-当前已完成runtime `f6ad61df` 中的共享注册ABI/校验基础：`HbgExecutionSlotRegistration` 同时冻结device id、SM/runtime-arena/GM-heap、outer Runtime、device KernelArgs、slot/binary generation、最大package bytes和serial-only flag，校验所有window的overflow/alias后才发布registration hash；replay restore必须以该注册为trust root。尚未完成：DeviceRunner在HBG L1 prepare中实际分配这些window、冻结后拒绝 `setup_static_arena` 增容/换址、将同一注册发布到AICPU registry及close-retry ownership。因此不得将该POD表述为H3 production完成。
+当前已完成两层基础。runtime `f6ad61df` 建立共享注册ABI/校验：`HbgExecutionSlotRegistration` 同时冻结device id、SM/runtime-arena/GM-heap、outer Runtime、device KernelArgs、slot/binary generation、最大package bytes和serial-only flag，校验所有window的overflow/alias后才发布registration hash；replay restore必须以该注册为trust root。runtime `ee292037` 又让A2/A3与A5 HBG strong prepare真实计算、分配并冻结GM heap/SM/runtime arena，HostApi freeze要求精确base/capacity且冻结后只接受完全相同的setup请求；Runtime保留可信capacity供后续registration生成。尚未完成：为outer Runtime/device KernelArgs/binary生成统一generation、seal完整registration、通过独立AICPU entry发布，以及close-retry对registration device copy的所有权。因此仍不得将H3表述为production完成。
 
 #### N.9.5 HBG Phase H4：AICPU leader per-replay restore
 
@@ -2503,6 +2503,8 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 - 新增HBG对应 `l1_runtime_supported_impl/prepare_l1_runtime_impl` 及AICPU L1 entry，但只在H0-H4硬门槛通过后开启capability；
 - caller stream运行AICPU主task，hidden stream只运行AICore，与本计划已确定单op fork/join边界一致；
 - 不使用旧PyPTO的hidden AICPU stream、capture-aware early launch或model attach。
+
+当前 `ee292037` 已为A2/A3与A5 HBG提供strong `prepare_l1_runtime_impl`，但它只建立并冻结三块working arena，尚未越过registration/runtime执行边界：common仍对host orchestration callable的 `host_dlopen_handle` 返回unsupported，HBG没有独立AICPU registration/run entry，也没有把slot registration发布到device，support query仍为false。该strong prepare是H3/H5共享的prepare基础，不能单独解释为H5完成。
 
 #### N.9.7 HBG Phase H6：direct external tensors与host-build数据契约
 
