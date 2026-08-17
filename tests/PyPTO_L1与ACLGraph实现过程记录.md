@@ -1560,3 +1560,126 @@ canonical HbgGraphPlan（host owner，尚未完整production化）
 7. device 1上同图多次replay、A/B两图交替、主动poison working state、cache-line canary和memory accounting实证。
 
 因此这次提交只把H4的“每次完整恢复、失败不提交”协议变成了可测代码。HBG `simpler_l1_supported()`仍为false，高层 `pypto_init` 仍必须拒绝HBG；当前不存在用host-only UT替代device 1 P0的结论。
+
+### 10.28 HBG H3信任根：task-owned blob不能用自己的binding自证可写
+
+#### 10.28.1 10.27的expected binding仍然缺少一个可传递的owner
+
+10.27中 `restore_hbg_launch_blob` 已要求caller另行提供 `expected_binding/expected_identity`，方向比“直接信任blob header”正确，但它还没有回答这份expected binding到底是谁创建、包含哪些必须freeze的地址、如何证明没有被中途改写。如果未来AICPU entry只是把blob中的 `header.binding` 复制一份当expected再调restore，形式上有两个参数，实际仍然是不可信source自证。
+
+因此H3先新增一个固定interface的prepare-time trust root：
+
+```text
+HbgExecutionSlotRegistration (144 bytes, align 8)
+  magic / ABI major+minor / exact struct_size
+  device_id
+  required flags:
+    CAPACITY_FROZEN
+    SERIAL_ONLY
+  max_launch_blob_size
+  HbgExecutionBinding:
+    working SM base/capacity
+    working runtime-arena base/capacity/runtime_offset
+    working GM-heap base/capacity
+    slot_generation
+  outer Runtime base/size
+  device KernelArgs base/size
+  binary_generation
+  registration_hash
+```
+
+这份记录将由未来HBG L1 prepare在实际device allocation全部成功后构造，host保留一份copy，并将完全相同的immutable bytes注册给HBG AICPU state。task/captured node只拥有graph package，不拥有也不能更新slot registration。
+
+#### 10.28.2 为什么不只记SM/arena/heap三个base
+
+HBG一次执行真正依赖的persistent device state不只有scheduler working image。outer `Runtime`保存handshake、worker topology、SM/heap/prebuilt-arena pointer与function table；device `KernelArgs`又持有outer Runtime、register window和AICore launch参数。如果只验证SM/arena/heap，旧captured package仍可能在context重建后指向新的working image，却与旧Runtime/KernelArgs/binary generation混用。
+
+新注册记录因此同时freeze：
+
+- 三个working windows和runtime offset；
+- outer Runtime device copy的完整window；
+- device KernelArgs copy的完整window；
+- slot generation与binary generation；
+- 本context首版允许的最大serialized launch bytes；
+- `SERIAL_ONLY`硬契约，明确v1的一个working slot不可支持并发graph replay。
+
+validator还拒绝五类window之间的任何地址重叠。当前 `KernelArgsHelper` 的outer Runtime和device KernelArgs本来就是两次独立device allocation，HBG pooled SM/arena/heap也分别是独立arena，所以这不改变现有合法layout；它防止未来为省一个allocation而未经设计地让restore destination覆盖control block。
+
+#### 10.28.3 capacity freeze的数学边界
+
+`max_launch_blob_size` 首先必须能容纳：
+
+```text
+canonical header
++ at least two region descriptors
++ alignment padding
++ full working SM capacity
++ full runtime-arena capacity
+```
+
+因为这两个full image是每次restore的强制项，小于这个下界的注册没有任何合法package，必须在prepare阶段拒绝。上界暂时不超过 `UINT32_MAX`，原因是当前HBG blob的 `total_size`和已核对CANN args-copy内部carrier都是32-bit；这只是防silent narrowing的PyPTO ABI边界，**不是CANN承诺支持接近4 GiB args**。真正可用64 KiB、1 MiB、16 MiB、64 MiB或更大尺寸仍必须由device 1 H0扫描决定。
+
+注册只保存max，不会把max假装成每个CANN task args allocation的真实size。HBG host bridge未来仍必须在launch前验证：
+
+1. fresh writable blob的实际 `args_size` 与header `total_size` 完全一致；
+2. 实际size不超过registration max；
+3. runtime确实复制了这么多bytes，而不是在某个backend被clamp；
+4. AICPU固定header parser只在上述host/runtime合约下使用 `total_size`，不声称kernel入参本身能查询backing allocation长度。
+
+第四点是 `aclrtLaunchKernelWithHostArgs` 入口只给AICPU function一个 `void *arg`而不额外传 `args_size` 的真实限制；注册max能给出private protocol的上界，但不能对一个绕过host bridge的恶意裸symbol调用独立证明device allocation真有那么大。这个信任边界必须在H5 AICPU entry注释和P0 probe中保留，不可在文档中隐去。
+
+#### 10.28.4 registration seal与restore的新关系
+
+`seal_hbg_execution_slot_registration` 在写hash之前先检查：
+
+- magic/version/exact struct size/reserved/required flags；
+- device id和可选expected current device；
+- 全部window非空、加法不溢出，runtime offset在arena内；
+- slot/binary generation非0；
+- package capacity同时满足full-image下界和32-bit carrier上界；
+- 五个persistent/mutable windows互不重叠。
+
+全部成功后才使用FNV-1a封存registration hash；失败seal保留caller原有hash，避免一份半更新记录被误发布。这个hash是防止stale/corrupt host-device protocol的一致性token，不被当作针对恶意device代码的密码学认证。
+
+`restore_hbg_launch_blob` 的API同步改为只接受完整 `HbgExecutionSlotRegistration`，顺序变为：
+
+```text
+validate sealed slot registration
+  -> validate actual blob size <= frozen max
+  -> validate device-patched blob against registration.binding
+  -> validate invocation identity/hash/full restore manifest
+  -> copy and cache-publish every region
+  -> commit registration.slot_generation + plan generation/hash/identity
+```
+
+所以现在有三种不同的失败面：slot registration被拒绝时0-copy；slot合法但blob与之不匹配时0-copy；copy/publish中途失败时slot可能partial-dirty但commit不变。三者不再被一个模糊错误码混在一起。
+
+#### 10.28.5 验证、提交和未完成边界
+
+新增 `test_hbg_execution_slot` 6项无硬件反例：
+
+1. 封存完整注册、expected device mismatch及seal后字段篡改hash mismatch；
+2. 缺frozen/serial flag、非法device、零slot/binary generation、缺outer Runtime或KernelArgs window；
+3. 小于full-image下界、超过32-bit carrier上界、为0或超过registered max的本launch size；
+4. SM/arena、heap/Runtime、Runtime/KernelArgs的三类alias；
+5. device window和minimum blob size的溢出；
+6. 失败seal不覆盖旧hash。
+
+`test_hbg_launch_blob` 另加了篡改binary generation但不重算registration hash的restore反例，确认在任何copy前返回 `SlotRejected/HashMismatch`且不更新旧commit。
+
+验证结果：
+
+- runtime完整pre-commit通过；
+- runtime editable build通过；
+- HBG定向测试：slot registration **6/6 passed**，blob/restore **16/16 passed**；
+- no-hardware C++全量：**87/87 passed**，其中71项标记 `no_hardware`；
+- HBG/runtime相关Python：**112 passed, 4 skipped, 14 warnings**；
+- `git diff --check`通过；未运行NPU任务，未使用device 0。
+
+runtime阶段提交：
+
+```text
+f6ad61df Add: 建立HBG稳定执行槽可信注册协议
+```
+
+这份提交是H3的共享ABI/校验基础，不是H3 production完成。当前DeviceRunner尚未在HBG L1 prepare中一次性分配五个window，也尚未把注册bytes通过独立AICPU registration task发布到device。现有HBG L2 `setup_static_arena` 遇到更大request仍可以release/recommit，不能直接当成capture-safe H3 owner。下一步必须在HBG L1专用prepare路径中先commit容量、再生成registration，并在第一个package可能被capture后把所有增容/换址请求变成fail-closed。HBG capability仍继续为false。
