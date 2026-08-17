@@ -2355,3 +2355,230 @@ ade00349 Add: 固化HBG任务级函数绑定身份
 - HBG L1或HBG ACLGraph已经supported。
 
 下一阶段回到H3/H5主线：由DeviceRunner在frozen working arenas、outer Runtime、device KernelArgs和已注册AICore executor全部稳定后，形成完整 `HbgExecutionSlotRegistration`的host owner并seal；generation与package capacity必须有明确来源，不能使用CANN内部“约2048次launch”或256 MiB实现常量。registration发布给独立HBG AICPU entry之后，才能把本轮的函数表互证放进每次device restore的success gate。
+
+### 10.33 HBG H3继续实现：完整slot registration的host trust-root owner
+
+#### 10.33.1 本阶段要解决的不是“再做一份binding”
+
+10.29已经分配并冻结了working GM heap、shared-memory和runtime arena；10.30/10.31/10.32又建立了task-owned graph plan、函数表和identity。此前仍没有一个由context owner统一认可的对象，能够回答未来AICPU restore前必须校验的全部persistent事实：
+
+```text
+这是不是同一个device？
+这是不是同一代working slot？
+SM / runtime arena / GM heap的base与capacity是否仍是prepare时那组？
+outer Runtime和device KernelArgs是否仍是同一组allocation？
+通用AICore executor是否仍是同一份binary？
+这个runtime-owned graph package是否超过prepare时允许的结构容量？
+这个registration本身是否被修改？
+```
+
+launch blob不能靠自己携带的binding回答这些问题，否则任何stale/corrupt blob都可以“自报一个匹配自己的destination”。`HbgExecutionSlotRegistration`在10.28已经定义了144-byte ABI和校验器，但此前只有测试构造的样例，没有production host owner。
+
+本阶段将“arena事实由谁提供”“generation由谁生成”“何时seal”“失败后谁保留”分别落到明确owner上。仍没有把registration交给AICPU，因此这一步是H3 host trust-root完成，不是H3/H5 device闭环完成。
+
+#### 10.33.2 generation不能由host-runtime DSO或launch次数生成
+
+一个容易实现但不可靠的方案是在 `libhost_runtime.so`中放static atomic。`ChipWorker::finalize()`会 `dlclose`该DSO；重新加载同一runtime后static counter可以从头开始。若将这种值写进captured package，generation的“不复用”就依赖DSO加载历史，而不是进程owner。
+
+另一个错误方案是使用kernel launch次数、所谓“约2048次launch”上限或某个args pool index。这些值既不是公开稳定规格，也不能证明context/resource lifetime；host launch返回更不代表device已消费task。
+
+现有 `ChipWorker`本来就为native run维护一个进程生命周期单调 `run_epoch`，其代码位于常驻的 `_task_interface`侧而非动态host runtime。此次将该source重命名为更准确的 `next_process_epoch()`，并让下列对象共用同一非零唯一性域：
+
+```text
+L1 context generation
+native-run epoch
+```
+
+实现使用原子compare-exchange，从1单调递增；达到 `UINT64_MAX`后直接抛出overflow，不回绕复用。L1 context在调用host runtime init前领取一个generation；失败init可以烧掉编号，但不能重复使用旧编号。
+
+内部 `simpler_l1_init` ABI新增最后一个 `uint64_t context_generation`参数：
+
+- `ChipWorker`自动生成并传入，Python `pypto_init`和operator API不增加参数；
+- onboard C API和 `DeviceRunnerBase::initialize_l1_borrowed`同时拒绝0；
+- simulator的unsupported stub保持同签名，避免host runtime产物间ABI漂移；
+- L2/L3 `simpler_init`签名完全不变；
+- TRB L1也收到generation，但不为此分配HBG registration，只把它作为dormant context identity保留到close。
+
+generation在execution mode成功claim后、stream/event init之前进入DeviceRunner。若init失败且全部回滚到 `New`，它被清0；若stream/event rollback失败导致context必须保留给显式close，generation也随owner保留。这样失败初始化不会留下“有资源但generation owner丢失”的半状态。
+
+#### 10.33.3 HBG strong query只陈述arena事实，不发明generation
+
+common `hbg_l1_host_build.h`新增runtime-specific query：
+
+```text
+query_l1_hbg_execution_binding_impl(const Runtime *, HbgExecutionBinding *)
+```
+
+职责边界刻意很窄：
+
+- common/TRB只有weak unsupported实现；
+- A2/A3和A5 HBG各自提供strong实现；
+- strong实现只在 `prepare_l1_runtime_impl`已经成功冻结static arena后可用；
+- 它从host `Runtime`读取精确SM、runtime arena、GM heap base/capacity和runtime offset；
+- 它要求三块device window与offset自身有效，失败时不替换caller output；
+- 输出的 `slot_generation`必须为0。
+
+最后一点是所有权防线：runtime maker知道自己分配了哪些arena，但不知道进程context identity。若strong hook自行填写generation，DeviceRunner就无法区分“runtime事实”和“caller自报identity”，也会重新引入DSO lifetime问题。
+
+editable build后的符号核对结果符合隔离预期：
+
+```text
+A2/A3 HBG onboard:  T query_l1_hbg_execution_binding_impl
+A2/A3 TRB onboard:  W query_l1_hbg_execution_binding_impl
+A5 HBG onboard:     T query_l1_hbg_execution_binding_impl
+A5 TRB onboard:     W query_l1_hbg_execution_binding_impl
+```
+
+sim产物也成套重编；公开HBG support query仍为false，因此这些strong prepare/query基础不会被用户入口半途调用。
+
+#### 10.33.4 registration只能在所有persistent window稳定后seal
+
+`DeviceRunnerBase::prepare_l1_callable_locked`原来的静态prepare顺序是：
+
+```text
+prepare platform/runtime state
+  -> allocate/copy outer Runtime
+  -> allocate/copy device KernelArgs
+  -> register generic AICore executor binary
+  -> enqueue AICPU init/register callable
+```
+
+本阶段把registration构建插在“executor注册完成”和“任何AICPU init/register enqueue”之间。此时：
+
+- HBG working GM heap/SM/runtime arena已经分配并freeze；
+- outer Runtime device allocation及其精确copy size已知；
+- device KernelArgs allocation及 `sizeof(KernelArgs)`已知；
+- `rtRegisterAllKernel`已经成功，capture-time launch不需要lazy registration；
+- AICore executor原始bytes仍由context持有，可以计算稳定内容身份；
+- caller stream上还没有发布任何HBG registration task。
+
+如果runtime query返回unsupported，方法直接成功返回且不分配owner，这就是TRB路径。如果HBG query成功，DeviceRunner要求hook给出的generation仍为0，再填入自己的 `l1_context_generation_`。
+
+#### 10.33.5 binary identity与function binding identity不是同一个东西
+
+registration中的 `binary_generation`本阶段写入通用AICore executor ELF的build-id/FNV fallback内容身份。它证明context准备并pin住的是哪份executor binary。
+
+每个callable的child AICore binaries则不属于这一个字段：它们已经在每次graph plan的完整 `func_id_to_addr[1024]`和 `function_binding_hash`中表达。二者的生命周期根不同：
+
+```text
+registration.binary_generation
+  -> context-pinned generic executor / launch entry identity
+
+plan.identity.function_binding_hash
+  -> this task/captured node's exact child function address table
+```
+
+如果把二者合并成一个hash，要么每注册一个callable就必须重建context registration并使旧captured node stale，要么registration无法证明通用executor是否变化。当前拆分允许registration在context内保持immutable，同时每个plan拥有自己的callable-local table identity。
+
+字段名暂时保留既有ABI中的 `binary_generation`；过程记录明确它当前是content identity，而非另一个会随每次launch递增的counter。
+
+#### 10.33.6 package capacity如何确定，以及它不代表什么
+
+当前HBG plan只允许两个mandatory full-image region：
+
+1. 完整shared-memory image；
+2. 完整runtime-arena image。
+
+所以DeviceRunner使用 `hbg_minimum_launch_blob_size(binding)`推导当前registration的 `max_launch_blob_size`：
+
+```text
+aligned HbgLaunchBlobHeader
++ 2 * HbgLaunchRegion
++ frozen shared_memory_capacity
++ frozen runtime_arena_capacity
+```
+
+对当前manifest而言，这既是minimum也是exact structural capacity。它不是：
+
+- CANN公开支持的大参数上限；
+- runtime源码中的256 MiB内部常量；
+- launch次数或task args pool容量；
+- 未来GM heap initializer manifest的预留。
+
+如果后续加入GM initializer region，当前registration会因blob超过capacity而fail-closed，必须在capability开放前明确新的prepare-time预算并生成新context registration；不能捕获后再偷偷增大。即使当前结构size小于 `UINT32_MAX`并能seal，也仍必须由device 1 H0证明目标CANN路径完整copy、capture持有和replay这类实际大小的HostArgs。
+
+#### 10.33.7 transactional builder与immutable host owner
+
+common `hbg_execution_slot.h`新增 `HbgExecutionSlotRegistrationSpec`和 `build_hbg_execution_slot_registration`：
+
+- spec只包含DeviceRunner已经拥有的事实；
+- helper先构造local candidate；
+- 复用既有validator检查magic/version/flags、device、非零generation、全部window、capacity、overflow/alias和binary identity；
+- 只有seal成功、registration hash写入candidate后才替换caller output；
+- 任何失败保留原owner逐byte不变。
+
+DeviceRunner随后在prepare阶段分配：
+
+```text
+unique_ptr<const HbgExecutionSlotRegistration>
+```
+
+这份host owner只在HBG strong query成功时存在，TRB每个callable不增加大块按callable状态。`const`防止seal后被普通代码修改；未来独立HBG AICPU registration entry必须接收这同一份bytes，而不是从launch blob重新拼一份“看起来等价”的registration。
+
+registration host owner当前没有device copy，也没有AICPU static registry slot。过程文档使用“host trust root”而不是“device registration完成”，避免过度宣称。
+
+#### 10.33.8 close失败与重试所有权
+
+`finalize_l1_borrowed`仍在任何destructive teardown前进入Closing；prepare/launch不能再进入。registration owner和context generation不在teardown中途清除：
+
+- AICPU unload、KernelArgs/Runtime free、arena/memory allocator finalize任一失败时，close返回首个错误；
+- immutable registration与generation继续留在DeviceRunner中，host runtime DSO也由ChipWorker保留，可显式重试；
+- 只有所有device资源释放成功、L1ExecutionState实际到达Closed后，才reset registration owner和generation；
+- close不增加stream/device sync，调用方仍必须先graph destroy并external quiescence。
+
+这与未来device registration owner的要求一致：当device/static registration发布实现加入时，失败释放必须纳入同一事务，不能host owner先消失而device仍持有旧trust root。
+
+#### 10.33.9 测试、构建和仍未运行的硬件验证
+
+`test_hbg_execution_slot`先增加两个测试，再实现builder；第一次target build按预期因缺少spec与builder符号失败。完成后共8项通过，新增覆盖：
+
+1. spec构建出的registration逐项等于输入事实，registration hash非零且完整validator通过；
+2. 零slot generation导致build失败，caller原有registration逐byte不变；
+3. null output明确返回 `NullArgument`。
+
+本阶段验证结果：
+
+- runtime完整editable build通过，A2/A3、A5的onboard/sim、HBG/TRB产物成套重编；
+- no-hardware C++全量：**90/90 passed**，其中73项标记 `no_hardware`；
+- PyPTO L1与simpler ChipWorker高层无硬件UT：**51/51 passed**；
+- HBG/TRB query strong/weak符号核对符合预期；
+- changed-files pre-commit全部通过，包括headers、English-only、clang-format、LLVM 18 clang-tidy和cpplint；
+- `git diff --check`通过。
+
+没有运行任何NPU task，没有使用device 0。device 1仍没有新的空闲授权，因此registration是否能通过未来AICPU entry异步发布、其HostArgs大小能否capture、以及captured graph多次replay时是否保持同一trust root，均没有板上证据。
+
+runtime阶段提交：
+
+```text
+6b356c35 Add: 封装HBG稳定执行槽注册所有权
+```
+
+#### 10.33.10 当前可以宣称与下一步
+
+现在可以准确宣称：
+
+- L1 context拥有进程生命周期不复用、非零且不对Python暴露的generation；
+- HBG runtime maker只提供冻结arena事实，不能自行选择generation；
+- DeviceRunner在所有persistent window和通用executor稳定后，生成并seal完整registration；
+- registration冻结device、三块working arena、outer Runtime、device KernelArgs、context generation、executor内容身份、当前package结构容量和serial-only flag；
+- host registration owner immutable，并遵守close失败保留/成功释放语义；
+- TRB weak路径不创建HBG registration owner，L2/L3 API不变。
+
+仍然不能宣称：
+
+- registration已经通过独立HBG AICPU entry发布到device；
+- AICPU restore已经以这份registration为trust root；
+- `max_launch_blob_size`已经由CANN device capability证明；
+- HBG public callable registration已接受host orchestration DSO；
+- HBG L1/ACLGraph已supported。
+
+下一阶段需要实现独立HBG AICPU registration ABI和device-side immutable registry owner。它至少要：
+
+1. 与TRB `L1RegisterCallableArgs`分离，不能让fixed callable ABI误解析144-byte slot registration；
+2. 在prepare caller stream上使用WithHostArgs异步发布，不引入sync；
+3. device端先byte-safe复制/校验registration，再一次性publish ready；
+4. 重复注册必须要求bytes/hash完全一致，冲突fail-closed；
+5. close/failure时明确AICPU static state与binary unload的顺序；
+6. 随后独立HBG run entry才能用这份trust root校验runtime-owned graph blob并执行per-replay restore。
+
+在registration device owner和run entry完成前，不能为了“先跑起来”让AICPU直接信launch blob里的binding，也不能复用TRB固定run entry偷渡variable tail。
