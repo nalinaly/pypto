@@ -2582,3 +2582,239 @@ runtime阶段提交：
 6. 随后独立HBG run entry才能用这份trust root校验runtime-owned graph blob并执行per-replay restore。
 
 在registration device owner和run entry完成前，不能为了“先跑起来”让AICPU直接信launch blob里的binding，也不能复用TRB固定run entry偷渡variable tail。
+
+### 10.34 HBG H3继续实现：独立AICPU registration与binary-lifetime device owner
+
+#### 10.34.1 先再次区分context trust root与task graph package
+
+本阶段直接承接用户对HBG graph内存的要求：每次dynamic host build产生的graph，在H2D并作为一次kernel task的输入时，本质上等价于AscendC每次launch的tiling参数。由此有两条不能互相替代的lifetime：
+
+```text
+context lifetime
+  HbgExecutionSlotRegistration
+    -> 哪个device / slot generation
+    -> working SM/runtime arena/GM heap window
+    -> outer Runtime / device KernelArgs
+    -> generic AICore executor identity
+    -> package capacity ceiling
+
+task / captured-node lifetime
+  runtime-owned HbgLaunchBlob
+    -> 本次host build的pristine SM image
+    -> 本次host build的pristine runtime-arena image
+    -> 本次host_total_tasks
+    -> 本次callable-local function table/hash
+    -> 本次tensor addresses / scalars / plan generation
+```
+
+context registration可以且应该只有一份；task package绝不能因为当前“全核占用、禁止并发”就只有一份可覆盖buffer。禁止并发只允许多个执行复用同一个mutable working slot，不允许后一次host launch改写前一个尚未被CANN消费、或已经被ACLGraph捕获的pristine source。
+
+所以本阶段只建立第一条lifetime在AICPU侧的owner。它没有把graph blob存进registry，也没有让后一次build覆盖前一次package；真正类似tiling_data的runtime-owned task package仍留给下一阶段的独立run entry。
+
+#### 10.34.2 为什么registry跟随AICPU binary lifetime，而不提供reset
+
+registration内包含多个device地址。AICPU restore未来会在每次replay前读取它，因此device侧必须存在一个跨task稳定、不可被普通run修改的owner。
+
+本阶段选择把它放在HBG AICPU runtime DSO的静态存储中：
+
+- `aclrtBinaryLoadFromData`成功后，DSO与静态registry一起存在；
+- prepare registration task只负责一次性发布immutable bytes；
+- 所有后续HBG run task只读acquire该registry；
+- caller完成外部quiescence后，显式close先unload AICPU binary；
+- binary unload成功即结束device registry lifetime，之后才允许释放它引用的Runtime/KernelArgs/arena；
+- binary unload失败则registry仍可能存在，host不能先释放其引用对象。
+
+registry没有公开或内部reset函数。若允许单独把Ready改回Empty，会出现旧captured node仍可replay、但同一DSO静态slot已经接受另一代registration的ABA问题。context generation虽然能检测generation不一致，却不能让已经释放并可能复用的旧device地址重新安全。正确的代际边界是整个L1 context与其AICPU binary owner，而不是一条可重置全局变量。
+
+#### 10.34.3 `Empty -> Publishing -> Ready`的一次性发布协议
+
+common新增 `hbg_execution_slot_registry.h`，定义device-process owner：
+
+```text
+HbgExecutionSlotRegistry
+  atomic phase
+  HbgExecutionSlotRegistration registration
+```
+
+phase只有三个合法值：
+
+```text
+Empty      尚无registration
+Publishing 唯一writer已经取得发布权，但完整bytes尚不可读
+Ready      immutable registration已经release-publish
+```
+
+注册流程严格按以下顺序：
+
+1. 从task args复制出本地 `HbgExecutionSlotRegistration candidate`；
+2. 用expected device id执行完整magic/version/size/flags/generation/window/capacity/overlap/hash校验；
+3. 校验失败直接返回 `SlotRejected`，registry仍为Empty，registration bytes不变；
+4. CAS从Empty取得Publishing；
+5. 复制完整144-byte candidate到registry；
+6. release-store Ready；
+7. reader只有在acquire-load看到Ready后才复制registration，并再次运行完整validator；
+8. reader验证失败返回 `CorruptState`，不向caller发布部分output。
+
+Ready之后不再写任何registration field。再次注册时：
+
+- candidate逐byte完全相同：返回 `AlreadyRegistered`，作为幂等成功；
+- 任一byte不同：返回 `Conflict`，旧owner保持不变；
+- 观察到Publishing：返回Publishing并fail-closed，不等待、不覆盖；
+- phase为任何未知值：返回CorruptState。
+
+这里使用逐byte相等不是为了替代validator，而是在两份都已经通过validator后，进一步要求duplicate registration真的是同一个context trust root。仅比较generation或hash字段会把碰撞、字段遗漏或错误重建降级成隐式覆盖。
+
+#### 10.34.4 独立HBG AICPU entry，不复用TRB callable ABI
+
+A2/A3和A5的HBG AICPU DSO各自新增并导出：
+
+```text
+simpler_aicpu_l1_hbg_register_execution_slot
+```
+
+它与TRB的下列入口没有ABI关系：
+
+```text
+simpler_aicpu_l1_register_callable
+  payload = L1RegisterCallableArgs
+  内容 = callable id + device orchestration SO + callable-local kernel addresses
+```
+
+HBG新入口的payload就是完整sealed `HbgExecutionSlotRegistration`。这样144-byte context registration不会被TRB fixed callable parser误解释，未来variable graph blob也不会借TRB `L1AicpuInvocationArgs`尾部偷渡。
+
+CANN task-argument地址不保证满足C++对象的自然对齐，所以entry不直接cast/dereference `void *arg`。它先 `memcpy` 到正确对齐的本地对象，再调用common registry publisher。这个规则与现有TRB L1 entry对 `L1RegisterCallableArgs`和 `L1AicpuInvocationArgs`的处理保持一致。
+
+entry使用此前 `simpler_aicpu_init`在同一caller stream上发布的device id作为expected device，registration自己的device id不能自证。首次Published和逐byte相同的AlreadyRegistered都返回成功；SlotRejected/Conflict/Publishing/CorruptState均返回错误。
+
+#### 10.34.5 host prepare发布顺序与canonical owner保护
+
+DeviceRunner在静态资源prepare中的关键顺序现在是：
+
+```text
+prepare/freeze HBG working arenas
+  -> upload outer Runtime
+  -> upload device KernelArgs
+  -> register generic AICore executor
+  -> build/seal immutable host slot registration
+  -> enqueue simpler_aicpu_init on caller stream
+  -> enqueue HBG slot registration on the same caller stream
+  -> 后续才允许进入runtime-specific callable/plan prepare
+  -> record PrepareTail
+```
+
+registration必须排在init之后，因为AICPU侧要用init latched的device id校验；必须排在任何future HBG run之前，因为run只能acquire Ready trust root。两条task都使用用户传入的caller stream，没有新增private AICPU stream、event绕行、stream sync或device sync。
+
+host owner是 `unique_ptr<const HbgExecutionSlotRegistration>`。虽然registration launch当前没有placeholder，`aclrtLaunchKernelWithHostArgs`的C接口仍接收可写pointer。为避免未来runtime patch行为或接口实现修改污染canonical trust root，DeviceRunner每次发布使用一个fresh writable栈副本：
+
+```text
+immutable canonical owner
+  -> byte copy to fresh launch_args
+  -> aclrtLaunchKernelWithHostArgs snapshots launch_args
+  -> host call return后launch_args可销毁
+```
+
+只有CANN接受enqueue后，host才置 `l1_hbg_execution_slot_registration_enqueued_ = true`。该bool只表示“device/static owner可能已经或将要出现”，不表示AICPU task已经执行，更不表示device已消费后续graph package。prepare整体仍通过caller-stream FIFO与PrepareTail定义顺序。
+
+#### 10.34.6 close失败必须在释放被引用window之前停止
+
+此前close即使 `LoadAicpuOp::Finalize()`失败，仍会继续尝试释放device KernelArgs、outer Runtime和arena。对没有persistent device registration的旧路径，这至少不会留下一个仍可读这些地址的HBG registry；一旦本阶段把registration发布给resident DSO，该顺序就不再安全。
+
+现在close执行：
+
+1. 先进入粘性Closing，禁止新的prepare/launch；
+2. 调用AICPU binary unload；
+3. 若unload成功，清除“registration已入队”标记，device registry lifetime结束；
+4. 若unload失败且HBG registration曾入队，立即返回首个错误；
+5. 不释放device KernelArgs、outer Runtime、working arenas、host registration或context generation；
+6. ChipWorker保留host runtime DSO与DeviceRunner owner，允许显式close retry；
+7. 只有后续unload成功后才继续其他资源释放；
+8. 全部资源与stream/event close成功后，最后清host registration与generation。
+
+即使registration AICPU task最终在device上返回校验错误，host也无法从异步launch返回值同步获知；只要task已经入队，就按“可能已发布”保守保留资源。这比根据host launch返回推断device状态更安全，也不需要引入内部sync。
+
+#### 10.34.7 symbol与capability隔离
+
+HBG host runtime新增strong `runtime_l1_extra_aicpu_symbols`，当前只报告：
+
+```text
+simpler_aicpu_l1_hbg_register_execution_slot
+```
+
+构建后的符号核对：
+
+```text
+A2/A3 HBG onboard AICPU: 导出HBG registration entry
+A5 HBG onboard AICPU:    导出HBG registration entry
+A2/A3 HBG sim AICPU:     导出HBG registration entry
+A5 HBG sim AICPU:        导出HBG registration entry
+TRB AICPU:               不导出该HBG entry
+
+A2/A3 HBG host runtime:  strong runtime_l1_extra_aicpu_symbols
+A5 HBG host runtime:     strong runtime_l1_extra_aicpu_symbols
+HBG l1_runtime_supported_impl: 仍为common weak/false
+TRB l1_runtime_supported_impl: 仍为strong/true
+```
+
+因此这一阶段的代码能被四变体编译和符号检查，但公开 `simpler_l1_prepare_callable`仍会在support gate前拒绝HBG。不会出现“registration能发、run entry不存在，却被Python误认为supported”的半开放状态。
+
+#### 10.34.8 无硬件反例与验证结果
+
+新增 `test_hbg_execution_slot_registry`，先在header不存在时确认target按预期编译失败，再实现状态机。5组测试覆盖：
+
+1. 有效registration只在完整校验后发布Ready，reader acquire后获得逐byte相同快照；
+2. hash篡改和expected device mismatch都返回SlotRejected，phase仍Empty，owner bytes不变；
+3. 同一registration重复发布返回AlreadyRegistered；
+4. 不同slot generation且重新seal的另一份有效registration返回Conflict，旧owner不变；
+5. Publishing、未知phase、空registry与null参数全部fail-closed，失败acquire不覆盖caller原output。
+
+本阶段验证结果：
+
+- runtime editable全构建通过，A2/A3和A5的onboard/sim、HBG/TRB全部重编；
+- no-hardware C++全量：**91/91 passed**，其中74项标记 `no_hardware`；
+- PyPTO L1与simpler ChipWorker Python回归：**51/51 passed**；
+- A2/A3、A5的onboard与sim HBG AICPU DSO均导出新entry，TRB不导出；
+- HBG host runtime的L1 symbol list为strong，support query仍是weak/false；
+- changed-files pre-commit通过headers、English-only、clang-format、LLVM 18 clang-tidy与cpplint；
+- `git diff --check`通过。
+
+没有运行任何NPU task，没有触碰device 0。device 1仍没有新的空闲授权；因此本阶段只证明ABI、host/device静态协议和构建完整性，没有证明CANN实际执行registration task或跨capture持有graph args。
+
+runtime阶段提交：
+
+```text
+4a8c3964 Add: 建立HBG执行槽设备注册所有权
+```
+
+#### 10.34.9 当前结论与下一阶段不可绕过的工作
+
+现在可以新增宣称：
+
+- HBG slot registration已经有独立于TRB callable ABI的AICPU entry；
+- device侧有binary-lifetime immutable registry，完整校验后才release-publish；
+- duplicate仅允许逐byte相同，冲突不覆盖；
+- host在caller stream上按init -> registration顺序异步发布，不创建private AICPU stream、不sync；
+- canonical host trust root不传给可写CANN API；
+- binary unload失败时，close不会释放registry引用的device window；
+- HBG capability仍关闭，L2/L3/TRB行为与symbol set保持隔离。
+
+仍然不能宣称：
+
+- 每个dynamic graph package已经交给CANN runtime-owned task args；
+- ACLGraph captured node已经独立持有其graph package；
+- HBG AICPU run entry已经acquire registry并restore working slot；
+- restore的cache publish与peer barrier已在A2/A3、A5设备上成立；
+- large HostArgs、placeholder patch、capture/replay lifetime已有板上证据；
+- HBG L1或HBG ACLGraph已经supported。
+
+下一阶段要实现的是独立HBG per-invocation run ABI，而不是继续扩registry。至少需要：
+
+1. DeviceRunner为本次callable与本次tensor/scalar args构建task-local `HbgGraphPlan`；
+2. 每次launch从immutable plan生成fresh writable HostArgs scratch和placeholder；
+3. CANN runtime-owned snapshot成为该eager task/captured node的pristine source owner；
+4. HBG AICPU run entry从task args取得variable blob，先acquire本阶段的device registration；
+5. exactly-one leader校验slot、package、plan identity与restored invocation state，再完整恢复working SM/runtime arena；
+6. cache publish和统一restore verdict完成后，peers才允许wire/classify/dispatch；
+7. 任一失败进入共同epilogue，不能留下AICore等待或半恢复slot；
+8. capability继续关闭，直到device 1完成同graph多次replay、A/B captured node交替、host owner释放压力和large-args边界实证。
+
+这里尤其不能把 `l1_hbg_execution_slot_registration_enqueued_`当作task package lease。它只保护context registration与其引用window；每个graph blob的lifetime仍必须由CANN task/graph或显式package lease独立承担。
