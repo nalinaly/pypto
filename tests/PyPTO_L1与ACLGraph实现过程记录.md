@@ -1464,3 +1464,99 @@ runtime阶段提交：
 下一阶段必须先定义HBG prepare-time stable slot与可信expected binding，再定义独立AICPU entry：device侧先把固定header复制到对齐local、比较slot generation/address/capacity/callable identity，exactly-one leader从runtime-owned inline source恢复full SM/runtime arena和initializer spans，所有peer看到同一restore verdict后才attach/classify/dispatch。只有这条路径存在，mutable HostArgs helper才有合法production call site。
 
 因此当前HBG capability继续为false；不能因为“已经调用得了带placeholder的runtime API”就忽略per-replay restore，也不能把CANN会复制args的源码行为扩大成captured graph lifetime已经通过。
+
+### 10.27 HBG H4正确性核心：每次replay恢复pristine image，完整成功后才提交epoch
+
+#### 10.27.1 为什么在stable execution slot完整接线前先落一层common restore core
+
+10.26结尾指出production顺序仍然是先建立H3 stable slot，再把H4 leader restore接到AICPU。这次没有颠倒该依赖：本阶段实现的只是不持有device资源、不选leader、不放行scheduler的common正确性核心，让后续H3/H4接线时不再重新发明“什么可以复制、什么时候才算一代可执行”。
+
+新增 `runtime/src/common/task_interface/hbg_restore.h`，其输入明确分成两个信任域：
+
+- `blob/blob_size`是本次task/captured node持有的variable runtime-owned bytes，必须当作不可信输入全量校验；
+- `expected_binding/expected_identity`必须来自prepare-time context/callable state，绝对不能先从blob中读出再原样传回validator；
+- `HbgRestoreOps`只提供无分配的copy和publish回调，以后A2/A3、A5可分别将其实现为device-memory copy与cache clean/barrier；
+- `HbgRestoreCommit`是完整恢复后的host/AICPU控制面候选commit，记录slot generation、plan generation/hash和invocation identity。
+
+这层不调用ACL/runtime API，不分配内存，不创建stream/event，不查capture状态，也不假设自己是leader。它是将来AICPU entry在“exactly-one leader已经选出、trusted slot registration已经查到”之后调用的纯恢复原语，不是完整HBG L1 runtime。
+
+#### 10.27.2 恢复前先验证task-owned source确实属于这个slot和这次invocation
+
+`restore_hbg_launch_blob` 只接受 `DevicePatched` 状态的blob：`inline_payload_addr`必须精确等于 `runtime_device_args_base + header_size`。这使恢复source不能偷换成blob外的某块device allocation，也不能把host-unpatched canonical bytes直接当成device args运行。`hbg_launch_blob.h`同时补了计算expected payload address时的无符号溢出检查。
+
+在任何working byte被改写前，validator会完成以下强校验：
+
+1. blob长度、header/region canonical layout、source/destination边界和全量SM/runtime-arena覆盖；
+2. blob中slot generation与prepare-time generation完全相等，所有base/capacity/runtime offset与trusted binding完全相等；
+3. callable/arguments/function-table identity与trusted identity完全相等；
+4. identity、restore descriptors和全部pristine payload的content hash仍然一致。
+
+因此stale captured node、另一个operator的package、已换址或已增容的slot、被截断/篡改的runtime args都在第一次copy前fail-closed。当前完整hash校验会在copy前额外扫描一遍大payload，这是首版correctness-first取舍，不被描述为最终性能形态。后续只能在device profile证明成本不可接受后，再设计fused copy/hash或更强的prepare-time trust token，不先删掉完整性门禁。
+
+#### 10.27.3 “复制成功”不等于“调度器可以看见新epoch”
+
+恢复核心按manifest顺序处理每个region：
+
+1. 用checked arithmetic计算runtime-owned inline source和trusted working destination；
+2. 调用copy回调恢复该region的完整bytes；
+3. 调用publish回调，为将来A2/A3、A5 cache clean/可见性协议保留明确边界；
+4. 所有region全部成功后，才一次性覆盖caller的 `HbgRestoreCommit`。
+
+任一copy或publish失败时，之前的working bytes可能已经被部分改写，这是不可能通过一个普通memcpy回调回滚的。协议不假装回滚成功，而是保证旧commit不变，并要求该slot保持non-dispatchable，直到下一次完整restore成功或context teardown。这个区分很重要：不允许scheduler仅看到某些cache line已经更新就开始classify/dispatch。
+
+`HbgRestoreCommit` 当前只是common层的transaction result，尚未形成AICPU peer可见的release-store gate。后续接入production时还必须明确：
+
+- leader将commit/cache clean完成后，以release语义发布restore verdict/generation；
+- peers以acquire语义等待同一verdict，只有success才能attach/classify；
+- failure必须走统一epilogue，不得放行hidden AICore继续等register window；
+- `blob_size`必须由prepare-time registration的可信max/package length约束，不能只相信untrusted header声明的 `total_size`。
+
+#### 10.27.4 无硬件反例要直接对应ACLGraph replay语义
+
+`test_hbg_launch_blob` 从13项增至16项，新增的三组用例不只检查“一次memcpy对不对”：
+
+1. `RestoresThePristineWorkingImageOnEveryReplay`：第一次恢复后主动将working SM/arena填成其他值，再次执行同一package，要求两个full image都恢复到初始快照；这对应“同一ACLGraph第二次replay不得沿用第一次已消费状态”。
+2. `AlternatingCapturedPackagesRestoreTheirOwnSnapshotIntoOneSlot`：A/B两个package携带不同argument identity和plan generation，按A→B→A顺序恢复到同一trusted slot，每次都必须看到当前node自己的SM/arena和commit；这对应v1无并发下多captured node共享working slot但不共享pristine source。
+3. `FailedRestoreNeverPublishesAReadyCommit`：stale slot generation在0-copy时拒绝；第二个region copy失败和第一个region publish失败都保持sentinel commit不变，即使working slot已被部分改写也不能发布ready。
+
+验证结果：
+
+- runtime完整pre-commit通过，包括LLVM 18 clang-tidy、clang-format、cpplint和header检查；
+- runtime editable build通过；
+- 定向HBG restore/blob target：**16/16 passed**；
+- `ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure`：**86/86 passed**，其中70项标记 `no_hardware`；
+- HBG/runtime相关Python回归：**112 passed, 4 skipped, 14 warnings**；
+- `git diff --check`通过；没有运行NPU任务，没有使用device 0。
+
+runtime阶段提交：
+
+```text
+de2aa0f9 Add: 建立HBG逐回放工作镜像恢复核心
+```
+
+#### 10.27.5 本提交与“graph像AscendC tiling参数被task管理”的精确关系
+
+当前四层关系已在common code中有了可执行的两段闭环：
+
+```text
+canonical HbgGraphPlan（host owner，尚未完整production化）
+  -> fresh writable HbgSerializedLaunchBlob
+  -> aclrtLaunchKernelWithHostArgs + placeholder
+  -> RuntimeOwnedHbgPayload（task/captured-node owner，待device 1证明）
+  -> restore_hbg_launch_blob on every invocation/replay
+  -> context-owned mutable HbgExecutionSlot（H3尚未接线）
+```
+
+这与AscendC tiling data相似的部分是：每个launch node拥有一份不会被下一次host build覆盖的参数快照，capture/replay时仍由该node的runtime args owner保持。与普通小tiling结构不同的部分是：HBG pristine payload较大且含有destination-bound device pointers，scheduler又会消费working image；因此它不能直接在runtime-owned source上执行，必须每次恢复到另一个稳定working slot。
+
+仍未完成的产品闭环包括：
+
+1. H3 prepare-time slot allocation/capacity freeze/device id与generation registration；
+2. HBG独立AICPU entry、exactly-one leader和peer acquire/release verdict；
+3. A2/A3、A5的真实copy/cache clean/invalidate协议；
+4. restore失败时AICPU/AICore common epilogue及operator tail的可终止性；
+5. CANN runtime对inline large args的snapshot时点、captured-node lifetime、graph destroy回收点和大小边界；
+6. host build对external tensor value的依赖分类，以及不D2H/不sync时哪些HBG callable可以被capture；
+7. device 1上同图多次replay、A/B两图交替、主动poison working state、cache-line canary和memory accounting实证。
+
+因此这次提交只把H4的“每次完整恢复、失败不提交”协议变成了可测代码。HBG `simpler_l1_supported()`仍为false，高层 `pypto_init` 仍必须拒绝HBG；当前不存在用host-only UT替代device 1 P0的结论。

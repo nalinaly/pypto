@@ -2445,7 +2445,7 @@ P0: WithHostArgs inline payload完整copy且随captured graph存活？
 
 ### N.9 第二阶段建议实施顺序
 
-> **2026-08-18实施快照：** runtime提交 `11b7a4b1` 完成第一笔不依赖device的H1/H2基础：A2/A3和A5拆开host orchestration SM image构建与同步H2D；common层新增destination-bound variable launch blob、deep-copy serializer和byte-safe validator。随后 `10e69df6` 增加mutable HostArgs + placeholder真实ACL API bridge，并在CANN调用前校验所有lossy carrier和pointer write。当前仍未形成完整owning `HbgGraphPlan`，也没有独立HBG AICPU entry、leader restore或stable execution slot，所以H1/H2只能标记为“host/launch桥接基础已落地、device闭环未完成”，HBG L1 capability继续为unsupported。详细代码、测试和未完成边界见过程记录10.25～10.26。
+> **2026-08-18实施快照：** runtime提交 `11b7a4b1` 完成第一笔不依赖device的H1/H2基础：A2/A3和A5拆开host orchestration SM image构建与同步H2D；common层新增destination-bound variable launch blob、deep-copy serializer和byte-safe validator。随后 `10e69df6` 增加mutable HostArgs + placeholder真实ACL API bridge，并在CANN调用前校验所有lossy carrier和pointer write。`de2aa0f9` 又将H4的正确性核心落为common层：每次从runtime-owned pristine source完整恢复working image，仅在全部region copy/cache-publish成功后提交新epoch，并用重复replay、A/B package交替和中途失败反例锁定语义。当前仍未形成完整owning `HbgGraphPlan`、stable execution slot注册、独立HBG AICPU entry或leader/peer发布协议；因此H1/H2是host/launch桥接基础，H4也只是无硬件恢复原语，device闭环未完成，HBG L1 capability继续为unsupported。详细代码、测试和未完成边界见过程记录10.25～10.27。
 
 当前进度不能解释成跳过H0：host-only ABI和边界拆分可以先写、先做无硬件fail-closed测试；任何关于CANN snapshot时点、captured-node lifetime、large args、cache可见性和replay恢复正确性的产品结论，仍必须由空闲device 1上的H0/P0实证给出。
 
@@ -2492,6 +2492,8 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 - 明确A2/A3、A5 cache clean/invalidate和release/acquire协议；
 - 与现有common epilogue整合，保证restore失败时hidden AICore不留在register-window轮询；
 - 先用full-span correctness restore，再以profile数据决定是否拆分immutable/mutable物理layout。
+
+当前已完成的只是runtime `de2aa0f9` 中不依赖device的restore core：它用prepare-time trusted binding/identity校验runtime-patched blob，逐span copy并调用cache-publish回调，所有span成功后才提交slot/plan generation。16项定向UT已覆盖同package重复恢复、A/B package交替和copy/publish中途失败不发布ready。尚未完成：H3 trusted slot registration、AICPU exactly-one leader、peer acquire/release verdict、A2/A3与A5 cache协议、failure common epilogue及device replay实证。这些未完成前不得把该common helper表述为H4 production完成。
 
 #### N.9.6 HBG Phase H5：独立L1 registration/runtime路径
 
