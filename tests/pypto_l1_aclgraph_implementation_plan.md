@@ -1,6 +1,8 @@
 # PyPTO L1 接入 ACLGraph 详细实现计划
 
-> 状态：设计讨论完成，等待按阶段实现。本文是指导性设计记录，完整上下文优先，不以篇幅压缩为目标。
+<!-- markdownlint-disable MD036 MD060 -->
+
+> 状态：TRB L1实现和无硬件回归已完成，已具备Phase-0 ST，但device 1 ACLGraph真实上板尚未通过；HBG仍是第二阶段准入设计。本文是指导性设计记录，完整上下文优先，不以篇幅压缩为目标。
 >
 > 首期范围：onboard、`tensormap_and_ringbuffer`（TRB）、`@pl.program`、静态 shape、PyTorch 直接调用验证。
 >
@@ -13,7 +15,7 @@
 - 附录 B 审计当前 L2/L3 源码调用链，并对照历史 `pto2/pypto` 的 L1/ACLGraph 实现；
 - 附录 C～F 展开 task package、workspace、stream、生命周期和方案取舍；
 - 附录 G～H 给出逐文件实施步骤和 before/after；
-- 附录 I～M 给出完整测试、事实门槛、提交顺序、评审清单和交付物。
+- 附录 I～M 给出完整测试、事实门槛、提交顺序、评审清单和交付物；附录 N 给出第二阶段HBG tiling-like graph payload的准入设计。
 
 摘要和附录发生表述差异时，以附录中更严格、更完整的约束为准；不得以摘要较短为理由省略附录要求。
 
@@ -40,7 +42,7 @@
 - A2/A3 与 A5 共用一套 L1 host 设计；架构差异只留在已有 arch-specific `KernelArgs` 和构建产物中。
 - 仅支持 onboard TRB；simulator 和 `host_build_graph` 明确返回 unsupported。
 - 仅支持 `@pl.program` 编译产物。
-- 输入输出个数、dtype、shape、stride 和参数布局在 prepare 后固定。
+- 输入输出个数、dtype、shape和参数布局由compiled callable固定；stride metadata在第一次成功enqueue后绑定。
 - scalar 值及 tensor device 地址作为每次调用参数；capture 后它们是否更新由 ACLGraph 的参数语义负责，PyPTO 不判断。
 - 关闭 args dump、PMU、dep-gen、L2 swimlane、scope stats 等可能引入额外资源或回读的 DFX 功能。
 - Python convenience wrapper 只做 forward，不做 autograd。
@@ -132,7 +134,7 @@ L1 不能在 launch 中重复 alloc/copy/free，但这个“一层指针”的 A
 ### 4.5 kernel binary 已有两种所有权
 
 - executor AICore ELF 由 `rtRegisterAllKernel` 注册，handle 在 `DeviceRunnerBase` 中缓存；当前没有对应的公开 unregister。
-- child/incore kernel binary 由 PyPTO 上传到 ChipCallable 相关 GM，并通过 `func_id_to_addr_` 分发，没有走 `aclrtRegisterBin`。
+- child/incore kernel binary 由 PyPTO 上传到 ChipCallable 相关 GM，没有走 `aclrtRegisterBin`。历史L2/L3使用runtime `func_id_to_addr_`；L1每个callable保存独立映射快照并在本次invocation重放。
 
 首期二者都按 context 生命周期 pin 住。child binary 允许持续累积，不在本次引入回收算法。
 
@@ -144,7 +146,7 @@ L1 不能在 launch 中重复 alloc/copy/free，但这个“一层指针”的 A
 
 ```cpp
 struct L1ExecutionState {
-    L1Phase phase;                 // created/prepared/poisoned/closed
+    L1Phase phase;                 // new/initializing/collecting/ready/sealed/poisoned/closing/closed
     int32_t device_id;
     rtStream_t aicore_stream;      // hidden, persistent
     rtEvent_t start_event;
@@ -236,7 +238,7 @@ caller stream                                hidden AICore stream
 -------------                                --------------------
 ... predecessor tasks
 | L1 operator entry
-| wait(serial_tail, if any)
+| [host only on stream switch: query previous serial_tail; never enqueue a wait]
 | aclrtMemsetAsync(handshake only)
 | record(start) ---------------------------> wait(start)
 | launch AICPU with host args                 launch persistent AICore executor
@@ -249,7 +251,7 @@ caller stream                                hidden AICore stream
 Host enqueue 顺序必须固定为：
 
 1. 用 context mutex 防止两个 host 线程交叉下发同一组 event 操作；
-2. caller stream 等待上一次 `serial_tail`（首次调用跳过）；
+2. 若caller raw stream与上一调用不同，host用 `aclrtQueryEventStatus` 非阻塞确认上一 `serial_tail` 已完成；未完成直接报错且不enqueue，完成后也不把旧tail wait加入新stream；同一raw stream依赖FIFO；
 3. `aclrtMemsetAsync` 只清理 handshake/invalidation 区域；
 4. caller stream record `start_event`；
 5. caller stream enqueue AICPU `aclrtLaunchKernelWithHostArgs`；
@@ -265,7 +267,9 @@ caller stream 自身保证 AICPU 完成后才越过步骤 9；`aicore_done_event
 
 `aicore_done_event` 同样不能用“AICPU orchestrator 已返回”替代。AICore executor 可能仍在执行最后的 child task、shutdown 或 cache/visibility 收尾；caller stream 必须等待 hidden stream 的真正完成点后才能对外暴露算子完成依赖。
 
-`serial_tail_event` 使先后从不同 caller stream 发起的普通 L1 launch 也被串行化。ACLGraph replay 的并发仍不作为 v1 支持契约；同一 context 的多个 graph 不得重叠 replay。
+`serial_tail_event` 是host在**普通eager换流前**使用的完成证明，不再是跨stream自动插入的device依赖。原因是CANN会拒绝capture stream等待一个在capture外record且仍带record状态的event；即使用户已同步，event synchronize/stream synchronize也不会清掉这个capture-isolation状态。标准 `warmup -> external synchronize -> capture stream` 流程只能在host侧确认旧eager tail已经完成，然后不把旧event依赖带入capture。
+
+这个query不是capture状态查询，也不感知graph/model；它只查询public event对应的先前eager task是否完成。capture会创建自己的event generation/clone，host以后查询原event不能证明graph replay已经完成。因此ACLGraph replay的并发仍不作为v1支持契约；graph→eager、两个graph交替或并发replay，以及capture后切换stream，都必须由调用方先保证外部quiescence。同一context的多个graph不得重叠replay。
 
 ### 6.2 为什么只 reset handshake
 
@@ -314,6 +318,7 @@ int simpler_l1_prepare_callable(
     DeviceContextHandle ctx,
     int32_t callable_id,
     const void *callable,
+    size_t callable_size,
     void *caller_stream);
 
 int simpler_l1_launch(
@@ -326,7 +331,7 @@ int simpler_l1_launch(
 约束：
 
 - `simpler_l1_init` 读取当前 device id 并校验，不取得 device reset 所有权。
-- `prepare_callable` 可做 allocation、binary upload、AICPU callable load 和 arena 构建，但必须在 capture 外调用；异步准备使用 caller stream，不在内部 sync。
+- `prepare_callable`可做allocation、binary upload、AICPU callable load和arena构建，但必须在capture外调用；异步准备使用caller stream，不在内部sync。`callable_size`是canonical `ChipCallable` blob的精确长度，native必须在任何hash/upload前校验header、name、binary和全部child offset/length恰好落在该范围内，拒绝truncation与trailing bytes。
 - `launch` 只接收预注册 callable、固定布局 args 和 stream；不接收 `RuntimeHandle`，不提供 poll/wait/finalize-run。
 - `finalize_device` 根据 mode 释放 PyPTO 自己持有的 L1 资源，但 L1 分支绝不 `rtDeviceReset/aclFinalize`。
 - 所有 runtime variant 导出同名 symbol；sim/HBG 的 `simpler_l1_supported()` 返回 0，其余 L1 API 返回清晰 unsupported error，避免 `dlsym` 差异。
@@ -341,20 +346,22 @@ int simpler_l1_launch(
 nanobind 层只暴露原始能力，不依赖 torch_npu：
 
 ```python
-worker.l1_init(...)
-worker.l1_prepare_callable(handle, callable, stream_ptr)
-worker.l1_launch(handle, chip_storage_args, stream_ptr)
+worker.init_l1(device_id, runtime_binaries, call_config)
+worker.l1_prepare_callable(callable_id, callable, raw_stream_address)
+worker.l1_launch(callable_id, chip_storage_args, raw_stream_address)
+prepare_call = worker.l1_make_prepare_queue_call(callable_id, callable)
+launch_call = worker.l1_make_launch_queue_call(callable_id, chip_storage_args)
 ```
 
-`stream_ptr` 使用 `uintptr_t`/capsule 传递，native 入口立刻校验 null 和 device。binding 在 native enqueue 时释放 GIL，但不等待设备完成。
+direct入口的raw stream是整数地址（`uintptr_t`语义），不是capsule；命名capsule只封装taskQueue deferred prepare/launch descriptor。native入口立即校验null和device。binding在native enqueue时释放GIL，但不等待设备完成。
 
 ### 8.2 独立 PyTorch convenience wrapper
 
 新增尽量独立的 torch_npu adapter，职责仅包括：
 
-- 从 `c10_npu::getCurrentNPUStream().stream()` 获取真实 current stream，并遵循 torch_npu taskQueue 调用方式；
-- 校验所有 tensor 位于同一 NPU device，把 `data_ptr`、metadata 和 scalar 打包为 `ChipStorageTaskArgs`；
-- 调用低层 L1 launch；维护 context/operator 强引用，避免 graph 存活期间资源析构。
+- 从 `c10_npu::getCurrentNPUStream().stream(false)` 获取真实 current stream，并遵循 torch_npu taskQueue 调用方式；`false`禁止这个入口因取stream而隐式排空taskQueue；
+- 校验所有 tensor 位于同一 NPU device，将Python tensor立即转换为C++ `at::Tensor` handle，并在callback入队前对普通torch_npu caching-allocator storage调用 `recordStream`；
+- 保持deferred descriptor和C++ Tensor handle到taskQueue callback完成，再调用低层 L1 launch。adapter不捕获Python对象，也不代替用户持有context、graph-bound tensors及external/custom storage owner到graph真正销毁和device完成。
 
 taskQueue 适配不得进入 simpler runtime core。core 永远只看一个外部 `aclrtStream`。
 
@@ -362,7 +369,7 @@ taskQueue 适配不得进入 simpler runtime core。core 永远只看一个外�
 
 ```python
 ctx = pypto.l1.pypto_init(
-    device=0,
+    device=device_id,  # mandatory; must already equal torch_npu current device
     programs=[compiled_program],
     config=l1_config,
 )
@@ -372,23 +379,24 @@ op = ctx.operator(compiled_program)
 op(x, out=y)
 ```
 
-wrapper 可基于静态 output spec 提供 eager 便利形式 `y = op(x)`，内部用 torch 分配输出；ACLGraph 首轮验收必须使用预分配 `out=`，把 torch allocator capture 行为与 PyPTO runtime 正确性分开验证。
+v1对纯Out参数始终要求预分配 `out=`，不实现 `y = op(x)` 的自动output allocation。若未来增加eager convenience，必须作为独立支持面；ACLGraph核心路径仍使用预分配 `out=`，把torch allocator capture行为与PyPTO runtime正确性分开验证。
 
 ### 8.3 prepare、warmup 和销毁
 
 ```python
-ctx = pypto.l1.pypto_init(...)
-op = ctx.operator(program)
+ctx = pypto.l1.pypto_init(programs=[compiled], device=device_id)
+op = ctx.operator(compiled)
 op.prepare()          # outside capture; idempotent
 op(x, out=y)          # eager warmup
 torch_npu.npu.synchronize()  # explicitly owned by user/test
 
-graph.capture_begin()
-op(x, out=y)
-graph.capture_end()
+graph = torch_npu.npu.NPUGraph()
+with torch_npu.npu.graph(graph, stream=capture_stream):
+    op(x, out=y)
 graph.replay()
 
-graph = None          # all graphs must die first
+torch_npu.npu.synchronize(device_id)
+graph.reset()         # all possible replays die first
 ctx.close()           # no implicit device/stream synchronization
 ```
 
@@ -400,7 +408,7 @@ ctx.close()           # no implicit device/stream synchronization
 
 - context 内 callable table 采用 append-only 语义。
 - 已注册 ID 不允许指向另一份 callable；重复注册同一 identity 幂等，冲突直接报错。
-- 已使用的 `func_id` 不允许被不同 child binary 地址重新绑定。
+- `callable_id` 不允许改指另一个identity；同一callable内的 `func_id -> child binary address` 快照不可变。不同独立program/callable可以都使用 `func_id=0` 并映射到不同binary。
 - unregister 在 L1 v1 中只移除 host 可见 handle，不能释放 graph 可能引用的 device binary/descriptor。
 - 所有 executor/child binary 与 device callable descriptor 在 `ctx.close()` 才统一回收。
 - 不依赖 runtime 内部“约 2048 次 launch”等规格，不把任何观察值写成 PyPTO 上限。
@@ -413,7 +421,7 @@ ctx.close()           # no implicit device/stream synchronization
 - 新 callable 若需要更大 workspace，可在 capture 外显式 prepare 时增长；已有地址如果会被 graph 引用，则不得搬迁，只能追加新 backing storage 或直接拒绝。
 - launch 路径发现资源不足一律报错，不能隐式 grow。
 - v1 不暴露 workspace 指针/size 给用户。
-- 因为调用被 `serial_tail` 排序且业务契约禁止并发 replay，同一份 workspace 可以安全复用。
+- 同raw stream由FIFO保证调用不重叠；换stream只在上一 `serial_tail` 已完成时放行；graph replay并发由业务契约禁止。因此v1可以复用同一份workspace。host mutex本身不是device完成证明，不能单独作为workspace复用依据。
 
 ## 10. AICPU/AICore executor 改造
 
@@ -525,12 +533,13 @@ L2/L3 的 `simpler_aicpu_exec` 保持原参数 ABI。共享逻辑通过内部函
 实现后按仓库环境执行，具体 ST selector 以新增测试 marker 为准：
 
 ```bash
-cd /mnt/workspace/inductor/pto/pypto
+cd /mnt/workspace/inductor/pto/gpt_pypto
 source .claude/skills/testing/load-env.sh
 cmake --build build --parallel "$PYPTO_BUILD_JOBS"
 python -m pytest runtime/tests/ut -n "$PYPTO_TEST_JOBS"
 python -m pytest tests/ut/runtime -n "$PYPTO_TEST_JOBS"
-python -m pytest tests/st/runtime/l1 -v
+# 仅在通过合规调度确认device 1空闲后执行；禁止fallback到device 0。
+python -m pytest tests/st/runtime/l1 -v --platform=a2a3 --device=1
 ```
 
 还要运行受改动模块现有的 compiled-program、task-interface 和 onboard TRB 回归；不能只跑新增 L1 case。
@@ -547,7 +556,7 @@ python -m pytest tests/st/runtime/l1 -v
 | hidden AICore 早于 caller predecessor 启动 | Phase 0/4 | `start_event` 是必选入口 gate；trace + 延迟 predecessor 测试验证；不提供 early mode |
 | caller 在 AICore 收尾前越过算子 | Phase 0/4 | `aicore_done_event` 是必选出口 join；不用 AICPU return/ack 推断整个算子完成 |
 | 新 callable 使稳定 workspace 地址失效 | Phase 2 | 追加 backing storage 或拒绝；绝不搬迁 graph 已引用地址 |
-| context 提前 close 导致 graph 悬空 | Python API | 强引用 + 显式 close 契约；不由 `__del__` 自动回收 |
+| context 提前 close 导致 graph 悬空 | Python API | 调用方显式持有context和graph-bound tensors，并按external quiescence -> graph reset/destroy -> close顺序处理；不由 `__del__` 自动回收 |
 | L1 finalize 误 reset torch_npu device | Phase 1 UT/ST | mode-specific finalize，mock 断言 reset/aclFinalize 从未调用 |
 | 异步错误导致 AICore/AICPU 等待不退出 | Onboard negative | 沿用 runtime timeout/error 机制；v1 不在 host launch 引入 wait |
 | L1 分支影响 L2/L3 hot path | 每阶段回归 | 新入口、新 state；共享 helper 只抽取纯公共逻辑 |
@@ -563,7 +572,7 @@ python -m pytest tests/st/runtime/l1 -v
 5. L1 launch 在 eager/capture 中走完全相同的路径，不查询 capture 状态，不持有 model/graph handle，不调用 `rtStreamAddToModel`，不存在 early-launch mode。
 6. launch 路径没有 device allocation/free、stream/event create/destroy、H2D/D2H staging、stream/device sync。
 7. 每次 AICPU 调用参数由 `aclrtLaunchKernelWithHostArgs` 形成独立快照；AICore 只引用 context-lifetime persistent device state。
-8. workspace 和 child binary 地址在 graph 生命周期内稳定；callable ID/func ID 不重绑定。
+8. workspace和child binary地址在graph生命周期内稳定；callable ID不重绑，同callable内func ID/address snapshot不变，不同callable可重复使用func ID数值。
 9. L1 close 不执行 `rtDeviceReset`、`aclFinalize`，不破坏 torch_npu device context。
 10. capture 前未 prepare、资源不足、unsupported runtime、DFX 开启等情况都在 host 侧清晰报错。
 11. 不依赖任何固定 kernel-launch 上限，也不向用户暴露 ACLGraph capture/replay 细节。
@@ -610,7 +619,7 @@ python -m pytest tests/st/runtime/l1 -v
 ### A.4 stream 和同步契约
 
 1. native L1 API 原则上必须显式接收 caller stream。
-2. PyTorch convenience wrapper 从 torch_npu current stream 获取底层 stream，参考用户给出的 torchair custom-op 用法；本仓库内可核对 `torch_npu/third_party/torchair/.../npu_utils.cpp` 中 `c10_npu::getCurrentNPUStream().stream()` 的同类做法。
+2. PyTorch convenience wrapper 从 torch_npu current stream 获取底层 stream，参考用户给出的 torchair custom-op 用法；必须调用 `c10_npu::getCurrentNPUStream().stream(false)`，不能使用会处理/排空taskQueue的默认 `.stream()` 重载。
 3. taskQueue 适配完全留在接近独立的 PyTorch wrapper，不把 torch/torch_npu 依赖传入 simpler core。
 4. AICPU 主执行 task 使用 caller stream，这是让 PyPTO 在外部看起来像普通 op 的关键。
 5. AICore 使用 PyPTO 内部持久 hidden stream；AICPU/AICore 双 stream 不出现在用户 API 中。
@@ -637,11 +646,11 @@ python -m pytest tests/st/runtime/l1 -v
 ### A.6 kernel binary 和 callable 生命周期
 
 1. 当前 executor AICore binary 由 `rtRegisterAllKernel` 注册并缓存 handle，没有通过 public `aclrtRegisterBin` 完成完整公共 API 生命周期。
-2. 当前 incore/child kernel binary 是 PyPTO 自己上传和管理的 GM 地址，通过 `func_id_to_addr_` 分发，没有注册成普通 runtime kernel。
+2. 当前 incore/child kernel binary 是 PyPTO 自己上传和管理的 GM 地址。历史L2/L3通过context runtime映射分发；L1对每个callable保存独立 `func_id -> addr` 快照，每次invocation只重放当前callable的映射。它们都没有注册成普通runtime kernel。
 3. v1 不要求立刻迁移 binary 注册 API，也不要求实现 device binary 内存复用。
 4. executor binary、child binary、orchestration SO、callable device descriptor 都至少存活到所有引用它们的 graph 被销毁。
 5. 为先保证正确性，child binary 允许在 context 内持续累积；`ctx.close()` 才统一释放 PyPTO 能释放的部分。
-6. callable ID 和 func ID 在 context 生命周期内不重绑定。相同 identity 的重复 prepare 可以幂等，不同 identity 冲突直接失败。
+6. callable ID在context生命周期内不重绑定；同一callable内的func ID/address snapshot不变。不同callable允许重复使用数值相同的func ID。相同identity的重复prepare可以幂等，不同identity冲突直接失败。
 7. unregister 不能立即释放 graph 可能引用的 binary/device descriptor；v1 可只撤销 host handle，device 对象继续 pin 到 context close。
 
 ### A.7 task package 和参数生命周期
@@ -669,7 +678,7 @@ python -m pytest tests/st/runtime/l1 -v
 
 1. simpler/native 提供 raw stream 的低层 L1 API；PyPTO 提供 `pypto_init`、operator、prepare/warmup/close。
 2. wrapper 只做 forward，首期不注册 autograd/backward。
-3. context/operator 必须强引用所有 graph 需要的 native state；关键 teardown 不依赖 `__del__`。
+3. context强持有全部native state，operator强持有context；但ACLGraph不会自动为PyPTO保持这些Python owner，调用方必须显式持有context和graph-bound tensors。关键teardown不依赖 `__del__`。
 4. 用户必须在 graph 销毁且相关 stream 工作完成后再 `ctx.close()`。PyPTO close 本身不偷偷同步。
 5. 测试首先覆盖 eager、单 kernel、多 child kernel、workspace，再做 ACLGraph capture/replay。
 6. 不使用 simulator 证明 stream 语义，不等待 inductor 接入，不把 dynamic shape、并发、外部 workspace 一并塞入首期。
@@ -889,7 +898,7 @@ launch AICore executor                     launch AICPU orchestrator early
 
 | 历史机制 | 源码事实 | 本计划的取舍 |
 | --- | --- | --- |
-| torch current stream 入参 | Python 将 `_current_stream()` 传到 native | 复用概念；由新 PyTorch adapter 取 `c10_npu::getCurrentNPUStream().stream()`，对 simpler core 只暴露 raw stream |
+| torch current stream 入参 | Python 将 `_current_stream()` 传到 native | 复用概念；由新 PyTorch adapter 取 `c10_npu::getCurrentNPUStream().stream(false)`，对 simpler core 只暴露 raw stream |
 | AICPU WithHostArgs | `load_aicpu_op.cpp:89-101` 调用 runtime WithHostArgs API | 复用机制；用它建立每次 invocation 的 runtime-owned 参数快照 |
 | AICore handle launch | `device_launcher.cpp:452-462` 调用 `RuntimeKernelLaunchWithHandleV2` | 作为 Phase 0 优先验证路径；但参数改为 context-lifetime persistent `KernelArgs *` |
 | executor binary 注册 | `kernel_binary.cpp:70-102` 注册/卸载整个 kernel binary | 参考 runtime-owned handle 思路；不假定它等价于当前 TRB child/incore binary GM 管理 |
@@ -943,6 +952,8 @@ wait(done) <------------------------------- record(done)
 5. 保留本文定义的 L1 单算子语义；图级优化不能暗中改变单独调用 L1 API 时的顺序保证。
 
 本计划仍然对 `host_build_graph` 的 L1 C API 返回 unsupported。本节只确定后续架构边界，不把 host-build-graph 改造偷渡进当前 TRB L1 的实现范围。
+
+第二阶段 HBG L1 + ACLGraph 的完整对象模型、WithHostArgs inline payload候选、per-replay restore、capacity/lifetime协议和device 1 P0矩阵见**附录N**。附录N是后续阶段准入设计，不改变本计划前文对当前TRB L1的API、完成定义和禁止项。
 
 ## 附录 C：kernel task package 与 device state 的完整推导
 
@@ -1049,8 +1060,9 @@ L1 需要逐字段审计，而不是直接把当前 struct 标记为 persistent�
 | 资源 | 创建时机 | 所有者 | launch 是否可修改 | 销毁时机 |
 | --- | --- | --- | --- | --- |
 | torch_npu device/context | PyTorch 初始化 | torch_npu/调用方 | 否 | 不由 PyPTO 销毁 |
-| input tensor storage | 用户/PyTorch | 调用方 | 只读或按 signature | 由调用方按 PyTorch 生命周期管理 |
-| output tensor storage | 用户预分配或 wrapper 分配 | 调用方/PyTorch | kernel 写 | 由 PyTorch 管理 |
+| input tensor storage | 用户/PyTorch | 调用方 | 只读或按 signature | default NPU caching allocator由adapter `recordStream`保护本次device use；调用方仍持有graph-bound tensor到graph销毁 |
+| output tensor storage | 用户预分配 | 调用方/PyTorch | kernel 写 | 同上；v1不自动分配纯Out storage |
+| external/from-blob/custom storage | 调用方/外部allocator | 外部owner | 按signature | `recordStream`可能无法接管；owner必须持有到graph销毁且最后真实device use完成 |
 | raw caller stream | PyTorch current stream | torch_npu | PyPTO只 enqueue | 不由 PyPTO 销毁 |
 | hidden AICore stream | `pypto_init` | L1 context | 只 enqueue | graph 销毁、外部 quiescence 后 `ctx.close()` |
 | start/done/tail events | `pypto_init` | L1 context | record/wait | 与 hidden stream 同期 |
@@ -1058,7 +1070,7 @@ L1 需要逐字段审计，而不是直接把当前 struct 标记为 persistent�
 | AICore executor handle | prepare/首次显式 binary prepare | L1 context | 否 | 若 API 可卸载则 close；否则遵守当前 runtime 生命周期 |
 | child kernel binary GM | callable prepare | L1 context append-only pool | 否 | `ctx.close()` |
 | orchestration SO/device descriptor | callable prepare | L1 context | 否 | `ctx.close()` |
-| callable ID/func ID maps | callable prepare | L1 context | 只追加，不重绑定 | `ctx.close()` |
+| callable ID / callable-local func ID maps | callable prepare | L1 context | callable ID只追加；同callable内mapping不重绑 | `ctx.close()` |
 | regs/FFTS tables | context prepare | L1 context | 否 | `ctx.close()` |
 | persistent Runtime/KernelArgs | context prepare | L1 context | 稳定字段不改 | `ctx.close()` |
 | handshake invalidation region | context prepare | L1 context | 每次 `aclrtMemsetAsync` | `ctx.close()` |
@@ -1067,7 +1079,7 @@ L1 需要逐字段审计，而不是直接把当前 struct 标记为 persistent�
 | AICPU invocation host image | 每次 Python/native launch | host 调用栈 | API 返回后可覆盖 | API 返回 |
 | CANN task args snapshot | 每次 WithHostArgs launch | CANN runtime | 不由 PyPTO访问 | runtime 确认 task completion 后 |
 | child task payload | 每次 AICPU execution | TRB arena | 本次 producer/consumer 使用 | serial-tail 后下一次 reset/reuse |
-| ACLGraph handle/graph pool | capture | 调用方/torch_npu | replay 使用 | 必须早于 `ctx.close()` 销毁 |
+| ACLGraph handle/graph pool | capture | 调用方/torch_npu | replay 使用 | 必须早于 `ctx.close()` 销毁；不假定graph会强持有PyPTO context |
 
 ### D.2 workspace 是否应在本次一起改造
 
@@ -1096,15 +1108,22 @@ COLLECTING
   - 尚未发生任何 L1 op launch
 
 SEALED
-  - 第一次 warmup/launch 前自动进入
+  - 第一次完整warmup/launch序列成功enqueue后进入
   - persistent addresses 和 capacity 固定
-  - 新 callable 只有在完全复用现有 capacity 时才允许 prepare
+  - 新callable一律不冁许prepare；全部program必须由context-wide prepare先收集
 
-CLOSED/POISONED
-  - 不再允许资源变更
+POISONED
+  - 不再允许dispatch，只允许外部quiescence后close
+
+CLOSING
+  - 第一项destructive teardown前进入；释放失败仍保持Closing
+  - 不允许prepare/launch，只允许显式retry close
+
+CLOSED
+  - 所有资源已释放，close幂等
 ```
 
-不需要把 `seal()` 暴露给普通用户。`pypto_init(programs=[...])` 完成主要收集，第一次 `op.prepare()`/warmup 前由内部自动 freeze。若将来要支持 prepare 后追加大 program，应采用 append-only backing storage 并保证旧地址不动；v1 更简单可靠的行为是直接报“context resource capacity frozen”。
+不需要把 `seal()` 暴露给普通用户。`pypto_init(programs=[...])` 声明全部program，context-wide `prepare()` 完成收集/异步注册，第一次完整launch enqueue成功后由内部seal。若将来要支持prepare后追加大program，应采用append-only backing storage并保证旧地址不动；v1的行为是sealed后新callable直接报错。
 
 ### D.4 workspace 需求计算
 
@@ -1127,7 +1146,7 @@ CLOSED/POISONED
 
 1. **Executor binary**：AICPU dispatcher/inner SO 和 AICore executor ELF，每个 L1 context 一份。
 2. **Callable orchestration binary**：按 orchestration ELF Build-ID 去重，但一旦被 graph 使用便 pin 到 context close。
-3. **Child/incore binary**：按 `(func_id, content identity)` 记录稳定 GM 地址；同 identity 重用，任何 func ID 重绑定到不同内容都拒绝。
+3. **Child/incore binary**：按content identity去重并记录稳定GM地址；每个callable保存自己的 `(func_id, device_addr)` 快照且不可重绑。不同callable可使用同一func ID数值指向不同binary。
 
 v1 不做 LRU、引用 graph 数量的 refcount 或 runtime completion 驱动的 binary recycle，因为 PyPTO 看不到 graph 何时永久不再 replay。简单“unregister callable 就 free child binary”会造成已经 capture 的 graph 在未来 replay 时读取悬空地址。
 
@@ -1176,8 +1195,15 @@ SEALED
   |                           POISONED
   |                              |
   +------------------------------+
-                                 | external quiescence + close
-SEALED --------------------------+-------------> CLOSED
+                                 | caller first proves external quiescence
+COLLECTING / READY_ENQUEUED / SEALED / POISONED
+                                 | begin_close(), before destructive teardown
+                                 v
+                              CLOSING
+                                 | cleanup failure: remain CLOSING; dispatch rejected
+                                 | explicit close retry eventually succeeds
+                                 v
+                               CLOSED
 ```
 
 “READY_ENQUEUED”不表示 device AICPU init/register 已经执行完成，只表示后续 launch 在 stream/event 上正确依赖它。ACLGraph capture 前的显式 warmup + caller synchronize 才是把异步准备错误暴露出来的用户流程。
@@ -1212,7 +1238,7 @@ first launch on same or another stream
 
 这样 `prepare_callable()` 的同步返回只报告 host validate/enqueue 是否成功；device dlopen/config 错误会在用户 warmup 后的外部 synchronize 报告。不能为了得到一个同步 prepare 返回值重新引入内部 stream sync。
 
-每个 callable 可有单独 prepare event，也可把所有 `pypto_init(programs=[...])` 准备汇总到 context-level prepare tail event。首期程序通常一次性准备，context-level event 更简单；实现选择必须由 Phase 0 验证 event capture/reuse 后确定。
+当前实现把所有 `pypto_init(programs=[...])` 准备汇总到context-level prepare tail event。该event只由第一个成功的完整warmup/launch enqueue消费；后续capture launch绝不再wait它，避免capture外record的event触发capture-isolation。
 
 ### E.4 单次 launch 的完整 host enqueue 伪代码
 
@@ -1226,10 +1252,14 @@ int DeviceRunnerBase::l1_launch(int32_t cid,
 
     L1AicpuInvocationArgs inv = make_invocation(cid, args);
 
-    if (l1_.has_prepare_tail)
+    if (l1_.has_prepare_tail && !l1_.prepare_tail_consumed)
         ACL_TRY(aclrtStreamWaitEvent(caller, l1_.prepare_tail));
-    if (l1_.has_serial_tail)
-        ACL_TRY(aclrtStreamWaitEvent(caller, l1_.serial_tail));
+    if (l1_.has_serial_tail && l1_.last_caller_stream != caller) {
+        aclrtEventRecordedStatus status{};
+        ACL_TRY(aclrtQueryEventStatus(l1_.serial_tail, &status));
+        if (status != ACL_EVENT_RECORDED_STATUS_COMPLETE)
+            return PTO_RUNTIME_ERR_BUSY;  // no task enqueued; caller must externally quiesce and retry
+    }
 
     ACL_TRY(aclrtMemsetAsync(l1_.handshake_invalidate_addr,
                              l1_.handshake_invalidate_size, 0,
@@ -1249,6 +1279,7 @@ int DeviceRunnerBase::l1_launch(int32_t cid,
 
     ACL_TRY(aclrtStreamWaitEvent(caller, l1_.aicore_done_event));
     ACL_TRY(aclrtRecordEvent(l1_.serial_tail, caller));
+    l1_.prepare_tail_consumed = true;  // only after the complete sequence was enqueued
     l1_.has_serial_tail = true;
     return 0;
 }
@@ -1269,15 +1300,19 @@ host API 调用只负责 enqueue，不会等待 device 执行。caller stream �
 
 也不能把 hidden AICore 的 wait/start 删掉或在 capture 时略过。“host 先调用某个 enqueue API”和“device task 可在 caller predecessor 之前执行”是两件事；真正的 device 语义由 stream/event 依赖决定。本协议允许 AICPU/AICore 在 start 后竞速，但绝不允许任何一方在 start 前抢跑。
 
-### E.6 多 caller stream 的串行化
+### E.6 多 caller stream 的fail-closed规则
 
-仅用 hidden AICore stream 的 FIFO 不够：两个 caller stream 上的 AICPU task仍可能重叠并同时 reset/use shared arena。`serial_tail` 必须代表“上一 invocation 的 AICPU 和 AICore 都完成”：
+仅用hidden AICore stream的FIFO不够：两个caller stream上的AICPU task仍可能重叠并同时reset/use shared arena。但不能通过“下一stream等待上一 `serial_tail`”自动串行，因为capture stream等待capture外record的event会触发runtime capture-isolation错误。
 
-1. 上一次 caller stream 在 AICPU task 之后 wait AICore done；
-2. wait 之后 record serial tail；
-3. 下一 caller stream 首先 wait serial tail，再 reset handshake/arena。
+当前规则是：
 
-因此 eager 下先后从不同 stream 调用仍能串行。Phase 0 必须确认相同 event 多次 record/wait 在 ACLGraph capture/replay 中按 generation 正确关联。
+1. 上一次caller stream在AICPU task之后wait AICore done，并在算子出口record serial tail；因此tail complete代表该次AICPU与AICore均已完成；
+2. 下一调用仍在同一raw stream时依赖stream FIFO，不额外wait/query；
+3. 下一调用切换raw stream时，在任何新task enqueue前非阻塞query上一tail；not-ready直接返回busy/invalid-state，context仍可使用，调用方外部同步后重试；
+4. query为complete时允许切stream，但不enqueue旧tail wait，避免把capture外event导入图；
+5. host mutex只防止host enqueue序列交叉，不代表device task已经完成。
+
+这使普通eager跨stream在调用方已经排空前序工作时可用，并对未排空情况fail-closed。它不能检测capture clone或未来graph replay：graph replay不重新进入PyPTO host代码，且host查询原public event只看到先前eager generation。因此两个graph并发、graph→eager或任意capture后的换流仍由v1外部quiescence契约约束。
 
 ### E.7 ACLGraph capture/replay 时 PyPTO 实际发生什么
 
@@ -1296,7 +1331,7 @@ host API 调用只负责 enqueue，不会等待 device 执行。caller stream �
 v1 的“不并发”包含：
 
 - 同一 context 不允许两个 host 线程同时进入 enqueue；mutex 强制。
-- 普通 eager launch 即使 caller stream 不同，也通过 serial tail 形成 device 顺序。
+- 普通eager同stream依赖FIFO；不同stream只有在上一tail已完成时才允许继续，否则fail-closed，不自动插入跨 stream event wait。
 - 一个 process/device 只允许一个 L1 context，wrapper/native registry 尽量强制。
 - 同一 context 的两个 ACLGraph 不得并发 replay。
 - L1 与同设备 L2/L3 全资源 run 不得重叠。
@@ -1309,7 +1344,7 @@ ACLGraph replay 不经过 PyPTO host，所以“并发 replay”无法单靠 hos
 | 失败位置 | 已进入 device queue 的内容 | context 处理 |
 | --- | --- | --- |
 | validate 失败 | 无 | 直接报错，context 可继续用 |
-| wait previous tail 失败 | 无或只有 wait API 未成功 | 原则上报错；按 runtime 返回语义决定是否 poison |
+| 换stream时query previous tail失败/not-ready | 无 | 直接报错，context可继续用；调用方外部quiescence后重试 |
 | handshake memset 失败 | 前序 wait 可能已入队 | poison，避免下一调用跨过不完整序列 |
 | start record 失败 | wait/memset 已入队 | poison |
 | AICPU launch 失败 | start 已记录，AICore 尚未 launch | poison；不能自行 sync/reset |
@@ -1498,7 +1533,7 @@ L2/L3 保留；L1 不采用。L1 要利用 `aclrtLaunchKernelWithHostArgs` 的�
 ```cpp
 class L1ExecutionState {
 public:
-    L1Phase phase;
+    L1Phase phase;  // New/Initializing/Collecting/ReadyEnqueued/Sealed/Poisoned/Closing/Closed
     int device_id;
     rtStream_t aicore_stream;
     rtEvent_t prepare_tail;
@@ -1506,7 +1541,9 @@ public:
     rtEvent_t aicore_done_event;
     rtEvent_t serial_tail;
     bool has_prepare_tail;
+    bool prepare_tail_consumed;
     bool has_serial_tail;
+    rtStream_t last_caller_stream;
     L1PersistentDeviceState device;
     L1WorkspaceState workspace;
     std::array<L1CallableState, MAX_REGISTERED_CALLABLE_IDS> callables;
@@ -1560,13 +1597,13 @@ public:
 
 1. 把当前注册拆成可共享的 host parse/upload 部分，以及 L2 sync device-register、L1 async device-register 两个尾部。
 2. L1 `record_device_orch_callable` 写 append-only table；保存 content identity、orchestration SO device address、entry/config 和 child `(func_id, addr)`。
-3. 在写 device state 前检查 ID/content 冲突，避免失败后部分注册。
+3. 在写device state前检查callable ID/content冲突及同callable内func ID重复/越界，避免失败后部分注册。不对不同callable中数值相同的func ID做全局冲突判定。
 4. L1 device register task使用传入 caller stream，通过 WithHostArgs 或已验证的 capture-compatible普通 launch enqueue。
-5. record `prepare_tail`；后续 launch wait 该 event。
+5. record context-level `prepare_tail`；只有第一个完整成功enqueue的warmup/launch wait并消费该event，后续capture launch不再wait。
 6. resource capacity 已 sealed 时，新 callable 若超出现有 arena/workspace/callable capacity直接失败；符合容量且不重绑定的 binary 可追加。
 7. L1 unregister 不释放 device binary；只把 Python handle 标为不可再提交。
 
-**验证：** 两个 program 共用相同 child binary时地址去重；相同 func ID 不同 binary失败；注册后多次 capture不增加 HBM。
+**验证：** 两个program共用相同child binary时地址去重；两个program都使用 `func_id=0` 但指向不同binary时均正确分发；同callable内重复func ID失败；注册后多次capture不增加HBM。
 
 ### G.5 Phase 5：新增 L1 AICPU entry 和 invocation ABI
 
@@ -1656,10 +1693,10 @@ L2 `stage_device_args()` 保持原样，不能在其中添加一个容易漏判�
 4. AICPU WithHostArgs 使用 caller stream；AICore handle launch 使用 hidden stream。
 5. `start_event` 必须在 caller 的 predecessor 和 handshake invalidation 之后 record，hidden stream 上的 AICore launch 必须位于对应 wait 之后。
 6. `aicore_done_event` 必须在 hidden AICore launch 后 record，caller 必须在 downstream/tail 前 wait；不以 AICPU ack 代替。
-7. 维护 `has_prepare_tail/has_serial_tail`，处理首次调用。
+7. 维护 `has_prepare_tail/prepare_tail_consumed/has_serial_tail/last_caller_stream`；只在第一个完整序列enqueue成功后标记prepare tail consumed。同stream依赖FIFO，换stream仅在pre-enqueue阶段query已完成的tail，禁止enqueue旧tail wait。
 8. 实现中不得查询 capture 状态、保存 capture/model handle、调用 `rtStreamAddToModel` 或分支出 early-launch 序列。
 9. 对每个 enqueue step 编号，部分失败时记录 step、原 error code、callable id并 poison。
-10. API 在最后一个 record 成功后立即返回，不调用 host wait/poll/query/sync。注意 stream-wait-event 是 enqueue 一个 device 依赖节点，不是 host blocking wait。
+10. API在最后一个record成功后立即返回，不调用host wait/poll/sync。唯一允许的host query是换raw stream时、任何新task enqueue前的非阻塞 `aclrtQueryEventStatus(serial_tail)`；它不是capture query。stream-wait-event是enqueue一个device依赖节点，不是host blocking wait。
 11. launch 前后读取 allocator/stream-create/capture-model API counters 的 debug test hook，证明 steady-state 中 allocation/create/model-mutation 都为零变化。
 
 ### G.9 Phase 9：low-level Python binding
@@ -1702,7 +1739,7 @@ L2 `stage_device_args()` 保持原样，不能在其中添加一个容易漏判�
 ```python
 ctx = pypto.l1.pypto_init(
     programs=[compiled_a, compiled_b],
-    device=0,
+    device=device_id,  # mandatory; caller already made this torch_npu device current
     config=L1Config(),
 )
 op_a = ctx.operator(compiled_a)
@@ -1711,26 +1748,27 @@ op_a.prepare()                  # idempotent; outside capture
 op_a(x, scale, out=y)           # warmup
 torch_npu.npu.synchronize()     # caller-owned
 
-with aclgraph_capture():
+graph = torch_npu.npu.NPUGraph()
+with torch_npu.npu.graph(graph, stream=capture_stream):
     op_a(x, scale, out=y)
 ```
 
 **torch adapter 职责：**
 
-1. 注册 forward-only custom op/schema；
-2. 检查 NPU device、dtype、shape和 output；
-3. 获取 `c10_npu::getCurrentNPUStream().stream()`；
-4. 遵循 taskQueue 推荐的 custom-op dispatch 方式；
-5. 构造 native task args并调用 raw-stream L1 API；
-6. 返回输入中显式 output 或 wrapper 新分配 output；
-7. 不接管 workspace、events或 graph。
+1. 导出nanobind `enqueue(queue_call, tensors, expected_device, op_name)`，不注册TORCH_LIBRARY/custom op schema；
+2. 校验queue-call ABI、torch/torch_npu build/runtime version和NPU device；dtype/shape/output等签名检查由Python L1 wrapper和native双层负责；
+3. 获取 `c10_npu::getCurrentNPUStream().stream(false)`；
+4. 用 `OpCommand::RunOpApiV2` 把纯C++ deferred callback插入taskQueue；
+5. 持有descriptor/Tensor到callback，并对default allocator storage做 `recordStream`；
+6. callback调用raw-stream L1 API；Python wrapper返回调用方显式传入的 `out=`；
+7. 不接管workspace、events、graph或external/custom storage owner。
 
-首个 ACLGraph ST 使用显式 `out=`。`op(x)` 自动分配作为 eager convenience 独立测试，通过后再决定是否列入 graph 支持面。
+首个ACLGraph ST使用显式 `out=`。`op(x)` 自动分配不在v1实现/支持面中；若未来需要，作为eager-only convenience独立设计。
 
 ### G.11 Phase 11：close、文档和旧路径回归
 
 1. 实现 D.6 borrowed-resource teardown。
-2. 高层 context manager 的 `__exit__` 只能在用户保证 graph 已销毁的场景使用；文档给出正确顺序。
+2. v1不实现context manager/`__exit__`：语法作用域结束不能证明ACLGraph不再replay或device已quiescent。只提供显式 `close()`，文档给出graph reset/destroy、外部同步、close的正确顺序。
 3. L1 未显式 close 的 process teardown不应 crash；可以报告 pinned-resource leak。
 4. 跑完整 L2 direct worker、one-shot L2、L3 persistent/one-shot、A2/A3/A5 TRB 回归。
 5. 比较 L2/L3 的 API symbol、stream count、allocation和 timing，确认 L1 分支没有改变原有语义。
@@ -1824,7 +1862,7 @@ aclrtLaunchKernelWithHostArgs(func_handle, aicpu_num, caller_stream,
 
 ```text
 PyTorch/torch_npu adapter
-  c10_npu::getCurrentNPUStream().stream()
+  c10_npu::getCurrentNPUStream().stream(false)
   tensor.data_ptr()
   taskQueue custom-op boundary
           |
@@ -1837,7 +1875,7 @@ Simpler L1 C ABI
 
 **当前一次性 L2：** init 创建自有 AICPU/AICore streams，register 同步 AICPU load，run sync，close reset/teardown device。
 
-**L1：** `pypto_init` 借用 current device，创建一个 hidden AICore stream 及 prepare/start/done/tail events，prepare persistent resources并把异步 init/register排入 caller stream；warmup 后由用户同步；close只释放自有资源。init 不创建 private AICPU run stream，也不预启动 orchestrator/executor 等待未来调用。
+**L1：** `pypto_init` 借用current device，创建一个hidden AICore stream及prepare/start/done/tail events，但它没有stream入参，不在init阶段将register task排入某个caller stream。`ctx.prepare()`（或普通eager的auto-prepare）才取当前stream，prepare persistent resources并异步enqueue init/register；warmup后由用户同步；close只释放自有资源。init不创建private AICPU run stream，也不预启动orchestrator/executor等待未来调用。
 
 ## 附录 I：完整测试矩阵
 
@@ -1853,7 +1891,7 @@ Simpler L1 C ABI
 | UT-004 | L1/L2 mode 混用 | 双向都拒绝；旧 L2 context 行为不变 |
 | UT-005 | init fault injection | 每个资源创建点失败均只回收已拥有对象 |
 | UT-006 | close twice | 第一次释放，第二次幂等，不触碰 caller stream/device |
-| UT-007 | context state | NEW/COLLECTING/SEALED/POISONED/CLOSED 迁移符合 E.1 |
+| UT-007 | context state | NEW/INITIALIZING/COLLECTING/READY_ENQUEUED/SEALED/POISONED/CLOSING/CLOSED 迁移符合 E.1；Closing失败可重试且拒绝dispatch |
 | UT-008 | invocation ABI | A2/A3、A5 host/device `sizeof/alignof/offsetof` 相同 |
 | UT-009 | invocation version | bad version、bad size、null descriptor被 AICPU entry 拒绝 |
 | UT-010 | max args | tensor/scalar capacity边界准确，越界在 host validate 失败 |
@@ -1868,7 +1906,7 @@ Simpler L1 C ABI
 | UT-022 | seal 后资源不足 | 直接报错；allocator/address/state均不改变 |
 | UT-023 | 相同 callable identity | prepare 幂等，binary/device descriptor地址相同 |
 | UT-024 | callable ID 冲突 | 不同 identity 重用 ID 在任何 device 修改前失败 |
-| UT-025 | func ID 冲突 | 相同 func ID 不同 binary 被拒绝 |
+| UT-025 | callable-local func ID | 同callable内重复/invalid func ID被拒绝；不同callable的同数值func ID可以指向不同binary |
 | UT-026 | child binary 去重 | 相同 content identity 重用地址；没有重复 HBM增长 |
 | UT-027 | unregister | host handle失效，但 pinned device state不释放 |
 | UT-028 | close | callable/binary/workspace按 D.6 顺序回收 |
@@ -1896,9 +1934,10 @@ Simpler L1 C ABI
 | 编号 | 场景 | 预期序列/行为 |
 | --- | --- | --- |
 | UT-060 | 首次 launch | prepare-tail wait（若有）→ memset → start record → AICPU → hidden wait/AICore/done → caller wait/tail |
-| UT-061 | 第二次同 stream | 先 wait serial tail，再进入本次 invalidation |
-| UT-062 | 第二次不同 stream | 同样 wait serial tail，不允许 AICPU overlap |
-| UT-063 | steady-state | 0 alloc/free、0 stream/event create/destroy、0 sync/query |
+| UT-061 | 第二次同 stream | 不wait/query旧tail；依靠caller FIFO进入本次invalidation |
+| UT-062 | 第二次不同 stream且旧tail not-ready | 在任何新enqueue前直接失败，context可重试，不允许AICPU overlap |
+| UT-062A | 第二次不同 stream且旧tail complete | host query后继续，但不enqueue旧tail wait；标准warmup→sync→capture不会导入capture外event |
+| UT-063 | steady-state | 0 alloc/free、0 stream/event create/destroy、0 sync/capture-query；同stream无event-status query |
 | UT-064 | pre-enqueue validation error | 调用记录为空，context 仍可使用 |
 | UT-065 | memset 失败 | context poisoned，记录准确 step/error |
 | UT-066 | AICPU launch 失败 | hidden launch不得继续或按确定状态 poison；后续 launch拒绝 |
@@ -1921,7 +1960,7 @@ Simpler L1 C ABI
 | ST-E-005 | TRB workspace | 内部共享 workspace、arena reset/reuse |
 | ST-E-006 | 连续异步不同地址 | 不同步 enqueue N 次，最后统一同步，不串包 |
 | ST-E-007 | 连续异步不同 scalar | 每次结果对应本次 scalar，不被下一 host call覆盖 |
-| ST-E-008 | caller stream 切换 | 不重叠的不同 stream调用由 tail排序 |
+| ST-E-008 | caller stream 切换 | 前序未完成时fail-closed；外部同步后query tail complete并换流，不导入旧event wait |
 | ST-E-009 | address stability | prepare/warmup/N 次 launch 后所有 persistent地址不变 |
 | ST-E-010 | memory stability | warmup后重复调用 HBM committed值不持续增长 |
 | ST-E-011 | A2/A3 | 核心 eager suite在 910B 系列 onboard 通过 |
@@ -1943,9 +1982,9 @@ Simpler L1 C ABI
 | ST-G-006 | workspace graph | 多次 replay 后 shared arena正确 reset，不读旧 task |
 | ST-G-007 | 一个图两个 L1 op | 同 context、同 workspace按 captured tail顺序复用 |
 | ST-G-008 | 两个图顺序 replay | 共享 context events在顺序 replay下 generation正确 |
-| ST-G-009 | warmup/capture 不同 stream | prepare tail和 serial tail正确衔接 |
+| ST-G-009 | warmup/capture 不同 stream | warmup外部同步后tail query通过；capture不包含对capture外serial tail的wait |
 | ST-G-010 | replay stress | 次数由环境/CI预算配置，不编码内部 launch上限 |
-| ST-G-011 | graph lifetime | graph存活时 context/callable强引用阻止资源回收 |
+| ST-G-011 | graph lifetime | 调用方显式持有context和graph-bound tensors；external quiescence + `graph.reset()` 之前不close/free native state |
 | ST-G-012 | close order | graph销毁+外部同步后 close不破坏 torch_npu后续 op |
 | ST-G-013 | capture 前未 prepare | 清晰失败，不在 capture内隐式 allocation/load |
 | ST-G-014 | unsupported DFX | capture前 host报错，不出现 collector task |
@@ -2057,7 +2096,7 @@ v1 契约仍禁止并发 replay，但需观察两个图共享 context events时 
 9. **PyTorch adapter**：current stream、taskQueue、explicit `out=` forward。
 10. **Eager ST**：A2/A3、A5 basic/multi-kernel/workspace/async args。
 11. **ACLGraph ST**：capture/replay、pre/post op、entry/exit 延迟 marker、event-only hidden capture、lifetime/stress。
-12. **Convenience/output allocation**：只在核心 graph路径通过后加入。
+12. **Convenience/output allocation（未来可选 backlog）**：不属于v1完成标准。只有在核心 graph路径通过后才能单独设计和加入；v1继续强制调用方预分配并显式传入 `out=`。
 13. **Regression/docs**：完整 L2/L3 suite、API reference和限制说明。
 
 不要把 Probe、native ABI、PyTorch wrapper和 ACLGraph tests压在一个无法定位问题的大提交里。
@@ -2079,9 +2118,10 @@ v1 契约仍禁止并发 replay，但需观察两个图共享 context events时 
 - [ ] hidden stream/events只在 init创建、close销毁。
 - [ ] workspace/arena/KernelArgs/Runtime在 capture前固定地址。
 - [ ] launch中没有 allocation/free或 lazy binary load/register。
-- [ ] callable/func ID不重绑定。
+- [ ] callable ID不重绑定；每个callable内func ID/address snapshot不变，不同callable可重复使用func ID数值。
 - [ ] graph可能引用的 binary/device descriptor pin到 context close。
 - [ ] L1 close不调用 reset/aclFinalize，不依赖隐式 sync。
+- [ ] 第一项destructive teardown前进入粘性 `CLOSING`；任何释放失败后prepare/launch均fail-closed，但close可显式重试且仍保留device claim/DSO/handle ownership。
 
 ### L.3 Task args
 
@@ -2099,20 +2139,21 @@ v1 契约仍禁止并发 replay，但需观察两个图共享 context events时 
 - [ ] start 依赖位于 caller predecessor 与 handshake invalidation 之后，并在 AICPU/AICore并行前建立，不产生抢核死锁。
 - [ ] hidden AICore 只能在 wait start 之后启动，不能越过单算子 entry。
 - [ ] downstream caller stream同时等待 AICPU自身顺序和 AICore done，不能越过单算子 exit。
-- [ ] serial-tail覆盖不同 caller stream。
-- [ ] capture/replay不执行 PyPTO host callback。
+- [ ] 同caller stream依赖FIFO；host调用换stream时在enqueue前非阻塞query上一operator tail，not-ready直接fail-closed，complete也不将capture外event wait导入图。
+- [ ] capture时执行一次PyPTO host launch以录制runtime task；replay不再进入Python/PyPTO host callback。
 - [ ] eager/capture 使用同一 launch 拓扑，没有 capture-only early mode。
 - [ ] PyPTO不查询 capture状态，不获取/保存 model/graph handle，不调用 `rtStreamAddToModel`。
 - [ ] hidden AICore branch 只通过 event fork/join 被 graph 捕获；不支持就停在 Phase 0，不降级边界。
-- [ ] 所有 graph销毁前 context保持强引用。
+- [ ] 调用方在所有graph销毁前持有context和graph-bound tensors；adapter只承担deferred callback lease与default allocator `recordStream`，不伪装成graph lifetime owner。
 
 ### L.5 Python/PyTorch
 
 - [ ] simpler core不 link torch/torch_npu。
 - [ ] taskQueue/current stream只在 adapter。
-- [ ] native低层强制显式 outputs。
+- [ ] Python L1 wrapper强制显式 `out=`；native低层对完整tensor descriptor/direction/pointer/device做独立强校验。
 - [ ] graph核心测试使用预分配 `out=`。
-- [ ] wrapper forward-only，autograd行为清晰报错或未注册。
+- [ ] wrapper forward-only，`requires_grad=True` 明确拒绝，不声称autograd/alias schema。
+- [ ] default torch_npu caching-allocator storage经 `recordStream` 保护；external/from-blob/custom allocator storage明确要求外部owner持有到最后真实stream/device use完成，capture时还覆盖graph销毁后的外部quiescence。
 - [ ] explicit prepare/warmup/close文档和错误信息完整。
 - [ ] `__del__` 不在未知 graph生命周期下释放关键资源。
 
@@ -2145,3 +2186,414 @@ v1 契约仍禁止并发 replay，但需观察两个图共享 context events时 
 11. 独立的 `host_build_graph` 性能优化 backlog：以完整图为调度边界提前展开 orchestration，不在 L1 中复活 early mode 或 `rtStreamAddToModel`。
 
 任何只实现“传入 stream并删除 sync”、但仍在 launch 中 staging/alloc/free、仍让 AICore使用 per-run device args、或仍可能在 graph存活时释放 binary/workspace 的版本，都不满足本计划定义的 L1。同样，任何通过 capture query + `rtStreamAddToModel`、private AICPU stream 或 capture-only early mode 让 orchestrator 越过单算子入口的版本，即使数值正确或性能更好，也不满足本计划定义的 L1。
+
+## 附录 N：第二阶段 `host_build_graph` L1 + ACLGraph 实现准入设计
+
+### N.1 本附录的状态、范围与不变量
+
+本附录定义的是**当前TRB L1完成之后**的第二阶段，不是本轮已实现或已验证功能。在本附录的P0门槛通过前：
+
+- `host_build_graph` 的L1 capability继续返回unsupported；
+- 不将HBG variable-length payload偷渡进当前TRB `L1AicpuInvocationArgs`；
+- 不修改本计划已确定的TRB Python/C++高层API、workspace内部管理、静态shape、显式warmup和close契约；
+- 不让HBG单算子通过capture query、`rtStreamAddToModel`、private AICPU stream或capture-only early launch越过单算子边界；
+- 不依赖“大约2048次launch”、256 MiB args或任何CANN内部常量作为公开设计规格；
+- 不因“PyPTO占用全部AICore”就把尚未完成的device task、captured graph package或external tensor storage当成可回收。
+
+对外语义仍是一个普通AscendC单算子：调用方只传tensor/scalar/output和caller stream，不感知AICPU/AICore双stream、graph package、restore manifest或ACLGraph capture/model handle。host-build-graph提前展开orchestration的性能收益只能在HBG完整图语义内实现，不回流到旧PyPTO跨op抢跑方案。
+
+### N.2 当前HBG源码对第二阶段的硬约束
+
+#### N.2.1 当前“graph image”至少跨越四类device存储
+
+| 区域 | 当前内容 | 第二阶段归类 |
+| --- | --- | --- |
+| GM SM | task descriptor、payload、slot state、completion flags、flow-control header | pristine source和mutable working copy都需覆盖 |
+| runtime arena | `PTO2Runtime`、orchestrator/scheduler objects、ready queues、mailbox、layout storage | pristine source和mutable working copy都需覆盖 |
+| GM heap | HBG intermediate/output/workspace地址和必要的host-built initializer目标 | v1 context-wide mutable slot；只将有语义的initializer spans放入restore manifest |
+| outer Runtime/KernelArgs/handshake | prebuilt arena base、GM base、function table、worker handshake、device KernelArgs | context-wide mutable/persistent execution state，需明确哪些每次restore，哪些prepare-time pin |
+
+源码证据：
+
+- `runtime/src/a2a3/runtime/host_build_graph/host/runtime_maker.cpp:450-538`：本地host SM、最终device base relocation和SM H2D；
+- `runtime/src/a2a3/runtime/host_build_graph/host/runtime_maker.cpp:772-888`：GM heap/SM/runtime arena三个region、本地host arena及arena H2D；
+- `runtime/src/common/platform/onboard/host/device_runner_helpers.cpp:25-75`：outer `Runtime`和device `KernelArgs`分别分配/复制；
+- `runtime/src/a2a3/runtime/host_build_graph/runtime/shared/runtime.cpp:155-157`：HBG当前将整个outer `Runtime` 作为device image复制。
+
+A5对应HBG文件当前与A2/A3同构；实现时不得只修一个arch而依赖复制粘贴假设。
+
+#### N.2.2 working image会被执行消费
+
+下列字段会在一次execution中被改写：
+
+- `pto_shared_memory.h:83-139`：completion flags与completed watermark；
+- `pto_runtime2_types.h:305-409`：payload early-dispatch atomics；
+- `pto_runtime2_types.h:445-543`：task state、wake list、completed subtasks、next block index；
+- `pto_scheduler.h:521-583, 825-866`：wake-list registration/drain、completion publication和subtask counters；
+- `scheduler_cold_path.cpp:1121-1157`：boot classify写ready queue和wake list；
+- `aicpu/aicpu_executor.cpp:260-299`：attach/wire、mailbox和device-local runtime fixup；
+- `runtime/shared/pto_runtime2_init.cpp:390-397`：`runtime_destroy` 清scheduler/orchestrator/mailbox/SM-handle pointer。
+
+`pto_shared_memory.h:241-247` 明确规定 `attach_populated` 不重置已填充内容。因此每次ACLGraph replay必须恢复working state，只有graph-lifetime地址pin绝不足够。
+
+#### N.2.3 image绑定具体destination addresses
+
+- `runtime_maker.cpp:517-529` 按具体 `device_sm/device_arena` 计算relocation delta；
+- `pto_runtime2_types.h:193-203` 保存GM heap的绝对 `packed_buffer_base/end`；
+- `pto_runtime2_types.h:364-381` 将具体Tensor buffer地址写入payload；
+- `pto_runtime2_init.cpp:347-387` 根据具体SM/GM heap base初始化runtime和wiring；
+- `runtime_maker.cpp:876-888` 将具体runtime arena base/offset写入outer Runtime。
+
+所以source blob可放在任意地址作copy source，但其bytes已绑定一组确定working destination bases。`host_build_graph/docs/RUNTIME_LOGIC.md` 中的“position-independent”只适用于fanin ID等局部表示，不适用于完整image。
+
+#### N.2.4 当前H2D和native pipeline lease都不是capture-lifetime解法
+
+- `DeviceRunnerBase::copy_to_device` 当前使用同步 `rtMemcpy`；
+- SM source是 `run_host_orchestration` 局部 `std::vector`，runtime-arena source是bind局部 `DeviceArena`；
+- HBG `PipelineContract` 将GM heap/SM/runtime image定义为 `HOST_PER_RUN`，depth为2，但 `PipelineSlotLease` 只从host prepare存活到该native run finalize；
+- ACLGraph replay不重新进入PyPTO host prepare/finalize，所以native lease、一次tail event或“host launch已返回”都无法证明captured package可回收。
+
+### N.3 五层对象和所有权模型
+
+规范性结论：**每次dynamic host build产生的graph必须作为该次HBG launch task/captured node的tiling-like payload被管理**，不得实现为context-wide、可被下一次host build原地覆盖的 `current_graph`。随task/node生存的是第3层不可变pristine source；在v1无并发契约下可被多个package顺序共享的只是第4层mutable execution slot和context workspace，且它们必须在每次replay前从当前node的pristine source恢复。
+
+| 层 | 名称 | 规范性内容 | 写入者 | owner/生命周期 |
+| --- | --- | --- | --- | --- |
+| 1 | `HbgGraphPlan` | host canonical immutable representation；pristine SM/runtime-arena bytes、optional GM initializer spans、topology、tensor/scalar/function bindings、generation/hash、restore/relocation metadata | host builder一次生成，随后只读 | PyPTO本次build，至少到第2层生成完成 |
+| 2 | `HbgSerializedLaunchBlob` | 一次性writable `[header \| inline payloads]`；所有offset/size已校验，pointer slot可被placeholder patch | serializer写，CANN launch可原地patch | PyPTO host，到runtime完成snapshot；精确时点由P0证明 |
+| 3 | `RuntimeOwnedHbgPayload` | CANN device task args中的immutable pristine source。AICPU只将它copy/parse到working slot，绝不在source上就地运行scheduler | runtime args loader创建；PyPTO device代码只读 | eager task或captured node/model；capture lifetime是P0门槛 |
+| 4 | `HbgExecutionSlot` | working GM SM/runtime arena/GM heap、outer Runtime、KernelArgs、handshake/mailbox、restore/completion generation。这是会被scheduler消费的可写状态 | AICPU restore、scheduler、AICore | PyPTO context；所有graph不再replay且device externally quiescent后才能释放 |
+| 5 | `HbgLifetimeRoots` | binary generations、context workspace、streams/events、external tensor storage，以及external-source fallback使用的explicit package lease | prepare/register/caller | PyPTO context + caller/ACLGraph owner + runtime按各自资源负责 |
+
+这五层的核心不变量是：
+
+1. 第1层永远不被placeholder或device execution改写；
+2. 第2层必须是从第1层deep-serialize的writable scratch，不得与plan cache共享同一pointer字段；
+3. 第3层是pristine source，不就地变成scheduler working memory；
+4. 第4层每次execution/replay前都从该node的第3层恢复；
+5. 第3层由runtime持有也不能延长第4/5层指针对应资源的生命；context close仍需graph destroyed + external quiescence。
+
+### N.4 WithHostArgs inline payload ABI候选
+
+#### N.4.1 CANN已证机制
+
+CANN当前实现提供下列源码证据：
+
+- `acl_rt.h:732-735`：`aclrtPlaceHolderInfo{addrOffset, dataOffset}`；
+- `api_c_kernel.cc:42-77`：WithHostArgs将host pointer、args size和placeholder传入CPU/non-CPU args descriptor，并要求H2D copy；
+- `arg_loader.hpp:29-40`：`UpdateAddrField` 将 `hostArgs + addrOffset` 原地写为 `kerArgs + dataOffset`；
+- `stars_arg_manager.hpp:127-147`、`stars_arg_manager.cc:165-182`：分配args copy、patch placeholder并复制bytes；
+- `aicpu_stars.cc:53-59, 105-113`：capture task强制走args-copy路径；
+- `aicpu_starsv2.cc:47-53`：arg handle挂到task并交给postprocess；
+- GE `executor_utils.cc:269-318`、`op_task.cc:619-646`：AscendC tiling使用“pointer + inline tiling bytes”同类布局。
+
+这些证据能证明“inline payload + placeholder”是有源码基础的P0候选，但不能替代graph lifetime和大小上限的板上证明。
+
+#### N.4.2 建议布局
+
+下列仅是ABI布局要求，不预先固定最终C++类名或字段顺序：
+
+```text
+HbgSerializedLaunchBlob
+  HbgL1InvocationHeader
+    magic / abi_version / header_size / total_size
+    graph_generation / content_hash / binding_generation
+    expected working SM/arena/heap/runtime bases
+    required capacities
+    pristine_sm_ptr      ---- placeholder[0] ---> inline SM bytes
+    pristine_sm_size
+    pristine_arena_ptr   ---- placeholder[1] ---> inline arena bytes
+    pristine_arena_size
+    restore_manifest_ptr ---- placeholder[2] ---> inline manifest/initializer table
+    restore_manifest_count
+    host_total_tasks / callable and function snapshot
+  aligned inline pristine SM
+  aligned inline pristine runtime arena
+  aligned restore manifest + optional initializer bytes
+```
+
+实现必须：
+
+- 使用独立HBG AICPU entry/ABI，不让当前固定 `L1AicpuInvocationArgs` 的 `struct_size == sizeof(...)` 验证接受variable tail；
+- 在host上对 `total_size`、alignment、每个 `offset + size`、placeholder `addrOffset + 8`、`dataOffset`和manifest数量做overflow-safe校验；
+- 显式限制 `total_size <= UINT32_MAX`，不接受public `size_t` 到runtime `uint32_t` 的静默截断；
+- header在AICPU端通过对齐local copy或byte-safe parser读取，不假设runtime args base满足PyPTO `alignas(64)`；
+- `LoadAicpuOp` 增加接受writable host args和placeholder array的独立能力；不继续使用当前 `const_cast + nullptr placeholder`的TRB helper形态；
+- placeholder只指向本blob内部，任何external pointer都在ownership table中另行列出，不宣称被runtime拥有。
+
+#### N.4.3 必须保持的未知项
+
+- CANN public API未在header注释中承诺任意大小args的capture-lifetime deep snapshot；
+- `GetClampedCpySize` 为某些旧backend保留allocated-entry clamp路径，必须验证目标板上是否完整copy；
+- public `argsSize` 内部cast为32位，而 `UB_ARG_MAX_COPY_SIZE = 256 MiB` 等只是当前源码细节，不是可编码的产品规格；
+- capture强制copy能证明host临时pointer不应被device task延迟读取，但还需证明arg handle究竟由capture graph、instantiate model还是首次replay task持有，以及graph destroy时何时回收。
+
+### N.5 destination-address-bound和capacity freeze协议
+
+`HbgGraphPlan` 和serialized header必须保存下列binding tuple：
+
+```text
+HbgWorkingBinding
+  device_id
+  context_generation
+  working_sm_base / capacity
+  working_runtime_arena_base / capacity
+  gm_heap_base / capacity
+  outer_runtime_base / size
+  device_kernel_args_base / size
+  binary_generation or function-address identity
+```
+
+AICPU leader恢复前必须比较header expected binding与当前context binding。任一base、capacity、device id、generation或必要binary identity不匹配都必须在放行scheduler/AICore前fail-closed，不得“先copy一部分再报错”。
+
+prepare/init阶段必须根据ring task-window、heap和runtime-arena layout一次性确定最大capacity。从第一个HBG package可能被capture开始：
+
+- 禁止 `setup_static_arena` 释放/重新commit任一被绑定region；
+- 新graph需要更大SM/arena/heap时直接返回capacity error；
+- 如果未来需扩容，创建新context generation和新stable slot，旧slot保留到旧graph全部销毁；
+- 不得通过更新“current base”全局变量让旧captured package静默指向新allocation。
+
+首版多个package可以绑定同一个working slot，前提是调用方保证不并发replay。未来多slot并发不可以直接复制当前address-bound bytes，必须实现per-slot materialization或完整relocation manifest。
+
+### N.6 每次eager/replay的restore和执行时序
+
+#### N.6.1 capture-time host路径
+
+```text
+caller invokes HBG L1 operator
+  validate static metadata / device / context state
+  run host orchestration and produce immutable HbgGraphPlan
+  validate plan sizes and exact working binding
+  deep-serialize a fresh writable HbgSerializedLaunchBlob
+  prepare aclrtPlaceHolderInfo[] for inline spans
+  enqueue caller-stream AICPU HBG entry with WithHostArgs
+  enqueue the same closed caller/hidden-AICore event topology as L1
+  return without stream/device synchronization
+```
+
+capture时host build执行一次，ACLGraph replay不重新进入host builder。所以这里的“dynamic graph”是capture/build-time dynamic，不是replay-time自动重新tiling。该captured node中的topology、tensor addresses、scalar和binding generation在v1都是静态snapshot；未来graph update/dynamic replay是另一项能力，不得暗含在v1。
+
+#### N.6.2 每次device execution/replay
+
+```text
+AICPU launch node begins on caller stream
+  all launched AICPU threads enter a generation gate
+  exactly one leader:
+    byte-safe parse and validate header
+    validate exact destination binding and capacities
+    restore every manifest span into working SM/runtime arena/initializers
+    reset or reconstruct manifest-declared Runtime/KernelArgs/handshake/mailbox state
+    perform required cache clean/invalidate
+    publish restore success/failure with release semantics
+  peers acquire the verdict
+  on failure: no scheduler classify/dispatch; all peers and hidden AICore follow common safe epilogue
+  on success:
+    attach/wire working runtime
+    attach_populated working SM
+    classify roots, ready queues and wake lists
+    dispatch and complete AICore work
+  last AICPU teardown may mutate/destroy working state
+  caller-stream op exit still waits hidden AICore done event
+```
+
+每次replay都要经过这个完整restore gate。首次执行之前恢复过一次、第一次结果数值正确、或working allocation从未free，都不能代替第二次replay restore。
+
+restore manifest至少要覆盖pristine SM和runtime arena。GM heap不必默认全量copy，但host builder对GM heap产生的任何语义化初值都必须以initializer span明确列入manifest。outer Runtime、KernelArgs、handshake和mailbox中的per-execution字段必须通过字节恢复或确定re-init路径列入协议，不得依赖“上次deinit应该已清干净”。
+
+#### N.6.3 为什么首选AICPU leader restore
+
+runtime-owned inline source的device base在WithHostArgs launch内部才由CANN创建，host侧没有一个已知、可交给更早memcpy node的source address。因此这条ownership路径天然配AICPU leader从本次arg指针复制到working slot。restore发生在captured AICPU kernel node内，每次replay自然重复，不需要PyPTO感知capture/replay。
+
+captured D2D restore node只与“external stable device pristine source”fallback搭配。若选用它，source allocation必须有独立graph-lifetime lease，不得使用临时host vector、单份可覆盖device buffer或native pipeline slot。
+
+### N.7 资源所有权与close规则
+
+| 资源 | 首选owner | 不得做的推断 | 释放条件 |
+| --- | --- | --- | --- |
+| host canonical plan | PyPTO host | placeholder API不会改它 | 序列化完成，或plan cache显式退出 |
+| writable launch blob | PyPTO host | 不假设异步launch API返回前后边界，必须P0 | runtime snapshot已实证完成 |
+| inline device pristine payload | CANN task/captured graph（待P0） | 不因capture强制copy就假定graph destroy lifetime已证 | eager task完成；graph destroy/model release的实证回收点 |
+| working slot/workspace | PyPTO context | 不因package由runtime持有就提前free | 所有graph destroyed + external quiescence |
+| incore/kernel binary | PyPTO/runtime append-only generation | 不依赖current callable map不再显示就free | 所有可引用它的graph不再replay；首版可到context close |
+| external tensors | caller/torch/graph pool | runtime args拷贝pointer value不等于拥有storage | device最后使用完成 |
+
+`close()` 仍不做sync，不猜测graph是否销毁。调用方必须先销毁所有可能replay的graph，再完成external quiescence，最后close HBG L1 context。在无graph retain/release hook的fallback中，PyPTO只能使用明确内存计数和上限的append-only/pin-until-context-close，不得在不能证明lifetime时复用source address。
+
+### N.8 fallback决策树
+
+```text
+P0: WithHostArgs inline payload完整copy且随captured graph存活？
+  yes
+    -> runtime-owned inline source
+    -> AICPU leader per-replay restore
+    -> PyPTO不自建graph-payload device pool
+  no
+    -> 是否可用stable external device source + captured D2D restore？
+       yes
+         -> 是否有ACLGraph/HBG owner retain-release hook？
+            yes -> explicit HbgPackageLease
+            no  -> bounded append-only until context close
+       no
+         -> HBG ACLGraph保持unsupported，不退化为临时host source、同步copy或可覆盖单buffer
+```
+
+不论选择哪条source ownership路径，working slot都必须per replay restore；append-only只解决source lifetime，不会把被消费的working state变成可重复执行。
+
+### N.9 第二阶段建议实施顺序
+
+#### N.9.1 HBG Phase H0：只做device 1 capability probes
+
+1. AICPU WithHostArgs placeholder inline pointer、host原地patch和snapshot时点；
+2. capture/instantiate/replay/destroy的args allocation lifetime；
+3. large args完整copy、错误边界和capture延迟；
+4. AICPU leader从args source到working GM的copy/cache可见性；
+5. external tensor host-build data dependency分类。
+
+H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回到N.8决策树，不用隐式sync或private AICPU stream绕过。
+
+#### N.9.2 HBG Phase H1：拆分host build与H2D
+
+- 将当前 `run_host_orchestration` 从“本地构建后立即同步H2D”拆成“产生owning canonical `HbgGraphPlan`”；
+- plan深拷贝SM、runtime arena和initializer spans，不保留local vector/arena的悬空pointer；
+- 保留L2/L3原有bind/copy路径，不迫使它们经过L1 variable blob；
+- 新增plan validation/hash/binding metadata UT。
+
+#### N.9.3 HBG Phase H2：variable launch blob和placeholder bridge
+
+- 定义独立HBG invocation header/ABI、serializer和parser；
+- 增加writable args + placeholder array的AICPU launch helper；
+- 实现完整size/offset/alignment/overflow validation；
+- 保留TRB fixed WithHostArgs ABI不变；
+- 对host patch污染canonical plan、截断blob、交叉span、错误placeholder做无硬件UT。
+
+#### N.9.4 HBG Phase H3：stable execution slot和capacity freeze
+
+- prepare/init一次性分配working SM/runtime arena/GM heap/workspace/outer Runtime/KernelArgs；
+- 记录 `HbgWorkingBinding`，capture可能开始后禁止增容/换址；
+- 加入binding/capacity/generation fail-closed；
+- 不对外暴露workspace pointer，延续当前“workspace由PyPTO内部prepare-time管理”结论。
+
+#### N.9.5 HBG Phase H4：AICPU leader per-replay restore
+
+- 将restore放在当前classify-ready barrier之前，且exactly one leader执行；
+- peers必须看到统一restore verdict，失败不attach/classify/dispatch；
+- 明确A2/A3、A5 cache clean/invalidate和release/acquire协议；
+- 与现有common epilogue整合，保证restore失败时hidden AICore不留在register-window轮询；
+- 先用full-span correctness restore，再以profile数据决定是否拆分immutable/mutable物理layout。
+
+#### N.9.6 HBG Phase H5：独立L1 registration/runtime路径
+
+- 保留host orchestration DSO和host entry，不经由现有“host dlopen handle即拒绝”的TRB device-orchestration registration分支；
+- 新增HBG对应 `l1_runtime_supported_impl/prepare_l1_runtime_impl` 及AICPU L1 entry，但只在H0-H4硬门槛通过后开启capability；
+- caller stream运行AICPU主task，hidden stream只运行AICore，与本计划已确定单op fork/join边界一致；
+- 不使用旧PyPTO的hidden AICPU stream、capture-aware early launch或model attach。
+
+#### N.9.7 HBG Phase H6：direct external tensors与host-build数据契约
+
+- HBG L1 binder只借用调用方device tensor storage，不自行分配/搬运external input/output；
+- 对每个host orchestration是否使用 `get_tensor_data/set_tensor_data` 建立静态标记或可审计分类；
+- 只允许已证明capture-safe的host-known metadata/scalar/CPU control-data路径；
+- 依赖device tensor value但无无sync host-view协议的callable必须fail-closed，不在capture中暗中D2H/sync；
+- A2/A3 host mapping能力不能被默认等价到A5。
+
+#### N.9.8 HBG Phase H7：ACLGraph、lifetime与回归
+
+- 完成N.10 device 1矩阵；
+- 对runtime-owned source、fallback source、working slot、binary和external tensor分别做memory accounting；
+- 验证graph A/B顺序交替replay和无并发契约；
+- 运行L2/L3 HBG/TRB回归，确认L1 host-plan拆分没有改变旧路径所有权/同步语义；
+- 只在完成上述证据后将HBG L1 capability从unsupported切换为supported。
+
+### N.10 device 1 P0/ST矩阵
+
+本矩阵是第二阶段开工门槛，不并入当前TRB Phase 0的已实现声明。优先使用device 1，device 0留给并行会话。
+
+#### N.10.1 placeholder、snapshot与canonical immutability
+
+- [ ] AICPU最小kernel验证placeholder pointer等于runtime args base + inline offset。
+- [ ] 验证多个placeholder可分别指向SM、arena和restore manifest。
+- [ ] launch API返回立即poison/free/reuse host blob，eager仍读到原payload。
+- [ ] 证明CANN原地patch只改写第2层scratch，第1层canonical plan hash不变。
+- [ ] 未对齐runtime args base不会导致typed UB，AICPU parser先做aligned local header copy。
+
+#### N.10.2 large args和backend边界
+
+- [ ] 至少扫描64 KiB、1 MiB、16 MiB、64 MiB、真实HBG常规image、真实最大image和失败边界。
+- [ ] 每个size检查tail bytes/checksum，防止old backend clamp后仅头部数值正确。
+- [ ] `argsSize > UINT32_MAX`、offset addition overflow、placeholder越界由PyPTO在host稳定拒绝。
+- [ ] 记录A2/A3和A5各自错误码、内存占用、capture/instantiate延迟和replay延迟，不将内部常量固化为PyPTO限制。
+
+#### N.10.3 captured-node lifetime
+
+- [ ] capture后立即销毁host blob，instantiate/replay至少100次仍正确。
+- [ ] capture后发射大量其他WithHostArgs task并制造args allocator环绕/压力，旧graph payload不串包。
+- [ ] graph A/B包含不同tail canary与topology/scalar，顺序交替replay仍持有各自payload。
+- [ ] 观察capture、instantiate、首次replay、graph destroy前后的arg handle/memory accounting，确认真实回收点。
+- [ ] graph销毁但device未external quiescent时，不提前释放working slot/context roots。
+
+#### N.10.4 per-replay restore正确性
+
+- [ ] 同一ACLGraph不重新host build，至少连续replay两次。
+- [ ] 第一次执行后用test hook poison ready queue、wake list、completion flags、task state、runtime pointer、mailbox等known mutable spans。
+- [ ] 第二次replay必须从该node的immutable source恢复，不是依赖某些field碰巧未变。
+- [ ] 验证GM heap中所有有语义initializer span每次恢复，而不必要的workspace bytes不强制清零。
+- [ ] restore失败时所有AICPU peer读取统一verdict，不classify/dispatch，hidden AICore安全退出。
+
+#### N.10.5 address binding、capacity和cache/order
+
+- [ ] 伪造wrong device/base/capacity/context generation/binary identity，leader在写working slot前fail-closed。
+- [ ] capture后尝试请求更大SM/arena/heap，旧slot不被recommit，新请求明确失败。
+- [ ] AICPU leader copy后多AICPU peer立即classify，AICore立即读descriptor/payload，A2/A3和A5都能看到完整同一generation。
+- [ ] 将restore generation/canary分布在首、中、尾多个cache line，防止只验证header可见。
+
+#### N.10.6 stream/op边界和禁止项
+
+- [ ] trace中无PyPTO `aclrtSynchronizeStream/Device`或runtime同类sync。
+- [ ] 无capture query、model attach、`rtStreamAddToModel`、private AICPU stream和capture-only early launch。
+- [ ] 延迟predecessor能阻止restore/AICPU/AICore越过op entry；延迟AICore tail能阻止successor越过op exit。
+- [ ] restore是每次captured AICPU node执行的内部阶段，不是capture之前提前启动的orchestrator。
+
+#### N.10.7 close、fallback和无并发契约
+
+- [ ] graph仍可replay时close fail-closed或按明确外部契约被拒绝，不free working slot/binary/workspace。
+- [ ] graph destroyed + external quiescence后close成功，所有资源只释放一次。
+- [ ] runtime-owned路径失败时，external-source fallback有独立lease和memory accounting，不默默复用单buffer。
+- [ ] 两个graph顺序replay通过；并发replay不在v1 supported matrix中，文档和test均不声称支持。
+
+### N.11 独立硬阻塞：host orchestration的tensor-data依赖
+
+当前L2 HBG在 `runtime_maker.cpp:695-766` 为external tensor自行分配device storage、H2D staging并注册host view；`host_tensor_access.cpp:60-84` 让host orchestration通过host view读写device-addressed tensor。这与L1“直接借用PyTorch device tensor、PyPTO不分配/搬运external input/output”的前提不同；而common onboard注释也明确A5当前没有A2/A3同类host-map path。
+
+因此HBG L1 capability必须另外定义host build输入分类：
+
+| 依赖 | capture-safe v1候选 | 处理 |
+| --- | --- | --- |
+| shape/dtype/stride/device address | 是 | 直接使用已校验metadata |
+| scalar / host-known control value | 是 | 写入GraphPlan和captured payload snapshot |
+| 显式CPU control tensor，且调用方保证capture期稳定 | 待定 | 定义独立API/签名与生命校验，不暗中D2H |
+| device tensor value，无无sync host-view协议 | 否 | prepare/capture前fail-closed |
+| host orchestration通过 `set_tensor_data` 改写external device tensor | 待定/默认拒绝 | 必须先证明caller-stream ordering、cache可见性和无sync协议 |
+
+实现前必须统计/静态标记orchestration是否使用 `get_tensor_data/set_tensor_data`，不允许因为某个example只依赖shape就推断所有HBG都不读data。这是与graph payload lifetime平行的独立硬门槛：
+
+- payload ownership解决“host已构建graph后，这些bytes如何随task/graph存活”；
+- tensor-data protocol解决“host builder在不内部sync/搬运external tensor的前提下，是否有权取得构图所需数据”。
+
+任一项未闭环，HBG L1 + ACLGraph都不得标记supported。
+
+### N.12 第二阶段完成定义
+
+HBG L1 + ACLGraph只在同时满足下列条件后才可以宣布完成：
+
+1. 五层对象在代码、ABI、日志和memory accounting中可区分，没有模糊的global current graph pointer；
+2. canonical plan与writable serialized blob完全分离，placeholder原地patch不污染plan/cache；
+3. runtime-owned inline payload的大小、copy完整性、capture/replay/destroy lifetime有device 1证据，或者按N.8选用有完整lease的fallback；
+4. graph package按exact destination binding生成，capacity在capture后freeze，错误binding不发生部分写入；
+5. 每次eager/replay都restore SM/runtime arena及manifest中全部per-execution state，反复replay和poison test通过；
+6. AICPU leader restore的A2/A3、A5 cache/order协议通过多cache-line可见性验证；
+7. caller/AICPU/hidden-AICore entry/exit仍是一个闭合单算子，无sync、capture query、model attach或private AICPU early launch；
+8. external tensor host-build data dependency已分类，不可capture的callable能在可控边界fail-closed；
+9. v1无并发契约、graph destroyed + external quiescence + close顺序在上层文档和测试中一致；
+10. TRB L1、HBG/TRB L2和L3回归通过，当前已确定的API与所有权不被暗中改写。
+
+本附录明确把WithHostArgs inline payload定义为**首选且需要P0证明的候选**，而不是已实现事实。任何只保持一份device graph buffer、只在capture时H2D一次、不在每次replay恢复working state，或用临时host source和隐式sync规避lifetime问题的实现，均不满足第二阶段完成定义。
