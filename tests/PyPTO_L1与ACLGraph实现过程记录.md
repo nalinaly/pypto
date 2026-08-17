@@ -305,6 +305,11 @@ python -m pytest tests/ut -q
   - 增加独立 `_torch_npu_l1` adapter，以 `.stream(false)`、`RunOpApiV2`、C++ Tensor lease和allocator `recordStream`维持taskQueue顺序与storage生命周期；
   - 增加runtime scalar metadata贯通、51项高层反例、最小ACLGraph真实ST及runtime子仓指针更新；
   - 顶层editable build、完整pre-commit和top/runtime组合350项回归通过。
+- runtime `11b7a4b1`：`Add: 建立HBG图包序列化与上传边界`
+  - A2/A3和A5同步把host orchestration拆成纯Host SM image构建与显式H2D边界，保持旧L2同步上传语义；
+  - 增加destination-bound variable HBG launch blob、pristine SM/runtime-arena/heap manifest、slot binding和invocation identity；
+  - 用完整镜像覆盖、容量、generation、地址、身份、区间重叠与content hash做fail-closed校验；
+  - runtime完整pre-commit、editable build、无硬件C++ 86/86和HBG相关Python 112 passed/4 skipped通过；HBG L1 capability未开启。
 
 每次后续HBG提交继续补充顶层/runtime SHA、中文提交主题、完整变更范围和对应验证；不 push。
 
@@ -1209,3 +1214,142 @@ op = context.operator(compiled)
 - 现有mandatory onboard arch precheck还硬编码查询 `npu-smi ... -i 0 -c 0`，而本机card ID为7，该查询会返回invalid card id。真正执行前需要合规调度或修正预检入口，不能因此fallback到device 0。
 
 因此本轮没有发送任何ACL/NPU task，没有触碰device 0。目前只能宣称“实现、产物和ST已进入Phase-0候选状态”，不能宣称“ACLGraph已在device 1通过”。真正发布门槛仍是在空闲device 1上通过event-only hidden-stream capture、WithHostArgs snapshot、AICore handle launch、连续replay、entry/exit顺序和无forbidden API trace。
+
+### 10.25 第一笔HBG实现：把dynamic graph落实为tiling-like invocation package
+
+#### 10.25.1 为什么先做host基础而不伪装H0已经通过
+
+用户再次强调，第二阶段每次动态build并H2D到device的graph，本质上是这次task类似AscendC `tiling_data` 的入参。由此实现顺序必须同时满足两个条件：
+
+1. 先在代码中消除“host builder一边构建、一边立即把唯一current image写进共享device buffer”的模糊边界，产出可以被一个launch task独立持有的pristine bytes；
+2. 在不知道CANN对large WithHostArgs、placeholder、capture/replay和graph destroy实际ownership之前，不能把host-only serializer写成“ACLGraph已经会替PyPTO管理graph image”的完成结论。
+
+device 1本轮仍非空闲，且没有可用的合规 `task-submit`。因此先实施不依赖device事实的H1/H2基础：拆host-build与H2D边界、定义variable task package ABI、写严格validator和无硬件UT；H0涉及的CANN snapshot/lifetime/cache结论继续保持未知。这个顺序不降低H0门槛，也没有触碰device 0。
+
+#### 10.25.2 A2/A3和A5的host-build/H2D边界已经同步拆开
+
+修改两份同构实现：
+
+- `runtime/src/a2a3/runtime/host_build_graph/host/runtime_maker.cpp`；
+- `runtime/src/a5/runtime/host_build_graph/host/runtime_maker.cpp`。
+
+原 `run_host_orchestration` 同时承担四件事：分配host SM mirror、运行host orchestration、按最终device bases做relocation、立即把SM同步H2D。它返回以后，调用方再单独上传runtime arena。这种写法虽然对当前L2可用，却没有一个明确时刻能说“两份构成graph初始状态的host image都已经完成，现在可以把它们交给task/package owner”。
+
+当前改为 `build_host_orchestration_image`：
+
+1. 接收caller-owned `std::vector<uint8_t> *out_sm_image`；
+2. 在host上完成SM清零、orchestrator执行、dependency graph收集和destination-address relocation；
+3. 只返回 `host_total_tasks` 和owning SM bytes，函数内部不再调用 `copy_to_device`；
+4. bind caller在host tensor-view window关闭、`PTO2Runtime::prebuilt_layout`写完、SM与arena两份host image都完成后，才进入一段显式H2D区域；
+5. 先上传完整SM，再上传完整runtime arena；两次copy都成功后才发布 `runtime->host_total_tasks` 和prebuilt arena binding，避免把半完成graph标记成ready。
+
+这一笔刻意不改变旧L2的外部时序：它仍在同一个bind调用中做同步H2D，仍使用原来的pooled GM SM/runtime arena/GM heap，AICPU执行入口也未改变。拆分的价值是建立可审计的ownership boundary，并不是提前把L2改成异步L1，也不是已经创建完整 `HbgGraphPlan`。当前host `DeviceArena`仍是bind栈内对象，下一阶段还要把SM、arena和initializer spans一起提升为正式canonical plan owner。
+
+#### 10.25.3 variable launch blob的内存布局
+
+新增：
+
+- `runtime/src/common/task_interface/hbg_launch_blob.h`；
+- `runtime/src/common/worker/hbg_launch_blob_builder.h`。
+
+host serializer产生一份writable、逐launch独立的深拷贝，布局固定为：
+
+```text
+HbgLaunchBlobHeader
+HbgLaunchRegion[region_count]
+zero alignment padding
+inline pristine payload bytes
+  - full SharedMemory image
+  - full RuntimeArena image
+  - zero or more GM heap initializer spans
+```
+
+这里继续严格区分五层owner：canonical graph plan不是这个writable blob；writable blob也不是CANN runtime-owned device args；runtime-owned inline source又不是scheduler会改写的working slot。serializer从caller source做深拷贝，后续CANN即使按placeholder规则原地修改writable blob，也不能污染canonical plan。
+
+`HbgLaunchBlobHeader::inline_payload_addr` 在canonical host状态必须为0。未来HBG专用 `aclrtLaunchKernelWithHostArgs` bridge可用 `aclrtPlaceHolderInfo{addrOffset, dataOffset}`，把该字段修补为runtime-owned device args blob中inline payload的device地址。header、region descriptors和payload全部包含在 `argsSize` 范围，外部pointer pointee没有被错误地当成runtime owner。当前代码只定义并验证host-unpatched/device-patched两种状态，尚未调用CANN placeholder API。
+
+#### 10.25.4 destination binding和invocation identity不能混成一个hash
+
+一个HBG source image内含最终device绝对地址，所以blob明确标记 `HBG_LAUNCH_DESTINATION_BOUND`，并携带 `HbgExecutionBinding`：
+
+- working SM base/capacity；
+- runtime arena base/capacity和runtime offset；
+- GM heap base/capacity；
+- execution slot generation。
+
+slot generation与地址/capacity分别比较：generation不匹配返回generation错误，任何base、capacity或runtime offset变化返回binding错误。plan content hash故意不把working binding混进去；同一canonical content未来若要materialize到另一slot，必须经过显式relocation/materialization并产生匹配的新binding，不能通过改header假装原bytes可自由搬家。
+
+另外新增32-byte `HbgInvocationIdentity`，把三个生命周期域分开：
+
+- `callable_hash`：这份graph属于哪个编译operator；
+- `argument_snapshot_hash`：host build时被烘焙进image的tensor地址、scalar和控制参数快照；
+- `function_binding_hash`：这份image依赖哪张已解析AICore function table；
+- `tensor_count/scalar_count`：对照本次callable签名，且不能超过现有chip ABI容量。
+
+identity参与plan hash，同时validator还可接收expected identity单独比较。这样未来AICPU restore入口可以在写working slot之前拒绝“地址碰巧相同但属于另一个callable/args/function generation”的旧package。header保持8-byte alignment，并用 `sizeof/offsetof/trivially_copyable` static assertions锁定placeholder、binding和identity ABI offset；没有依赖未证实的64-byte CANN args alignment。
+
+#### 10.25.5 restore manifest的fail-closed规则
+
+`validate_hbg_launch_blob`把输入视为不可信variable bytes，在任何restore前验证：
+
+1. magic、ABI major/minor、exact canonical header size、exact total size和zero padding；
+2. blob/header alignment、region数量、所有size/offset加法和 `uint32_t argsSize` 表示范围；
+3. plan generation、slot generation、destination base/capacity和runtime offset；
+4. invocation identity非空关键hash、tensor/scalar容量及可选expected identity；
+5. 恰好一份完整覆盖frozen capacity的SM image和一份完整runtime-arena image，拒绝partial restore；
+6. 所有source spans落在inline payload内且互不重叠；同类destination spans也不能重叠；
+7. GM heap initializer只能写进声明的heap window；没有heap binding时不得偷放initializer；
+8. region flags和reserved字段必须canonical；
+9. identity、region descriptors和全部payload bytes的FNV-1a content hash必须一致；placeholder pointer本身不参与hash，因为它属于runtime每次launch的patch结果。
+
+要求SM和runtime arena完整覆盖不是为了追求序列化简单，而是当前HBG scheduler会原地消费ready queue、wake list、completion flags、task state和runtime pointers。只恢复“看起来变化的字段”很容易漏掉跨代状态；首版先用full-image restore证明正确性，之后只能在profile和逐字段ownership证据支持下优化。
+
+builder具有transaction语义：先在local candidate中完成allocation、descriptor构造、deep copy、hash和全量validate，成功后才替换caller的 `out`。无论非法identity、缺失full image、空source、越界还是span overlap，已有canonical blob保持不变，避免失败build把上一次可用package清空或部分覆盖。
+
+实现早期UT实际暴露过一个有价值的问题：`candidate.assign(total_size, 0)` 只产生零字节，随后把它reinterpret为header却没有执行default member initializers，magic/version/flags仍是0，测试在继续解释非法header时触发崩溃。修正为在写字段前显式执行 `*header = HbgLaunchBlobHeader{}`。这也说明variable ABI不能依赖“零内存等于默认对象”的偶然假设。
+
+#### 10.25.6 本阶段验证证据
+
+新增 `runtime/tests/ut/cpp/types/test_hbg_launch_blob.cpp` 和独立 `no_hardware` CMake target，10个case覆盖：
+
+- source被修改后deep snapshot不变；
+- host-unpatched、device-patched和错误pointer状态；
+- truncated/header/generation/identity损坏；
+- partial full-image、source/destination overlap和capacity越界；
+- hash覆盖identity/descriptors/payload但排除placeholder；
+- stale slot generation/address和另一次argument/function identity被拒绝；
+- 多个不重叠heap initializer及重叠负例；
+- invalid input/build失败不覆盖上一份canonical blob。
+
+验证结果：
+
+- runtime完整pre-commit通过，包括header检查、English-only、clang-format、clang-tidy、cpplint；仍使用与CI同系列且resource headers完整的LLVM 18.1.8临时工具链，没有跳过hook；
+- runtime editable build通过，并重新编译A2/A3与A5的onboard/sim HBG host runtime对象；
+- 新target：10/10 passed；
+- `ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure`：**86/86 passed**，其中70项标记 `no_hardware`；
+- `test_runtime_builder.py + test_host_runtime_abi.py + test_worker_reuse.py + test_chip_worker_explicit_dispatch.py + test_binary_cache_context.py`：**112 passed, 4 skipped, 14 warnings**；
+- 两仓 `git diff --check`通过；没有运行NPU命令。
+
+第一次Python回归命令从runtime子仓执行时误写成 `runtime/tests/...`，pytest只报告file not found、没有执行测试体；随后用正确的 `tests/ut/py/...` 路径重跑，得到上述112/4结果。过程记录保留这一点，避免以后把错误命令的空跑当成验证。
+
+runtime阶段提交为：
+
+```text
+11b7a4b1 Add: 建立HBG图包序列化与上传边界
+```
+
+提交仅在GPT工作区和 `gpt/pypto-l1-aclgraph` 分支，本地commit，未push；没有修改Grok工作目录。
+
+#### 10.25.7 当前明确没有完成的能力
+
+这一阶段不能被表述为“HBG已经支持L1/ACLGraph”。仍未完成的关键闭环是：
+
+1. current HBG host builder尚未把SM、runtime arena和heap initializers发布成正式、可缓存、带owner的 `HbgGraphPlan`；新serializer当前是common基础设施，尚未接入production HBG bind；
+2. 尚未新增writable args + placeholder array的CANN launch helper，未证明CANN何时原地patch host blob、何时完成snapshot、captured graph销毁时何时释放runtime-owned device args；
+3. 尚未有HBG独立AICPU L1 entry，也未把parser放到device侧，更没有exactly-one leader在每次eager/replay前恢复working SM/runtime arena/initializer；
+4. 尚未建立HBG stable execution slot、prepare-time capacity freeze、generation owner、outer Runtime/KernelArgs/handshake的per-execution reset清单；
+5. 尚未解决host orchestration读取tensor data时，L1 direct external NPU tensor如何在不D2H、不sync的前提下提供host-known control data；
+6. HBG所有variant的 `simpler_l1_supported()`仍返回false，高层 `pypto_init`仍拒绝HBG；TRB L1路径和fixed `L1AicpuInvocationArgs`完全未改；
+7. device 1上的placeholder/large-args/capture lifetime、AICPU restore cache/order、同图第二次及后续replay、graph A/B交替replay和memory accounting全部还是发布硬门槛。
+
+当前可以确认的只是：代码中已经有一个与用户“graph像tiling参数随task管理”原则一致的host表示——每次launch的writable blob深拷贝并封装自己的pristine graph bytes、identity和destination generation，working slot则明确属于context且必须per replay restore。谁最终拥有runtime-owned source、什么时候可释放、device如何恢复，仍由后续H0与H3/H4实现回答，不能从本轮host UT推断。

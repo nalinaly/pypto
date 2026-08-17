@@ -2,7 +2,7 @@
 
 <!-- markdownlint-disable MD036 MD060 -->
 
-> 状态：TRB L1实现和无硬件回归已完成，已具备Phase-0 ST，但device 1 ACLGraph真实上板尚未通过；HBG仍是第二阶段准入设计。本文是指导性设计记录，完整上下文优先，不以篇幅压缩为目标。
+> 状态：TRB L1实现和无硬件回归已完成，已具备Phase-0 ST，但device 1 ACLGraph真实上板尚未通过；HBG第二阶段已经落下host-build/H2D边界和variable launch blob的H1/H2 host基础，但尚未接入CANN placeholder launch、AICPU per-replay restore或高层L1 capability，仍保持unsupported。本文是指导性设计记录，完整上下文优先，不以篇幅压缩为目标。
 >
 > 首期范围：onboard、`tensormap_and_ringbuffer`（TRB）、`@pl.program`、静态 shape、PyTorch 直接调用验证。
 >
@@ -2215,8 +2215,8 @@ v1 契约仍禁止并发 replay，但需观察两个图共享 context events时 
 
 源码证据：
 
-- `runtime/src/a2a3/runtime/host_build_graph/host/runtime_maker.cpp:450-538`：本地host SM、最终device base relocation和SM H2D；
-- `runtime/src/a2a3/runtime/host_build_graph/host/runtime_maker.cpp:772-888`：GM heap/SM/runtime arena三个region、本地host arena及arena H2D；
+- `runtime/src/a2a3/runtime/host_build_graph/host/runtime_maker.cpp` 的 `build_host_orchestration_image`：本地host SM、最终device base relocation和owning SM bytes；该函数在提交 `11b7a4b1` 后不再自行H2D；
+- 同文件 `bind_callable_to_runtime_impl`：GM heap/SM/runtime arena三个region、本地host arena，并在SM与arena两份host image完成后进入显式同步H2D区域；
 - `runtime/src/common/platform/onboard/host/device_runner_helpers.cpp:25-75`：outer `Runtime`和device `KernelArgs`分别分配/复制；
 - `runtime/src/a2a3/runtime/host_build_graph/runtime/shared/runtime.cpp:155-157`：HBG当前将整个outer `Runtime` 作为device image复制。
 
@@ -2289,33 +2289,37 @@ CANN当前实现提供下列源码证据：
 
 这些证据能证明“inline payload + placeholder”是有源码基础的P0候选，但不能替代graph lifetime和大小上限的板上证明。
 
-#### N.4.2 建议布局
+#### N.4.2 已落地的host ABI和待接device bridge
 
-下列仅是ABI布局要求，不预先固定最终C++类名或字段顺序：
+提交 `11b7a4b1` 已将host侧ABI具体化为下列布局；在HBG capability开启前仍可按device probe结果做versioned演进，但任何变更必须同步magic/version/static assertions和parser测试：
 
 ```text
-HbgSerializedLaunchBlob
-  HbgL1InvocationHeader
-    magic / abi_version / header_size / total_size
-    graph_generation / content_hash / binding_generation
-    expected working SM/arena/heap/runtime bases
-    required capacities
-    pristine_sm_ptr      ---- placeholder[0] ---> inline SM bytes
-    pristine_sm_size
-    pristine_arena_ptr   ---- placeholder[1] ---> inline arena bytes
-    pristine_arena_size
-    restore_manifest_ptr ---- placeholder[2] ---> inline manifest/initializer table
-    restore_manifest_count
-    host_total_tasks / callable and function snapshot
-  aligned inline pristine SM
-  aligned inline pristine runtime arena
-  aligned restore manifest + optional initializer bytes
+HbgLaunchBlobHeader
+  magic / abi major+minor / exact header_size / exact total_size
+  region_count / flags / plan_generation / plan_hash
+  inline_payload_addr  ---- placeholder[0] ---> inline payload base
+  inline_payload_size
+  HbgExecutionBinding
+    SM / runtime-arena / GM-heap bases and capacities
+    runtime_offset / slot_generation
+  HbgInvocationIdentity
+    callable_hash / argument_snapshot_hash / function_binding_hash
+    tensor_count / scalar_count
+HbgLaunchRegion[region_count]
+  kind / flags / source_offset / size / destination_offset
+zero alignment padding
+aligned inline payload
+  full pristine SM image
+  full pristine runtime-arena image
+  optional GM-heap initializer bytes
 ```
+
+只用一个placeholder修补inline payload base，region的source offset全部相对该base。这避免为每个span建立独立pointer字段，也让region table本身仍位于runtime复制的固定header范围。canonical host blob中pointer必须为0；device-patched blob中必须精确等于runtime args base加 `header_size`。
 
 实现必须：
 
 - 使用独立HBG AICPU entry/ABI，不让当前固定 `L1AicpuInvocationArgs` 的 `struct_size == sizeof(...)` 验证接受variable tail；
-- 在host上对 `total_size`、alignment、每个 `offset + size`、placeholder `addrOffset + 8`、`dataOffset`和manifest数量做overflow-safe校验；
+- 在host上对 `total_size`、alignment、每个 `offset + size`、placeholder `addrOffset + 8`、`dataOffset`和region数量做overflow-safe校验；当前serializer/validator已完成除真实placeholder array以外的这部分；
 - 显式限制 `total_size <= UINT32_MAX`，不接受public `size_t` 到runtime `uint32_t` 的静默截断；
 - header在AICPU端通过对齐local copy或byte-safe parser读取，不假设runtime args base满足PyPTO `alignas(64)`；
 - `LoadAicpuOp` 增加接受writable host args和placeholder array的独立能力；不继续使用当前 `const_cast + nullptr placeholder`的TRB helper形态；
@@ -2441,6 +2445,10 @@ P0: WithHostArgs inline payload完整copy且随captured graph存活？
 
 ### N.9 第二阶段建议实施顺序
 
+> **2026-08-18实施快照：** runtime提交 `11b7a4b1` 已完成一笔不依赖device的H1/H2基础改造：A2/A3和A5都把host orchestration的SM image构建与同步H2D拆开；common层新增destination-bound variable launch blob、deep-copy serializer和byte-safe validator，并以slot generation/address/capacity、callable/argument/function identity、full-image/overlap/hash规则约束输入。它尚未形成完整owning `HbgGraphPlan`，也没有把blob接到 `aclrtLaunchKernelWithHostArgs` placeholder、AICPU leader restore或stable execution slot，所以H1/H2只能标记为“host基础已落地、device闭环未完成”，HBG L1 capability继续为unsupported。详细代码、测试和未完成边界见过程记录10.25。
+
+当前进度不能解释成跳过H0：host-only ABI和边界拆分可以先写、先做无硬件fail-closed测试；任何关于CANN snapshot时点、captured-node lifetime、large args、cache可见性和replay恢复正确性的产品结论，仍必须由空闲device 1上的H0/P0实证给出。
+
 #### N.9.1 HBG Phase H0：只做device 1 capability probes
 
 1. AICPU WithHostArgs placeholder inline pointer、host原地patch和snapshot时点；
@@ -2458,6 +2466,8 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 - 保留L2/L3原有bind/copy路径，不迫使它们经过L1 variable blob；
 - 新增plan validation/hash/binding metadata UT。
 
+当前已完成：`build_host_orchestration_image`不再执行H2D，调用方只在SM与runtime-arena两份host image都完整后越过显式上传边界；A2/A3与A5保持同构，旧L2仍在同一bind调用中同步上传。当前尚未完成：把SM、arena及initializer spans正式封装成独立、可缓存且具有明确owner的 `HbgGraphPlan`；现有 `DeviceArena` 仍是bind栈内对象，因此不得把当前拆分描述成已经解决captured-node lifetime。
+
 #### N.9.3 HBG Phase H2：variable launch blob和placeholder bridge
 
 - 定义独立HBG invocation header/ABI、serializer和parser；
@@ -2465,6 +2475,8 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 - 实现完整size/offset/alignment/overflow validation；
 - 保留TRB fixed WithHostArgs ABI不变；
 - 对host patch污染canonical plan、截断blob、交叉span、错误placeholder做无硬件UT。
+
+当前已完成：独立 `HbgLaunchBlobHeader/HbgLaunchRegion/HbgExecutionBinding/HbgInvocationIdentity` ABI、深拷贝serializer、host-unpatched/device-patched pointer状态、严格size/alignment/overflow/full-image/overlap/hash校验以及10项无硬件UT。当前尚未完成：CANN placeholder array与writable per-launch blob的真实launch helper、AICPU侧parser/restore入口、host原地patch与runtime snapshot时点的device 1实证。这里的“device-patched”测试只是ABI状态机测试，不是CANN已经按预期持有payload的证据。
 
 #### N.9.4 HBG Phase H3：stable execution slot和capacity freeze
 
