@@ -2,7 +2,7 @@
 
 <!-- markdownlint-disable MD036 MD060 -->
 
-> 状态：TRB L1实现和无硬件回归已完成，已具备Phase-0 ST，但device 1 ACLGraph真实上板尚未通过；HBG第二阶段已经落下host-build/H2D边界、variable launch blob、CANN mutable HostArgs/placeholder host bridge、common per-replay restore核心，以及真实working arena的prepare-time分配/冻结基础；尚未注册HBG AICPU entry、接入device leader restore或开放高层L1 capability，仍保持unsupported。本文是指导性设计记录，完整上下文优先，不以篇幅压缩为目标。
+> 状态：TRB L1实现和无硬件回归已完成，已具备Phase-0 ST，但device 1 ACLGraph真实上板尚未通过；HBG第二阶段已经落下host-build/H2D边界、variable launch blob、CANN mutable HostArgs/placeholder host bridge、common per-replay restore核心、真实working arena的prepare-time分配/冻结，以及task级immutable `HbgGraphPlan`/fresh writable HostArgs快照的所有权基础；尚未生成并发布完整slot registration、注册HBG AICPU entry、接入device leader restore或开放高层L1 capability，仍保持unsupported。本文是指导性设计记录，完整上下文优先，不以篇幅压缩为目标。
 >
 > 首期范围：onboard、`tensormap_and_ringbuffer`（TRB）、`@pl.program`、静态 shape、PyTorch 直接调用验证。
 >
@@ -2291,7 +2291,7 @@ CANN当前实现提供下列源码证据：
 
 #### N.4.2 已落地的host ABI和待接device bridge
 
-提交 `11b7a4b1` 已将host侧ABI具体化为下列布局；在HBG capability开启前仍可按device probe结果做versioned演进，但任何变更必须同步magic/version/static assertions和parser测试：
+提交 `11b7a4b1` 已将host侧ABI具体化；提交 `2873feae` 为避免context-wide `Runtime::host_total_tasks`被后一次build覆盖，将实际scheduler task数纳入task-owned identity，并将ABI minor升级为1。当前固定大小为：`HbgExecutionBinding=64` bytes、`HbgInvocationIdentity=40` bytes、`HbgLaunchRegion=40` bytes、`HbgLaunchBlobHeader=160` bytes、`HbgRestoreCommit=64` bytes。在HBG capability开启前仍可按device probe结果做versioned演进，但任何变更必须同步magic/version、全部static assertions、plan hash和parser/restore测试：
 
 ```text
 HbgLaunchBlobHeader
@@ -2304,7 +2304,7 @@ HbgLaunchBlobHeader
     runtime_offset / slot_generation
   HbgInvocationIdentity
     callable_hash / argument_snapshot_hash / function_binding_hash
-    tensor_count / scalar_count
+    tensor_count / scalar_count / host_total_tasks / reserved
 HbgLaunchRegion[region_count]
   kind / flags / source_offset / size / destination_offset
 zero alignment padding
@@ -2445,7 +2445,7 @@ P0: WithHostArgs inline payload完整copy且随captured graph存活？
 
 ### N.9 第二阶段建议实施顺序
 
-> **2026-08-18实施快照：** runtime提交 `11b7a4b1` 完成第一笔不依赖device的H1/H2基础：A2/A3和A5拆开host orchestration SM image构建与同步H2D；common层新增destination-bound variable launch blob、deep-copy serializer和byte-safe validator。随后 `10e69df6` 增加mutable HostArgs + placeholder真实ACL API bridge，并在CANN调用前校验所有lossy carrier和pointer write。`de2aa0f9` 又将H4的正确性核心落为common层：每次从runtime-owned pristine source完整恢复working image，仅在全部region copy/cache-publish成功后提交新epoch，并用重复replay、A/B package交替和中途失败反例锁定语义。`f6ad61df` 再建立144-byte prepare-time slot registration trust root，freeze device、SM/arena/heap、outer Runtime、device KernelArgs、slot/binary generation、package capacity和serial-only契约，restore不再允许blob用自己的binding自证。`ee292037` 进一步让A2/A3和A5 HBG strong prepare真实计算并分配GM heap/SM/runtime arena，通过DeviceRunner按精确base/capacity冻结working arena，且冻结后拒绝任何增容、缩容或换址。当前仍未形成完整owning `HbgGraphPlan`、完整slot registration生成/发布、独立HBG AICPU entry或leader/peer发布协议；因此working destination已有真实prepare-time owner，但task/captured-node source与device replay闭环仍未完成，HBG L1 capability继续为unsupported。详细代码、测试和未完成边界见过程记录10.25～10.29。
+> **2026-08-18实施快照：** runtime提交 `11b7a4b1` 完成第一笔不依赖device的H1/H2基础：A2/A3和A5拆开host orchestration SM image构建与同步H2D；common层新增destination-bound variable launch blob、deep-copy serializer和byte-safe validator。随后 `10e69df6` 增加mutable HostArgs + placeholder真实ACL API bridge，并在CANN调用前校验所有lossy carrier和pointer write。`de2aa0f9` 又将H4的正确性核心落为common层：每次从runtime-owned pristine source完整恢复working image，仅在全部region copy/cache-publish成功后提交新epoch，并用重复replay、A/B package交替和中途失败反例锁定语义。`f6ad61df` 再建立144-byte prepare-time slot registration trust root，freeze device、SM/arena/heap、outer Runtime、device KernelArgs、slot/binary generation、package capacity和serial-only契约，restore不再允许blob用自己的binding自证。`ee292037` 进一步让A2/A3和A5 HBG strong prepare真实计算并分配GM heap/SM/runtime arena，通过DeviceRunner按精确base/capacity冻结working arena，且冻结后拒绝任何增容、缩容或换址。`2873feae` 已把一次dynamic host build提升为真正owning、immutable的 `HbgGraphPlan`：A2/A3和A5 strong host-build hook针对冻结slot生成SM/runtime-arena pristine image，实际 `host_total_tasks`进入task identity，plan每次只导出fresh writable HostArgs scratch，placeholder不能污染canonical bytes。当前仍未形成完整slot registration生成/发布、独立HBG AICPU entry或leader/peer发布协议；因此working destination和host canonical source已有明确owner，但CANN runtime-owned device source与device replay闭环仍未完成，HBG L1 capability继续为unsupported。详细代码、测试和未完成边界见过程记录10.25～10.30。
 
 当前进度不能解释成跳过H0：host-only ABI和边界拆分可以先写、先做无硬件fail-closed测试；任何关于CANN snapshot时点、captured-node lifetime、large args、cache可见性和replay恢复正确性的产品结论，仍必须由空闲device 1上的H0/P0实证给出。
 
@@ -2466,7 +2466,7 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 - 保留L2/L3原有bind/copy路径，不迫使它们经过L1 variable blob；
 - 新增plan validation/hash/binding metadata UT。
 
-当前已完成：`build_host_orchestration_image`不再执行H2D，调用方只在SM与runtime-arena两份host image都完整后越过显式上传边界；A2/A3与A5保持同构，旧L2仍在同一bind调用中同步上传。当前尚未完成：把SM、arena及initializer spans正式封装成独立、可缓存且具有明确owner的 `HbgGraphPlan`；现有 `DeviceArena` 仍是bind栈内对象，因此不得把当前拆分描述成已经解决captured-node lifetime。
+当前已完成：`build_host_orchestration_image`不再执行H2D，调用方只在SM与runtime-arena两份host image都完整后越过显式上传边界；A2/A3与A5保持同构，旧L2仍在同一bind调用中同步上传。runtime `2873feae` 进一步增加immutable owning `HbgGraphPlan`和A2/A3、A5 strong host-build hook：host `DeviceArena`与SM vector只作为本次build的临时source，成功返回前被deep-copy进私有canonical blob；失败不覆盖caller原有plan owner。当前plan已正式拥有完整SM与runtime-arena image，但GM heap中有语义的initializer spans尚未形成manifest/region，因而不能把“两个full image已有owner”扩张成“全部graph执行态都已可重复恢复”。captured-node lifetime还要由H2 runtime-owned device source和H0实证闭环。
 
 #### N.9.3 HBG Phase H2：variable launch blob和placeholder bridge
 
@@ -2476,7 +2476,7 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 - 保留TRB fixed WithHostArgs ABI不变；
 - 对host patch污染canonical plan、截断blob、交叉span、错误placeholder做无硬件UT。
 
-当前已完成：独立 `HbgLaunchBlobHeader/HbgLaunchRegion/HbgExecutionBinding/HbgInvocationIdentity` ABI、深拷贝serializer、host-unpatched/device-patched pointer状态、严格size/alignment/overflow/full-image/overlap/hash校验；runtime `10e69df6` 又增加CANN-independent placeholder ABI、silent-narrowing/8-byte pointer-write校验、`LoadAicpuOp::LaunchWithMutableHostArgs`真实ACL API bridge，以及合计13项无硬件UT。当前尚未完成：把该helper接到独立HBG AICPU symbol、AICPU侧parser/restore入口，以及host patch、runtime snapshot时点和captured lifetime的device 1实证。这里的“device-patched”测试只是等价字节状态测试，不是CANN已经按预期持有payload的证据。
+当前已完成：独立 `HbgLaunchBlobHeader/HbgLaunchRegion/HbgExecutionBinding/HbgInvocationIdentity` ABI、深拷贝serializer、host-unpatched/device-patched pointer状态、严格size/alignment/overflow/full-image/overlap/hash校验；runtime `10e69df6` 又增加CANN-independent placeholder ABI、silent-narrowing/8-byte pointer-write校验和 `LoadAicpuOp::LaunchWithMutableHostArgs` 真实ACL API bridge。runtime `2873feae` 将serializer封进immutable `HbgGraphPlan`：canonical `HostUnpatched` bytes完全私有，每次 `serialize()` deep-copy出独立writable scratch；一份scratch被placeholder patch不影响plan或其他task。ABI minor 1还把实际 `host_total_tasks`纳入identity/hash，防止后一次build覆盖旧task的scheduler规模。当前尚未完成：把fresh scratch接到独立HBG AICPU symbol、AICPU侧parser/restore入口，以及host patch、runtime snapshot时点和captured lifetime的device 1实证。这里的“device-patched”测试只是等价字节状态测试，不是CANN已经按预期持有payload的证据。
 
 #### N.9.4 HBG Phase H3：stable execution slot和capacity freeze
 
@@ -2504,7 +2504,7 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 - caller stream运行AICPU主task，hidden stream只运行AICore，与本计划已确定单op fork/join边界一致；
 - 不使用旧PyPTO的hidden AICPU stream、capture-aware early launch或model attach。
 
-当前 `ee292037` 已为A2/A3与A5 HBG提供strong `prepare_l1_runtime_impl`，但它只建立并冻结三块working arena，尚未越过registration/runtime执行边界：common仍对host orchestration callable的 `host_dlopen_handle` 返回unsupported，HBG没有独立AICPU registration/run entry，也没有把slot registration发布到device，support query仍为false。该strong prepare是H3/H5共享的prepare基础，不能单独解释为H5完成。
+当前 `ee292037` 已为A2/A3与A5 HBG提供strong `prepare_l1_runtime_impl`，建立并冻结三块working arena；`2873feae` 又为两架构提供同构的strong `build_l1_hbg_graph_plan_impl`，能以冻结binding和本次args为输入生成owning plan，TRB/common weak hook仍明确返回unsupported。但这些host hook尚未被DeviceRunner的公开L1 callable路径调用，common仍对host orchestration callable的 `host_dlopen_handle` 返回unsupported，HBG没有独立AICPU registration/run entry，也没有把slot registration发布到device，support query仍为false。strong prepare/build只是H1/H3/H5共享基础，不能单独解释为H5完成。
 
 #### N.9.7 HBG Phase H6：direct external tensors与host-build数据契约
 
@@ -2513,6 +2513,8 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 - 只允许已证明capture-safe的host-known metadata/scalar/CPU control-data路径；
 - 依赖device tensor value但无无sync host-view协议的callable必须fail-closed，不在capture中暗中D2H/sync；
 - A2/A3 host mapping能力不能被默认等价到A5。
+
+当前 `2873feae` 的strong host-build hook已经执行第一层运行时防护：external tensor只借用原device地址，不分配、不H2D/D2H、不stream/device sync；只有platform同时提供register/unregister时才尝试建立临时host view，映射存在时只允许读取；`set_tensor_data`在修改direct或mirrored bytes之前统一失败。无法映射而又读取device value的host orchestration经现有host access接口失败；只依赖metadata/scalar/topology的build不受影响。这还不能替代编译期静态分类：尤其A5映射能力不能凭A2/A3行为假设，未来仍应把data-read/write requirement写进final transformed orchestration metadata，在进入build前fail-fast。
 
 #### N.9.8 HBG Phase H7：ACLGraph、lifetime与回归
 
@@ -2590,7 +2592,7 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 | scalar / host-known control value | 是 | 写入GraphPlan和captured payload snapshot |
 | 显式CPU control tensor，且调用方保证capture期稳定 | 待定 | 定义独立API/签名与生命校验，不暗中D2H |
 | device tensor value，无无sync host-view协议 | 否 | prepare/capture前fail-closed |
-| host orchestration通过 `set_tensor_data` 改写external device tensor | 待定/默认拒绝 | 必须先证明caller-stream ordering、cache可见性和无sync协议 |
+| host orchestration通过 `set_tensor_data` 改写external device tensor | v1拒绝 | 当前HBG L1 read-only host-view在修改direct/mirrored bytes前失败；未来若开放写入，必须先证明caller-stream ordering、cache可见性和无sync协议 |
 
 实现前必须统计/静态标记orchestration是否使用 `get_tensor_data/set_tensor_data`，不允许因为某个example只依赖shape就推断所有HBG都不读data。这是与graph payload lifetime平行的独立硬门槛：
 
@@ -2598,6 +2600,8 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 - tensor-data protocol解决“host builder在不内部sync/搬运external tensor的前提下，是否有权取得构图所需数据”。
 
 任一项未闭环，HBG L1 + ACLGraph都不得标记supported。
+
+runtime `2873feae` 已把“默认拒绝写”做成代码而不是文档约定：host-build开始时清空旧mapping并进入read-only模式，成功映射的device storage只供 `host_tensor_read` 使用，所有 `host_tensor_write` 在定位region或执行copy之前返回false；RAII退出时清除mapping并成对unregister。该保护只解决“绝不在host build偷偷写调用方tensor”，并没有凭空创造device-value快照：没有host view时，任何真实data read仍会失败。因此静态requirement标记、A2/A3与A5分别验证，以及capture时host control data的稳定性仍是H6准入项。
 
 ### N.12 第二阶段完成定义
 
