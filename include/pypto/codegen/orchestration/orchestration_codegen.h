@@ -12,6 +12,7 @@
 #ifndef PYPTO_CODEGEN_ORCHESTRATION_ORCHESTRATION_CODEGEN_H_
 #define PYPTO_CODEGEN_ORCHESTRATION_ORCHESTRATION_CODEGEN_H_
 
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -44,6 +45,9 @@ struct OrchestrationResult {
   /// ChipCallable signature so read-only IN tensors skip the D2H copy-back and
   /// pure-OUT tensors take the on-device memset fast path.
   std::vector<std::string> orchestration_signature;
+  /// Number of scalar/CommCtx parameters in the orchestration entry. Kept
+  /// separate because ChipCallable.signature_ is tensor-only.
+  int32_t orchestration_scalar_count{0};
 };
 
 /**

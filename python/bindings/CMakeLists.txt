@@ -88,3 +88,95 @@ endif()
 
 # Generate dSYM on macOS for libbacktrace debug symbols
 pypto_add_apple_dsymutil(${LIBRARY_NAME})
+
+# Optional taskQueue-aware torch_npu adapter for borrowed-device L1. Keep it a
+# separate extension: pypto_core and simpler remain free of torch_npu's private
+# C++ ABI, and CPU-only builds continue when torch_npu is absent.
+option(PYPTO_BUILD_TORCH_NPU_L1_ADAPTER "Build the optional torch_npu L1 adapter" ON)
+if(PYPTO_BUILD_TORCH_NPU_L1_ADAPTER AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    execute_process(
+        COMMAND ${Python_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/detect_torch_npu.py
+        RESULT_VARIABLE PYPTO_TORCH_NPU_DETECT_RESULT
+        OUTPUT_VARIABLE PYPTO_TORCH_NPU_METADATA
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+
+    if(PYPTO_TORCH_NPU_DETECT_RESULT EQUAL 0)
+        string(REPLACE "\n" ";" PYPTO_TORCH_NPU_FIELDS "${PYPTO_TORCH_NPU_METADATA}")
+        list(LENGTH PYPTO_TORCH_NPU_FIELDS PYPTO_TORCH_NPU_FIELD_COUNT)
+    else()
+        set(PYPTO_TORCH_NPU_FIELD_COUNT 0)
+    endif()
+
+    if(PYPTO_TORCH_NPU_FIELD_COUNT EQUAL 5)
+        list(GET PYPTO_TORCH_NPU_FIELDS 0 PYPTO_TORCH_ROOT)
+        list(GET PYPTO_TORCH_NPU_FIELDS 1 PYPTO_TORCH_NPU_ROOT)
+        list(GET PYPTO_TORCH_NPU_FIELDS 2 PYPTO_TORCH_CXX11_ABI)
+        list(GET PYPTO_TORCH_NPU_FIELDS 3 PYPTO_TORCH_VERSION)
+        list(GET PYPTO_TORCH_NPU_FIELDS 4 PYPTO_TORCH_NPU_VERSION)
+
+        set(PYPTO_TORCH_LIB_DIR ${PYPTO_TORCH_ROOT}/lib)
+        set(PYPTO_TORCH_NPU_LIB_DIR ${PYPTO_TORCH_NPU_ROOT}/lib)
+        set(PYPTO_TORCH_NPU_REQUIRED_FILES
+            ${PYPTO_TORCH_ROOT}/include/torch/csrc/api/include/torch/torch.h
+            ${PYPTO_TORCH_ROOT}/include/torch/csrc/autograd/python_variable.h
+            ${PYPTO_TORCH_NPU_ROOT}/include/torch_npu/csrc/core/npu/NPUCachingAllocator.h
+            ${PYPTO_TORCH_NPU_ROOT}/include/torch_npu/csrc/core/npu/NPUStream.h
+            ${PYPTO_TORCH_NPU_ROOT}/include/torch_npu/csrc/framework/OpCommand.h
+            ${PYPTO_TORCH_NPU_LIB_DIR}/libtorch_npu.so
+            ${PYPTO_TORCH_LIB_DIR}/libtorch.so
+            ${PYPTO_TORCH_LIB_DIR}/libtorch_cpu.so
+            ${PYPTO_TORCH_LIB_DIR}/libtorch_python.so
+            ${PYPTO_TORCH_LIB_DIR}/libc10.so
+        )
+        set(PYPTO_TORCH_NPU_BUILDABLE TRUE)
+        foreach(PYPTO_TORCH_NPU_FILE IN LISTS PYPTO_TORCH_NPU_REQUIRED_FILES)
+            if(NOT EXISTS ${PYPTO_TORCH_NPU_FILE})
+                set(PYPTO_TORCH_NPU_BUILDABLE FALSE)
+            endif()
+        endforeach()
+    else()
+        set(PYPTO_TORCH_NPU_BUILDABLE FALSE)
+    endif()
+
+    if(PYPTO_TORCH_NPU_BUILDABLE)
+        nanobind_add_module(_torch_npu_l1 torch_npu_l1_adapter.cpp)
+        target_include_directories(_torch_npu_l1 PRIVATE
+            ${PYPTO_TORCH_ROOT}/include
+            ${PYPTO_TORCH_ROOT}/include/torch/csrc/api/include
+            ${PYPTO_TORCH_NPU_ROOT}/include
+            ${PYPTO_TORCH_NPU_ROOT}/include/third_party/acl/inc
+            ${PYPTO_TORCH_NPU_ROOT}/include/third_party/hccl/inc
+            ${CMAKE_SOURCE_DIR}/runtime/src
+        )
+        target_compile_definitions(_torch_npu_l1 PRIVATE
+            _GLIBCXX_USE_CXX11_ABI=${PYPTO_TORCH_CXX11_ABI}
+            PYPTO_L1_BUILD_TORCH_VERSION="${PYPTO_TORCH_VERSION}"
+            PYPTO_L1_BUILD_TORCH_NPU_VERSION="${PYPTO_TORCH_NPU_VERSION}"
+        )
+        target_link_libraries(_torch_npu_l1 PRIVATE
+            ${PYPTO_TORCH_NPU_LIB_DIR}/libtorch_npu.so
+            ${PYPTO_TORCH_LIB_DIR}/libtorch.so
+            ${PYPTO_TORCH_LIB_DIR}/libtorch_cpu.so
+            ${PYPTO_TORCH_LIB_DIR}/libtorch_python.so
+            ${PYPTO_TORCH_LIB_DIR}/libc10.so
+        )
+        set_target_properties(_torch_npu_l1 PROPERTIES
+            CXX_VISIBILITY_PRESET hidden
+            VISIBILITY_INLINES_HIDDEN ON
+            BUILD_RPATH "${PYPTO_TORCH_LIB_DIR};${PYPTO_TORCH_NPU_LIB_DIR}"
+            INSTALL_RPATH "$ORIGIN/../torch/lib;$ORIGIN/../torch_npu/lib"
+        )
+        if(SKBUILD_MODE)
+            install(TARGETS _torch_npu_l1 DESTINATION .)
+        else()
+            set_target_properties(_torch_npu_l1 PROPERTIES
+                LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/python/pypto
+            )
+        endif()
+        message(STATUS "Building optional PyPTO L1 adapter for torch ${PYPTO_TORCH_VERSION}, torch_npu ${PYPTO_TORCH_NPU_VERSION}")
+    else()
+        message(STATUS "Skipping optional PyPTO L1 torch_npu adapter: compatible headers/libraries were not found")
+    endif()
+endif()

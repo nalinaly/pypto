@@ -151,6 +151,21 @@ class TestOrchestrationConfigSignature:
         assert "_D.SCALAR" not in text
         assert _is_valid_python(text)
 
+    def test_orchestration_scalar_count_emitted_separately(self) -> None:
+        text = _generate_config_file(
+            **_base_inputs(),
+            orchestration_signature=["IN", "OUT"],
+            orchestration_scalar_count=3,
+        )
+        orch_block = text.split("KERNELS")[0]
+        assert '"signature": [_D.IN, _D.OUT]' in orch_block
+        assert '"scalar_count": 3' in orch_block
+        assert _is_valid_python(text)
+
+    def test_negative_orchestration_scalar_count_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="orchestration_scalar_count must be non-negative"):
+            _generate_config_file(**_base_inputs(), orchestration_scalar_count=-1)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

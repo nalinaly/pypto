@@ -835,6 +835,7 @@ def _generate_config_file(
     func_name_to_core_type: dict[str, _ir_core.CoreType],
     func_name_to_signature: dict[str, list[str]] | None = None,
     orchestration_signature: list[str] | None = None,
+    orchestration_scalar_count: int = 0,
     func_name_to_external_source: dict[str, str] | None = None,
     func_name_to_external_include_dirs: dict[str, tuple[str, ...]] | None = None,
     enable_sdma: bool = False,
@@ -871,6 +872,8 @@ def _generate_config_file(
     func_name_to_external_source = func_name_to_external_source or {}
     func_name_to_external_include_dirs = func_name_to_external_include_dirs or {}
     orchestration_signature = orchestration_signature or []
+    if orchestration_scalar_count < 0:
+        raise ValueError("orchestration_scalar_count must be non-negative")
     has_signatures = any(func_name_to_signature.values()) or bool(orchestration_signature)
 
     runtime_lines = [
@@ -903,6 +906,8 @@ def _generate_config_file(
     ]
     if orchestration_signature:
         lines.append(f'\t"signature": [{_format_signature(orchestration_signature)}],')
+    if orchestration_scalar_count:
+        lines.append(f'\t"scalar_count": {orchestration_scalar_count},')
     lines += [
         "}\n",
         "KERNELS = [",
@@ -1763,6 +1768,7 @@ def _generate_single_chip(
                     orch_result.func_name_to_core_type,
                     orch_result.func_name_to_signature,
                     orch_result.orchestration_signature,
+                    orch_result.orchestration_scalar_count,
                     func_name_to_external_source,
                     func_name_to_external_include_dirs,
                     enable_sdma=any(_uses_sdma_workspace(func) for func in emitted_incore_funcs),

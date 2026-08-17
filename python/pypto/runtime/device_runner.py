@@ -868,6 +868,7 @@ def _compile_and_assemble_locked(
         func_name=func_name,
         binary=orch_so_binary,
         children=kernel_binaries,
+        scalar_count=int(orchestration.get("scalar_count", 0)),
     )
     # ``orch_so_binary`` is the buffer the runtime hashes into the ``hid=`` of this
     # callable's [STRACE] markers; pair it with the per-program display name (NOT

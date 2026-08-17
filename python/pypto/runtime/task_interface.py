@@ -15,6 +15,11 @@ torch-aware helpers (make_tensor_arg, scalar_to_uint64) come from the
 """
 
 from simpler.task_interface import (  # pyright: ignore[reportMissingImports]
+    CHIP_MAX_SCALAR_ARGS,  # pyright: ignore[reportAttributeAccessIssue]
+    CHIP_MAX_TENSOR_ARGS,  # pyright: ignore[reportAttributeAccessIssue]
+    MAX_REGISTERED_CALLABLE_IDS,  # pyright: ignore[reportAttributeAccessIssue]
+    MAX_TENSOR_DIMS,  # pyright: ignore[reportAttributeAccessIssue]
+    ArgDirection,  # pyright: ignore[reportAttributeAccessIssue]
     CallConfig,  # pyright: ignore[reportAttributeAccessIssue]
     ChipCallable,  # pyright: ignore[reportAttributeAccessIssue]
     ChipStorageTaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
@@ -48,11 +53,16 @@ def device_tensor_to_tensor(dt: DeviceTensor) -> Tensor:
 
 
 __all__ = [
+    "ArgDirection",
     "CallConfig",
     "ChipCallable",
     "ChipStorageTaskArgs",
     "CoreCallable",
     "DataType",
+    "CHIP_MAX_SCALAR_ARGS",
+    "CHIP_MAX_TENSOR_ARGS",
+    "MAX_REGISTERED_CALLABLE_IDS",
+    "MAX_TENSOR_DIMS",
     "Tensor",
     "Worker",
     "device_tensor_to_tensor",

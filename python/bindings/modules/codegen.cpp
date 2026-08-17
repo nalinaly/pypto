@@ -63,7 +63,9 @@ void BindCodegen(nb::module_& m) {
               "task-payload (tensors-first) order")
       .def_ro("orchestration_signature", &OrchestrationResult::orchestration_signature,
               "Orchestration entry per-tensor ArgDirection name list (scalars excluded), in "
-              "orch_args tensor order; sets the ChipCallable signature");
+              "orch_args tensor order; sets the ChipCallable signature")
+      .def_ro("orchestration_scalar_count", &OrchestrationResult::orchestration_scalar_count,
+              "Number of scalar/CommCtx orchestration parameters");
 
   // Free functions for orchestration codegen (backend-agnostic)
   codegen_module.def("generate_orchestration", &GenerateOrchestration, nb::arg("program"), nb::arg("func"),

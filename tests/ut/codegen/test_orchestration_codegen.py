@@ -380,9 +380,10 @@ class TestOrchestration:
             def orch_scalar(
                 self,
                 a: pl.Tensor[[16, 16], pl.FP32],
+                scalar: pl.Scalar[pl.FP32],
                 d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
             ) -> pl.Tensor[[16, 16], pl.FP32]:
-                d = self.kernel_add_scalar(a, 1.0, d)
+                d = self.kernel_add_scalar(a, scalar, d)
                 return d
 
         result = _generate_orch_result(ScalarKernelProgram)
@@ -392,6 +393,11 @@ class TestOrchestration:
         assert "SCALAR" not in signature
         assert len(signature) == 2
         assert all(d in {"IN", "OUT", "INOUT"} for d in signature)
+        # ChipCallable keeps orchestration tensor directions and scalar arity
+        # as separate ABI fields.  L1 launch validation consumes both, so keep
+        # the scalar count covered at the codegen boundary that produces it.
+        assert list(result.orchestration_signature) == ["IN", "OUT"]
+        assert result.orchestration_scalar_count == 1
 
     def test_independent_tasks(self):
         """Test codegen with independent tasks (no dependencies needed)."""

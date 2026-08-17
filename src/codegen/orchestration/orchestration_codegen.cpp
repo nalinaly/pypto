@@ -4292,8 +4292,12 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   oss << "}\n\n";
   oss << "}  // extern \"C\"\n";
 
-  return OrchestrationResult{oss.str(), std::move(func_name_to_id), std::move(func_name_to_core_type),
-                             std::move(func_name_to_signature), std::move(orchestration_signature)};
+  return OrchestrationResult{oss.str(),
+                             std::move(func_name_to_id),
+                             std::move(func_name_to_core_type),
+                             std::move(func_name_to_signature),
+                             std::move(orchestration_signature),
+                             static_cast<int32_t>(scalar_params.size())};
 }
 
 }  // namespace codegen

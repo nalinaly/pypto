@@ -75,6 +75,11 @@ class OrchestrationResult:
         """Orchestration entry per-tensor ArgDirection names (scalars excluded), in orch_args tensor order."""
         ...
 
+    @property
+    def orchestration_scalar_count(self) -> int:
+        """Number of scalar and communication-context orchestration parameters."""
+        ...
+
 class BuiltinNextLevelSpec:
     """Builtin chip-callable variant requested by distributed host codegen."""
 

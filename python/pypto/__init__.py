@@ -16,7 +16,7 @@ This package provides Python bindings for the PyPTO C++ library.
 from typing import cast
 
 # Import IR module (includes operations and core IR types)
-from . import compile_profiling, ir, language, runtime
+from . import compile_profiling, ir, l1, language, runtime
 from .pypto_core import (
     DataType,
     Error,
@@ -65,6 +65,7 @@ __all__ = [
     # Modules
     "codegen",
     "ir",
+    "l1",
     "language",
     "passes",
     "compile_profiling",
