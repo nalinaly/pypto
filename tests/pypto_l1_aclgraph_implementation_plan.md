@@ -2,7 +2,7 @@
 
 <!-- markdownlint-disable MD036 MD060 -->
 
-> 状态：TRB L1实现和无硬件回归已完成，已具备Phase-0 ST，但device 1 ACLGraph真实上板尚未通过；HBG第二阶段已经落下host-build/H2D边界、variable launch blob、CANN mutable HostArgs/placeholder host bridge、common per-replay restore核心、真实working arena的prepare-time分配/冻结，以及task级immutable `HbgGraphPlan`/fresh writable HostArgs快照的所有权基础；尚未生成并发布完整slot registration、注册HBG AICPU entry、接入device leader restore或开放高层L1 capability，仍保持unsupported。本文是指导性设计记录，完整上下文优先，不以篇幅压缩为目标。
+> 状态：TRB L1实现和无硬件回归已完成，已具备Phase-0 ST，但device 1 ACLGraph真实上板尚未通过；HBG第二阶段已经落下host-build/H2D边界、variable launch blob、CANN mutable HostArgs/placeholder host bridge、common per-replay restore核心、真实working arena的prepare-time分配/冻结、task级immutable `HbgGraphPlan`/fresh writable HostArgs快照，以及随pristine runtime arena恢复的callable-local函数地址表与host task数；尚未生成并发布完整slot registration、注册HBG AICPU entry、接入device leader restore或开放高层L1 capability，仍保持unsupported。本文是指导性设计记录，完整上下文优先，不以篇幅压缩为目标。
 >
 > 首期范围：onboard、`tensormap_and_ringbuffer`（TRB）、`@pl.program`、静态 shape、PyTorch 直接调用验证。
 >
@@ -2209,16 +2209,17 @@ v1 契约仍禁止并发 replay，但需观察两个图共享 context events时 
 | 区域 | 当前内容 | 第二阶段归类 |
 | --- | --- | --- |
 | GM SM | task descriptor、payload、slot state、completion flags、flow-control header | pristine source和mutable working copy都需覆盖 |
-| runtime arena | `PTO2Runtime`、orchestrator/scheduler objects、ready queues、mailbox、layout storage | pristine source和mutable working copy都需覆盖 |
+| runtime arena | `PTO2Runtime`、orchestrator/scheduler objects、ready queues、mailbox、layout storage，以及task-owned完整函数地址表与host task数 | pristine source和mutable working copy都需覆盖 |
 | GM heap | HBG intermediate/output/workspace地址和必要的host-built initializer目标 | v1 context-wide mutable slot；只将有语义的initializer spans放入restore manifest |
-| outer Runtime/KernelArgs/handshake | prebuilt arena base、GM base、function table、worker handshake、device KernelArgs | context-wide mutable/persistent execution state，需明确哪些每次restore，哪些prepare-time pin |
+| outer Runtime/KernelArgs/handshake | prebuilt arena base、GM base、worker handshake、device KernelArgs，以及仅供host build暂存的legacy function table | context-wide mutable/persistent execution state；scheduler不得把其中可被后续build覆盖的function table/task count当作invocation source |
 
 源码证据：
 
 - `runtime/src/a2a3/runtime/host_build_graph/host/runtime_maker.cpp` 的 `build_host_orchestration_image`：本地host SM、最终device base relocation和owning SM bytes；该函数在提交 `11b7a4b1` 后不再自行H2D；
 - 同文件 `bind_callable_to_runtime_impl`：GM heap/SM/runtime arena三个region、本地host arena，并在SM与arena两份host image完成后进入显式同步H2D区域；
 - `runtime/src/common/platform/onboard/host/device_runner_helpers.cpp:25-75`：outer `Runtime`和device `KernelArgs`分别分配/复制；
-- `runtime/src/a2a3/runtime/host_build_graph/runtime/shared/runtime.cpp:155-157`：HBG当前将整个outer `Runtime` 作为device image复制。
+- `runtime/src/a2a3/runtime/host_build_graph/runtime/shared/runtime.cpp`：HBG仍将整个outer `Runtime` 作为context/device control image复制；
+- runtime提交 `6228b481`：A2/A3与A5的pristine `PTO2Runtime`新增 `PTO2PrebuiltInvocationState`，host build把完整1024项函数地址表和实际host task数深拷贝进runtime-arena image；AICPU boot先校验该state，scheduler只绑定恢复后的表，不再读取outer `Runtime::func_id_to_addr_`和 `Runtime::host_total_tasks`作为调用语义。
 
 A5对应HBG文件当前与A2/A3同构；实现时不得只修一个arch而依赖复制粘贴假设。
 
@@ -2291,7 +2292,7 @@ CANN当前实现提供下列源码证据：
 
 #### N.4.2 已落地的host ABI和待接device bridge
 
-提交 `11b7a4b1` 已将host侧ABI具体化；提交 `2873feae` 为避免context-wide `Runtime::host_total_tasks`被后一次build覆盖，将实际scheduler task数纳入task-owned identity，并将ABI minor升级为1。当前固定大小为：`HbgExecutionBinding=64` bytes、`HbgInvocationIdentity=40` bytes、`HbgLaunchRegion=40` bytes、`HbgLaunchBlobHeader=160` bytes、`HbgRestoreCommit=64` bytes。在HBG capability开启前仍可按device probe结果做versioned演进，但任何变更必须同步magic/version、全部static assertions、plan hash和parser/restore测试：
+提交 `11b7a4b1` 已将host侧ABI具体化；提交 `2873feae` 为避免context-wide `Runtime::host_total_tasks`被后一次build覆盖，将实际scheduler task数纳入task-owned identity，并将ABI minor升级为1。提交 `6228b481` 又把device实际消费的1024项函数地址表与同一task数收进pristine runtime-arena的 `PTO2PrebuiltInvocationState`；identity/hash用于选择与验证，arena state提供scheduler真正要解引用的地址，二者不能互相替代。当前固定大小为：`HbgExecutionBinding=64` bytes、`HbgInvocationIdentity=40` bytes、`HbgLaunchRegion=40` bytes、`HbgLaunchBlobHeader=160` bytes、`HbgRestoreCommit=64` bytes、`PTO2PrebuiltInvocationState=8216` bytes（函数表offset 24）。在HBG capability开启前仍可按device probe结果做versioned演进，但任何变更必须同步magic/version、全部static assertions、plan hash和parser/restore测试：
 
 ```text
 HbgLaunchBlobHeader
@@ -2386,6 +2387,7 @@ AICPU launch node begins on caller stream
     byte-safe parse and validate header
     validate exact destination binding and capacities
     restore every manifest span into working SM/runtime arena/initializers
+    validate restored task-owned function-table metadata and require its host task数与header identity一致
     reset or reconstruct manifest-declared Runtime/KernelArgs/handshake/mailbox state
     perform required cache clean/invalidate
     publish restore success/failure with release semantics
@@ -2402,7 +2404,7 @@ AICPU launch node begins on caller stream
 
 每次replay都要经过这个完整restore gate。首次执行之前恢复过一次、第一次结果数值正确、或working allocation从未free，都不能代替第二次replay restore。
 
-restore manifest至少要覆盖pristine SM和runtime arena。GM heap不必默认全量copy，但host builder对GM heap产生的任何语义化初值都必须以initializer span明确列入manifest。outer Runtime、KernelArgs、handshake和mailbox中的per-execution字段必须通过字节恢复或确定re-init路径列入协议，不得依赖“上次deinit应该已清干净”。
+restore manifest至少要覆盖pristine SM和runtime arena。完整runtime arena现在已包含 `PTO2PrebuiltInvocationState`，即实际1024项callable-local函数地址表、非负host task数和magic/version/count/reserved校验头；因此每次restore自然同时恢复graph调度状态与函数分发语义。header中的 `function_binding_hash/host_total_tasks`仍须和恢复后的state交叉校验，不能因为两个值都来自host就跳过。GM heap不必默认全量copy，但host builder对GM heap产生的任何语义化初值都必须以initializer span明确列入manifest。outer Runtime、KernelArgs、handshake和mailbox中的per-execution字段必须通过字节恢复或确定re-init路径列入协议，不得依赖“上次deinit应该已清干净”。
 
 #### N.6.3 为什么首选AICPU leader restore
 
@@ -2445,7 +2447,7 @@ P0: WithHostArgs inline payload完整copy且随captured graph存活？
 
 ### N.9 第二阶段建议实施顺序
 
-> **2026-08-18实施快照：** runtime提交 `11b7a4b1` 完成第一笔不依赖device的H1/H2基础：A2/A3和A5拆开host orchestration SM image构建与同步H2D；common层新增destination-bound variable launch blob、deep-copy serializer和byte-safe validator。随后 `10e69df6` 增加mutable HostArgs + placeholder真实ACL API bridge，并在CANN调用前校验所有lossy carrier和pointer write。`de2aa0f9` 又将H4的正确性核心落为common层：每次从runtime-owned pristine source完整恢复working image，仅在全部region copy/cache-publish成功后提交新epoch，并用重复replay、A/B package交替和中途失败反例锁定语义。`f6ad61df` 再建立144-byte prepare-time slot registration trust root，freeze device、SM/arena/heap、outer Runtime、device KernelArgs、slot/binary generation、package capacity和serial-only契约，restore不再允许blob用自己的binding自证。`ee292037` 进一步让A2/A3和A5 HBG strong prepare真实计算并分配GM heap/SM/runtime arena，通过DeviceRunner按精确base/capacity冻结working arena，且冻结后拒绝任何增容、缩容或换址。`2873feae` 已把一次dynamic host build提升为真正owning、immutable的 `HbgGraphPlan`：A2/A3和A5 strong host-build hook针对冻结slot生成SM/runtime-arena pristine image，实际 `host_total_tasks`进入task identity，plan每次只导出fresh writable HostArgs scratch，placeholder不能污染canonical bytes。当前仍未形成完整slot registration生成/发布、独立HBG AICPU entry或leader/peer发布协议；因此working destination和host canonical source已有明确owner，但CANN runtime-owned device source与device replay闭环仍未完成，HBG L1 capability继续为unsupported。详细代码、测试和未完成边界见过程记录10.25～10.30。
+> **2026-08-18实施快照：** runtime提交 `11b7a4b1` 完成第一笔不依赖device的H1/H2基础：A2/A3和A5拆开host orchestration SM image构建与同步H2D；common层新增destination-bound variable launch blob、deep-copy serializer和byte-safe validator。随后 `10e69df6` 增加mutable HostArgs + placeholder真实ACL API bridge，并在CANN调用前校验所有lossy carrier和pointer write。`de2aa0f9` 又将H4的正确性核心落为common层：每次从runtime-owned pristine source完整恢复working image，仅在全部region copy/cache-publish成功后提交新epoch，并用重复replay、A/B package交替和中途失败反例锁定语义。`f6ad61df` 再建立144-byte prepare-time slot registration trust root，freeze device、SM/arena/heap、outer Runtime、device KernelArgs、slot/binary generation、package capacity和serial-only契约，restore不再允许blob用自己的binding自证。`ee292037` 进一步让A2/A3和A5 HBG strong prepare真实计算并分配GM heap/SM/runtime arena，通过DeviceRunner按精确base/capacity冻结working arena，且冻结后拒绝任何增容、缩容或换址。`2873feae` 已把一次dynamic host build提升为真正owning、immutable的 `HbgGraphPlan`：A2/A3和A5 strong host-build hook针对冻结slot生成SM/runtime-arena pristine image，实际 `host_total_tasks`进入task identity，plan每次只导出fresh writable HostArgs scratch，placeholder不能污染canonical bytes。`6228b481` 进一步让pristine runtime arena携带完整task-owned function table与实际task count；HBG scheduler从恢复后的arena绑定地址，不再从context-wide outer Runtime读取可被后续build覆盖的调用级语义。当前仍未形成完整slot registration生成/发布、独立HBG AICPU entry或leader/peer restore发布协议；因此working destination和host canonical source已有明确owner且graph image已自包含函数分发信息，但CANN runtime-owned device source与device replay闭环仍未完成，HBG L1 capability继续为unsupported。详细代码、测试和未完成边界见过程记录10.25～10.31。
 
 当前进度不能解释成跳过H0：host-only ABI和边界拆分可以先写、先做无硬件fail-closed测试；任何关于CANN snapshot时点、captured-node lifetime、large args、cache可见性和replay恢复正确性的产品结论，仍必须由空闲device 1上的H0/P0实证给出。
 
@@ -2466,7 +2468,7 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 - 保留L2/L3原有bind/copy路径，不迫使它们经过L1 variable blob；
 - 新增plan validation/hash/binding metadata UT。
 
-当前已完成：`build_host_orchestration_image`不再执行H2D，调用方只在SM与runtime-arena两份host image都完整后越过显式上传边界；A2/A3与A5保持同构，旧L2仍在同一bind调用中同步上传。runtime `2873feae` 进一步增加immutable owning `HbgGraphPlan`和A2/A3、A5 strong host-build hook：host `DeviceArena`与SM vector只作为本次build的临时source，成功返回前被deep-copy进私有canonical blob；失败不覆盖caller原有plan owner。当前plan已正式拥有完整SM与runtime-arena image，但GM heap中有语义的initializer spans尚未形成manifest/region，因而不能把“两个full image已有owner”扩张成“全部graph执行态都已可重复恢复”。captured-node lifetime还要由H2 runtime-owned device source和H0实证闭环。
+当前已完成：`build_host_orchestration_image`不再执行H2D，调用方只在SM与runtime-arena两份host image都完整后越过显式上传边界；A2/A3与A5保持同构，旧L2仍在同一bind调用中同步上传。runtime `2873feae` 进一步增加immutable owning `HbgGraphPlan`和A2/A3、A5 strong host-build hook：host `DeviceArena`与SM vector只作为本次build的临时source，成功返回前被deep-copy进私有canonical blob；失败不覆盖caller原有plan owner。runtime `6228b481` 又在构图结束、H2D或plan deep-build之前，把当前完整函数地址表和实际task数写入runtime arena中的versioned invocation state；所以plan拥有的arena不再只有scheduler结构，也拥有实际dispatch所需的callable-local地址。当前plan已正式拥有完整SM与runtime-arena image，但GM heap中有语义的initializer spans尚未形成manifest/region，因而不能把“两个full image已有owner”扩张成“全部graph执行态都已可重复恢复”。captured-node lifetime还要由H2 runtime-owned device source和H0实证闭环。
 
 #### N.9.3 HBG Phase H2：variable launch blob和placeholder bridge
 
@@ -2495,7 +2497,7 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 - 与现有common epilogue整合，保证restore失败时hidden AICore不留在register-window轮询；
 - 先用full-span correctness restore，再以profile数据决定是否拆分immutable/mutable物理layout。
 
-当前已完成的只是runtime `de2aa0f9` 中不依赖device的restore core：它逐span copy并调用cache-publish回调，所有span成功后才提交slot/plan generation。`f6ad61df` 已将它收紧为先验证prepare-time sealed `HbgExecutionSlotRegistration`和package capacity，再用其binding/identity校验runtime-patched blob，不再允许裸binding入参。16项blob/restore UT已覆盖同package重复恢复、A/B package交替、slot注册篡改以0-copy拒绝，以及copy/publish中途失败不发布ready。尚未完成：AICPU exactly-one leader、peer acquire/release verdict、A2/A3与A5 cache协议、failure common epilogue及device replay实证。这些未完成前不得把该common helper表述为H4 production完成。
+当前已完成的只是runtime `de2aa0f9` 中不依赖device的restore core：它逐span copy并调用cache-publish回调，所有span成功后才提交slot/plan generation。`f6ad61df` 已将它收紧为先验证prepare-time sealed `HbgExecutionSlotRegistration`和package capacity，再用其binding/identity校验runtime-patched blob，不再允许裸binding入参。16项blob/restore UT已覆盖同package重复恢复、A/B package交替、slot注册篡改以0-copy拒绝，以及copy/publish中途失败不发布ready。`6228b481` 又完成restore之后scheduler真正消费哪份调用语义的静态路径：AICPU boot在wire/classify前校验arena中的invocation magic/version/count/task数，scheduler bind指向arena内完整函数表，task数也从同一state读取；旧 `post_handshake_init`不再抓outer Runtime表。当前L2由同步H2D预填该state，未来L1由每次blob restore预填。尚未完成：把common restore接入AICPU exactly-one leader、header identity与restored state交叉校验、peer acquire/release verdict、A2/A3与A5 cache协议、failure common epilogue及device replay实证。这些未完成前不得把该common helper和消费路径表述为H4 production完成。
 
 #### N.9.6 HBG Phase H5：独立L1 registration/runtime路径
 
@@ -2504,7 +2506,7 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 - caller stream运行AICPU主task，hidden stream只运行AICore，与本计划已确定单op fork/join边界一致；
 - 不使用旧PyPTO的hidden AICPU stream、capture-aware early launch或model attach。
 
-当前 `ee292037` 已为A2/A3与A5 HBG提供strong `prepare_l1_runtime_impl`，建立并冻结三块working arena；`2873feae` 又为两架构提供同构的strong `build_l1_hbg_graph_plan_impl`，能以冻结binding和本次args为输入生成owning plan，TRB/common weak hook仍明确返回unsupported。但这些host hook尚未被DeviceRunner的公开L1 callable路径调用，common仍对host orchestration callable的 `host_dlopen_handle` 返回unsupported，HBG没有独立AICPU registration/run entry，也没有把slot registration发布到device，support query仍为false。strong prepare/build只是H1/H3/H5共享基础，不能单独解释为H5完成。
+当前 `ee292037` 已为A2/A3与A5 HBG提供strong `prepare_l1_runtime_impl`，建立并冻结三块working arena；`2873feae` 又为两架构提供同构的strong `build_l1_hbg_graph_plan_impl`，能以冻结binding和本次args为输入生成owning plan，TRB/common weak hook仍明确返回unsupported。`6228b481` 使该plan内的runtime-arena包含device实际需要的task-owned函数表与task数，并让现有HBG AICPU/scheduler消费该state；但strong hook当前只是从outer Runtime的完整表做snapshot。未来DeviceRunner接入L1时必须先清空host staging table、只重放当前callable的全部 `(func_id, addr)`，再对这份精确全表计算/核对 `function_binding_hash`后构图，不能把其他callable的残留entry带进identity。上述host hook尚未被DeviceRunner的公开L1 callable路径调用，common仍对host orchestration callable的 `host_dlopen_handle` 返回unsupported，HBG没有独立AICPU registration/run entry，也没有把slot registration发布到device，support query仍为false。strong prepare/build和task-owned state只是H1/H3/H4/H5共享基础，不能单独解释为H5完成。
 
 #### N.9.7 HBG Phase H6：direct external tensors与host-build数据契约
 
@@ -2554,6 +2556,8 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 #### N.10.4 per-replay restore正确性
 
 - [ ] 同一ACLGraph不重新host build，至少连续replay两次。
+- [ ] graph A/B的callable都从 `func_id=0` 编号但绑定不同binary，交替replay必须分别命中各自runtime-arena中的完整函数表；不得回读outer Runtime的最后一次绑定。
+- [ ] 篡改restored `PTO2PrebuiltInvocationState` 的magic/version/count/reserved/task数，leader必须在wire/classify/dispatch前fail-closed；header identity中的task数/hash与arena state不一致也必须拒绝。
 - [ ] 第一次执行后用test hook poison ready queue、wake list、completion flags、task state、runtime pointer、mailbox等known mutable spans。
 - [ ] 第二次replay必须从该node的immutable source恢复，不是依赖某些field碰巧未变。
 - [ ] 验证GM heap中所有有语义initializer span每次恢复，而不必要的workspace bytes不强制清零。
@@ -2611,7 +2615,7 @@ HBG L1 + ACLGraph只在同时满足下列条件后才可以宣布完成：
 2. canonical plan与writable serialized blob完全分离，placeholder原地patch不污染plan/cache；
 3. runtime-owned inline payload的大小、copy完整性、capture/replay/destroy lifetime有device 1证据，或者按N.8选用有完整lease的fallback；
 4. graph package按exact destination binding生成，capacity在capture后freeze，错误binding不发生部分写入；
-5. 每次eager/replay都restore SM/runtime arena及manifest中全部per-execution state，反复replay和poison test通过；
+5. 每次eager/replay都restore SM/runtime arena及manifest中全部per-execution state；restored arena携带的完整callable-local函数表/task数与header identity一致，反复replay、同func-id graph A/B和poison test通过；
 6. AICPU leader restore的A2/A3、A5 cache/order协议通过多cache-line可见性验证；
 7. caller/AICPU/hidden-AICore entry/exit仍是一个闭合单算子，无sync、capture query、model attach或private AICPU early launch；
 8. external tensor host-build data dependency已分类，不可capture的callable能在可控边界fail-closed；

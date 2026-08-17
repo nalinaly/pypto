@@ -1977,3 +1977,203 @@ runtime阶段提交：
 10. 只有上述device闭环和L2/L3回归通过后才把HBG L1 capability从false改为true。
 
 因此当前准确结论是：**HBG dynamic graph已经有task级host canonical owner和逐launch writable参数快照，但还没有runtime-owned captured-node source的板上证据，也没有device逐回放执行闭环。** 这比10.29前进了一层，但仍不能对外宣称HBG L1或HBG ACLGraph可用。
+
+### 10.31 HBG H2/H4前置收口：函数绑定与task数进入pristine runtime arena
+
+#### 10.31.1 继续审查10.30后发现的关键缺口
+
+10.30解决了host graph bytes由谁拥有，但继续沿device消费链检查时发现：当时的plan还不是一个真正可以独立执行的图计划。`HbgInvocationIdentity`虽然已有 `function_binding_hash`和 `host_total_tasks`，但hash只能说明“期望哪份绑定”，不能给scheduler提供实际要跳转的AICore函数地址。
+
+改造前，HBG实际执行仍有两条context-wide读取：
+
+1. `SchedulerContext::post_handshake_init(Runtime *runtime)`直接执行 `func_id_to_addr_ = runtime->func_id_to_addr_`；
+2. HBG AICPU boot把 `runtime->host_total_tasks`传给 `on_orchestration_done`。
+
+这里的 `Runtime`是outer Runtime。L2一次拥有型run中，host在同步H2D之后立即执行，后续build不会越过当前run，所以这个结构长期没有暴露问题；L1/ACLGraph却完全不同：
+
+```text
+build callable A
+  A.func_id=0 -> binary_A
+  A.host_total_tasks=37
+  enqueue/capture task A
+
+host returns before device consumes A
+
+build callable B
+  B.func_id=0 -> binary_B
+  B.host_total_tasks=52
+  overwrite context-wide outer Runtime
+
+device executes/replays A
+  if scheduler reads outer Runtime, it sees B's function/task semantics
+```
+
+PyPTO禁止同context合法并发，只能说明A与B不应该同时占用working slot；它不能把异步task参数的ownership降级成“host调用返回即可覆盖”。captured A甚至可以在B完成build很久以后才replay。因此函数地址表和task数都必须和A自己的pristine graph package一起生存，并在每次A replay时一起恢复。
+
+这也是用户提出的AscendC tiling类比在更深一层的具体结果：graph topology bytes、用于解释task中 `func_id` 的真实地址表、以及scheduler完成条件所需的task count，都是同一个task的tiling-like invocation package，不能拆一部分放task、一部分留在“current context”。
+
+#### 10.31.2 outer Runtime与inner PTO2Runtime重新划界
+
+本轮没有把整个outer Runtime再复制一份塞进graph package，而是把状态按语义分为：
+
+```text
+context-persistent outer Runtime
+  worker handshakes / core geometry
+  frozen GM SM / runtime arena / heap bases
+  prebuilt arena base + runtime offset
+  active platform execution control
+  host build阶段可暂存的function table（不是device invocation source）
+
+task-owned pristine PTO2Runtime inside runtime-arena image
+  orchestrator/scheduler state
+  ready queues / mailbox / arena layout
+  PTO2PrebuiltInvocationState
+    exact full func_id -> device address table
+    exact host_total_tasks
+    magic / ABI / count / reserved validation metadata
+```
+
+之所以选择inner `PTO2Runtime`，而不是给launch blob再增加一个第三份独立function-table region，有三个原因：
+
+1. 10.30的plan已经完整拥有runtime-arena image，表进入arena后自动参与canonical deep copy和未来full-span per-replay restore；
+2. scheduler本来就会在AICPU boot得到restored `PTO2Runtime *`，无需再保留一个外部source pointer或第二套lifetime；
+3. graph execution结束时 `runtime_destroy`会修改inner runtime的pointer/state，下一次replay恢复整份arena即可同时恢复scheduler state和函数分发语义，不会出现两种generation各自推进的问题。
+
+新增的内部ABI为：
+
+```text
+PTO2PrebuiltInvocationState  // 8216 bytes, align 8
+  magic = "HBGI"
+  abi_version = 1
+  func_id_count = 1024
+  host_total_tasks >= 0
+  reserved[2] == {0, 0}
+  func_id_to_addr[1024]      // offset 24
+```
+
+固定复制完整1024项而不是只序列化稀疏 `(id, addr)` 对，是有意的correctness选择：
+
+- 新generation会整体替换旧generation，未使用entry自然恢复为0，不会保留上一callable的尾部槽；
+- device不需要解析变长稀疏表或另外分配展开buffer；
+- `RUNTIME_MAX_FUNC_ID`和task-owned capacity有编译期 `static_assert`，两边不能静默漂移；
+- 约8 KiB开销会自动进入 `sizeof(PTO2Runtime)`、arena layout、capacity freeze和plan size，不依赖隐藏常量。
+
+这份state是HBG尚未公开的private ABI，A2/A3与A5必须成对重编，不能混用旧host image与新AICPU binary。本轮双架构文件保持逐行同构，并完成了两套产物的完整editable重编。
+
+#### 10.31.3 host build发布事务
+
+新增 `runtime_set_prebuilt_invocation_state`，其边界是：
+
+1. null runtime、null source、不是精确1024项或负task count时，在任何字段变化前拒绝；
+2. 成功输入先把magic清0，使正在构造的state不呈现valid；
+3. 深拷贝完整函数表，而不是保留outer Runtime pointer；
+4. 写task count、count、reserved和ABI；
+5. 最后写magic，发布完整candidate。
+
+当前没有并发reader进入host临时arena，所以这里不需要device atomic publication；“magic最后写”的目的主要是把构造顺序和未来device validator语义固定下来。真正的AICPU peer publication仍必须走后续H4 exactly-one leader + release/acquire gate。
+
+两条host路径都在graph完整构建之后、任何device upload或plan deep-build之前调用该helper：
+
+- 既有L2 HBG：host orchestration得到实际task数后，把当前outer Runtime函数表与task数写进host arena，随后SM与完整arena同步H2D；outer `host_total_tasks`暂时继续赋值以保持legacy host状态可观测，但device scheduler不再读它；
+- HBG L1 strong plan hook：同样在host orchestration成功后写inner state，再把SM与完整arena deep-build进immutable `HbgGraphPlan`，不触碰working device slot。
+
+要特别保留一个后续接入要求：strong hook目前只看到outer Runtime的完整staging table。公开HBG L1 DeviceRunner真正调用它之前，必须先清空该表，只重放当前callable全部 `(func_id, addr)`，并对同一份精确全表计算/核对 `function_binding_hash`。本轮没有为了抢跑而修改common L2/L3 binding语义，也不把“snapshot已经task-owned”误写成“identity与精确current-callable表已全部接通”。
+
+#### 10.31.4 device消费路径不再回读context-wide调用语义
+
+HBG AICPU boot现在按以下顺序工作：
+
+```text
+attach stable runtime arena base
+  -> locate restored PTO2Runtime
+  -> validate HBGI magic / ABI / exact count / nonnegative task count / reserved
+  -> validation failure: rt=null, run_rc=-1, no wire/classify/dispatch
+  -> validation success: wire arena pointers
+  -> attach populated SM
+  -> finalize device-only runtime fields
+  -> scheduler.bind_runtime(restored rt)
+       func_id_to_addr_ = rt->prebuilt_invocation.func_id_to_addr
+  -> on_orchestration_done(rt->prebuilt_invocation.host_total_tasks)
+  -> publish existing classify-ready barrier
+```
+
+原来 `post_handshake_init` 中从outer Runtime抓函数表的语句已经删除。函数表只在leader绑定restored runtime时确定；已有 `classify_ready_` / `runtime_init_ready_` release-acquire顺序使peer在dispatch前看到该绑定。后续peer仍会调用现有幂等 `bind_runtime(rt)`，写入的是同一个restored地址，不会重新回到outer Runtime。
+
+这个改动对L2的执行结果保持等价：L2 host H2D已经把snapshot放入arena，AICPU仍得到相同函数地址与task数，只是source从outer Runtime换成inner pristine image。它对未来L1的价值则是决定性的：当AICPU leader每次从runtime-owned HostArgs source恢复full runtime arena后，scheduler天然得到captured node自己的地址表；不需要PyPTO知道这是首次eager、capture执行还是第N次replay。
+
+当前AICPU只校验inner state自身，还没有拿独立HBG launch header中的 `function_binding_hash/host_total_tasks`做交叉核对，因为production HBG AICPU entry尚未接入。后续独立entry必须在restore success发布前同时满足：
+
+```text
+header.identity.host_total_tasks == restored_state.host_total_tasks
+header.identity.function_binding_hash == hash(restored exact full table)
+registration binary generation == header/plan expected generation
+```
+
+任一不一致都必须在wire/classify/dispatch前失败，不能把两个都来自host当作可跳过验证的理由。
+
+#### 10.31.5 测试先行与新增反例
+
+本轮先增加 `test_hbg_prebuilt_invocation.cpp`，并让同一source分别通过A2/A3和A5 HBG include/runtime配置编译。第一次构建按预期因缺少constant、state字段和helper而失败，证明测试不是在验证已有行为。
+
+实现后四组反例覆盖：
+
+1. null runtime、null function source、错误table count、负task count全部拒绝，且已有snapshot逐byte不变；
+2. 成功snapshot持有完整函数表和task数，调用方随后清零原source不会修改arena；
+3. 第二generation用新的 `func_id=0`地址整体替换第一generation，同时把旧generation独有的 `func_id=19`清0；
+4. magic/ABI/count/task metadata被破坏后validator拒绝。
+
+此外，既有HBG `run_stream_reuse`场景本来已有add/sub两个callable：两者都从 `func_id=0`编号，但0分别绑定ADD与SUB binary。旧用例只在A2/A3 onboard检查AICore instruction-cache/新stream问题；本轮增加独立的sim/onboard通用交替用例：
+
+```text
+register add callable  (func_id 0 -> ADD)
+register sub callable  (func_id 0 -> SUB)
+run add -> run sub -> run add -> run sub
+each result compared with its own golden
+```
+
+该scene test和结构性snapshot UT解决不同问题：scene test证明两个callable共享worker时不会把数值func ID当全局identity；UT证明host source变化和新generation替换不会修改旧task snapshot。真正的“两个captured graph异步交替replay”仍需device 1 HBG L1路径完成后验证，不能由同步L2 sim替代。
+
+#### 10.31.6 验证过程中的环境问题也保留记录
+
+本轮验证结果：
+
+- A2/A3与A5的新prebuilt invocation C++ target：**2/2 passed**；
+- runtime editable build通过，A2/A3与A5 onboard/sim HBG产物均完成重编；
+- no-hardware C++全量：**90/90 passed**，其中73项标记 `no_hardware`；
+- A2/A3 HBG sim定向：vector + prepared callable + native lifecycle，**8/8 passed**；
+- A5 HBG sim定向：vector + prepared callable，**7/7 passed**；
+- callable-local `func_id=0` add/sub交替专项：**1/1 passed**；
+- runtime完整pre-commit通过，包括headers、English-only、platform literal、clang-format、LLVM 18 clang-tidy、cpplint、ruff和pyright；
+- `git diff --check`通过。
+
+仿真第一次运行的8个用例全部在编译SimKernel之前失败，错误统一为 `g++-15 not found`。这不是代码回归：机器已有 `/mnt/workspace/inductor/toolchains/gcc15`与 `gcc15-shims/g++-15`，只是默认PATH未包含。仅为测试进程临时加入shim和对应lib目录后，上述A2/A3与A5结果全部通过；没有修改仓库或系统toolchain配置。
+
+pre-commit第一次也因默认 `/usr/local` LLVM 21缺少resource headers而在 `unistd.h/stddef.h`、`cstdint`处误报。改用此前已解包的LLVM 18及其库目录后，完整hook通过。这里保留失败原因，避免以后把“工具根目录未选中”误诊成HBG头文件破坏。
+
+本轮没有运行任何NPU task，没有使用device 0。device 1仍不满足空闲条件，因此没有新增WithHostArgs/ACLGraph板上证据。
+
+runtime阶段提交：
+
+```text
+6228b481 Add: 将HBG函数绑定收进任务级图镜像
+```
+
+#### 10.31.7 当前可以宣称与仍不可宣称的边界
+
+现在可以准确宣称：
+
+- HBG pristine runtime-arena image已经自包含scheduler实际要使用的完整function address table和host task count；
+- 现有L2 HBG AICPU/scheduler已经从该task-owned state消费，不再从outer Runtime读取这两项调用级语义；
+- 新graph generation能整体替换旧函数表，旧host source修改不影响已构建snapshot；
+- A2/A3与A5实现同构，并通过各自重编和无硬件/仿真回归。
+
+仍然不能宣称：
+
+- HBG L1已supported；support query仍为false；
+- CANN已经随eager task或captured node持有大尺寸inline graph source；
+- AICPU leader已经从WithHostArgs source执行per-replay restore；当前L2仍是host同步H2D预填arena；
+- header identity、sealed registration与restored function table已经完成三方交叉验证；
+- GM heap initializer manifest已经完整；
+- 同一ACLGraph连续replay或graph A/B交替replay已经在device 1通过。
+
+下一阶段仍按原顺序推进：生成/seal完整slot registration并发布给独立HBG AICPU entry；接入fresh mutable HostArgs scratch；leader以registration为trust root恢复SM/runtime arena并验证本轮task-owned invocation state；peer在统一verdict后才进入scheduler。完成这些代码也不等于可开放capability，最后仍需空闲device 1上的snapshot/lifetime/large-args/cache/order/replay矩阵。
