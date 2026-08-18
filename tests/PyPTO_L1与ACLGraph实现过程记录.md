@@ -6199,3 +6199,69 @@ HBG callable的独立task package与重复replay，以及HBG 16阶段故障后ca
 4. 临时L1 polling诊断改动已完全回滚，两个git仓都没有遗留源码差异；
 5. 因此当前没有发现由L1实现引入的A2/A3 L2/L3功能回归，但“L2全量绿色”仍有上述一个明确例外，
    不能在交付说明中省略；A5实机与A5 simulator不属于当前结论。
+
+### 10.61 只读对照Grok实现并补充跨方案回归矩阵
+
+#### 10.61.1 对照范围与隔离边界
+
+按用户要求，只读检查`/mnt/workspace/inductor/pto/pypto`及其`runtime`子仓，没有修改、checkout、
+clean或提交Grok工作树。检查时Grok顶层`main`相对`origin/main`有15个本地提交，另有其自身未跟踪的
+`build.pre-main-upgrade/`；runtime位于`l1-aclgraph`，从其阶段基线到HEAD有14个L1/HBG提交。
+这些状态全部保持原样。
+
+对照重点不是把两套实现机械合并，而是逐项核对Grok提交中出现的行为是否在GPT树缺失：
+
+| Grok侧做法或发现 | GPT侧结论 | 本轮处理 |
+| --- | --- | --- |
+| `ctx.prepare()`、`op.warmup()`、`prepared/warmed/closed` | GPT已有正式API，并区分“成功入队”与device完成 | 不重复移植 |
+| 所有`__call__`都禁止隐式prepare | 与既定“普通eager可自动prepare，ACLGraph用户必须显式prepare/warmup”契约冲突；GPT又禁止capture query，不能在内部猜capture状态 | 不采用；保留GPT契约 |
+| Python全局集合拒绝同device第二context | GPT在native按device持有唯一lease，覆盖Python/direct C ABI及初始化失败回滚，边界更完整 | 不采用Python影子owner |
+| close幂等且借用设备不reset | GPT已有retryable Closing状态、幂等close和no-reset fault matrix | 不重复移植 |
+| launch携带per-callable `func_id`表 | GPT的TRB invocation与HBG immutable package均已有callable-local函数表、hash、capacity/identity校验；双callable同从`func_id=0`起编号已上板 | 不替换更强实现 |
+| HBG graph作为WithHostArgs tiling blob，每次replay恢复 | GPT已有canonical plan、serialized scratch、runtime-owned snapshot、working slot和每代restore，且有large-args/双graph/no-reset证据 | 不退回单blob模型 |
+| `RunConfig.runtime`进入kernel config/JIT key | GPT已有规范runtime名称、artifact校验、目录owner和跨runtime防覆盖 | 不重复移植 |
+| Grok未接taskQueue adapter，直接读取current stream | GPT生产路径已使用`.stream(false)`的独立torch_npu adapter，并持有descriptor/tensor lease及`recordStream` | 保留GPT实现 |
+| 泛化ST覆盖同一callable双节点、不同capture stream、FP16及非均匀输入 | GPT原矩阵分别覆盖双callable、双graph、scalar/multi-output/workspace，但没有把这三个组合做成独立回归 | 借鉴并新增A2/A3 ST |
+
+因此本轮没有发现一项“Grok生产实现正确而GPT生产实现缺失”的功能性修复点；真正值得吸收的是测试场景，
+尤其是同一callable在一个graph里形成两个不同captured node时，每个node必须保有独立参数快照，不能因
+共享callable/working slot退化成最后一次调用。
+
+#### 10.61.2 新增跨方案回归
+
+新增`tests/st/runtime/l1/test_l1_cross_session_matrix.py`。它没有照抄Grok测试的teardown，而是继续执行
+GPT已经确定的严格所有权顺序：外部device quiescence，逆序`graph.reset()`，最后`context.close()`；
+所有graph-bound tensor也一直保活到reset之后。三个场景分别在TRB与HBG运行：
+
+1. **同一callable在同一ACLGraph连续调用两次。** 第一节点写intermediate，第二节点读取它并写最终
+   output；8轮replay使用`arange`、横向flip、逐轮bias等非均匀数据，验证两个captured node的tensor
+   地址/参数快照与caller/hidden-stream串行边界没有折叠；
+2. **FP16 tensor replay。** 使用test-local FP16乘法kernel，三轮正数、小数和负数输入，证明L1
+   descriptor、task package和replay路径不是只在FP32下碰巧成立；
+3. **两张graph使用两个不同capture stream。** graph A生成intermediate，外部等待后graph B消费它；
+   三轮严格顺序replay验证外部已证明quiescent时切换stream不会把旧graph tail错误导入新capture，且
+   不声称支持并发graph replay。
+
+静态门禁结果：
+
+```text
+ruff check: All checks passed
+ruff format --check: 1 file already formatted
+py_compile: passed
+pytest --collect-only --platform=a2a3: 6 selected, 6 deselected
+git diff --check: passed
+```
+
+确认`npu-smi`进程表为`No running processes found`后，在device0运行：
+
+```text
+pytest -q -s tests/st/runtime/l1/test_l1_cross_session_matrix.py \
+  --platform=a2a3 --device=0
+
+6 passed, 6 deselected, 1 warning in 31.23s
+```
+
+6个选中项即三个场景乘TRB/HBG；6个deselection均为A5平台参数，符合当前只管A2/A3的范围。该结果
+没有要求或调用device reset，也没有修改runtime生产代码。结论是：Grok的核心功能点在GPT中已有
+同等或更强闭环，本轮吸收的是能增加交叉实现置信度的设备反例，而不是降低GPT的taskQueue、lifetime、
+fail-closed或no-reset约束来追求表面代码一致。

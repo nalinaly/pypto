@@ -2182,6 +2182,7 @@ v1 契约仍禁止并发 replay，但需观察两个图共享 context events时 
 - [x] L2 one-shot/reuse定向回归在A2/A3 device0通过。
 - [ ] A2/A3 L2全量65节点按干净进程证据去重后为63 passed、1 skipped、1个可独立复现的paged-attention `s8192`遗留失败，不能写成全量绿色；其后`spmd_starvation`已在干净进程通过，证明原第二失败为runner污染级联。
 - [x] A2/A3 L3当前选择集7/7通过：6个device0节点，加1个显式`--device=0-1`的`TestL3Group`节点；A5不在当前范围。
+- [x] 对照Grok实现后新增跨方案矩阵：TRB/HBG均通过同一callable在一个graph内连续两节点的8轮非均匀replay、FP16 replay，以及两张graph在不同capture stream上的外部quiescent顺序replay；A2/A3 device0为6/6通过。
 - [x] poisoned/close/device ownership负面路径通过。
 
 ## 附录 M：最终交付物
