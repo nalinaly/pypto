@@ -2,7 +2,7 @@
 
 <!-- markdownlint-disable MD036 MD060 -->
 
-> 状态：TRB L1实现和无硬件回归已完成，已具备Phase-0 ST，但device 1 ACLGraph真实上板尚未通过。HBG第二阶段的源码链路已经接通到“每个task/captured node一份tiling-like graph package”：DeviceRunner按本次callable与参数构建immutable `HbgGraphPlan`，生成fresh writable HostArgs blob和placeholder，经独立HBG WithHostArgs run entry交给CANN；AICPU run entry取得prepare-time slot/callable trust roots，exactly-one leader在每次执行/replay前完整恢复共享working SM/runtime arena，peers只在统一restore verdict后进入classify/dispatch。函数地址表是callable-local快照，`callable_id`是context-global身份，两个program可以都从 `func_id=0` 开始。上述链路已通过A2/A3、A5全构建和无硬件反例，但CANN大HostArgs/placeholder的真实snapshot与graph lifetime、hidden-stream capture、跨cache可见性、HBG无reset错误收尾仍未在device 1证明；A2/A3与A5因此都有显式strong `l1_runtime_supported_impl() == 0`，Python仍拒绝HBG。本文是指导性设计记录，完整上下文优先，不以篇幅压缩为目标。
+> 状态：TRB L1实现和无硬件回归已完成，已具备Phase-0 ST，但device 1 ACLGraph真实上板尚未通过。HBG第二阶段的源码链路已经接通到“每个task/captured node一份tiling-like graph package”：DeviceRunner按本次callable与参数构建immutable `HbgGraphPlan`，生成fresh writable HostArgs blob和placeholder，经独立HBG WithHostArgs run entry交给CANN；AICPU run entry取得prepare-time slot/callable trust roots，exactly-one leader在每次执行/replay前完整恢复共享working SM/runtime arena，peers只在统一restore verdict后进入classify/dispatch。函数地址表是callable-local快照，`callable_id`是context-global身份，两个program可以都从 `func_id=0` 开始。runtime `8427ffd7`进一步完成HBG no-reset源码协议：generation内所有有效AICPU participant采用arrive/finalize/snapshot/depart两阶段完成门，generation前错误通过独立64-byte control line释放hidden AICore，已report但physical id/regs mapping无效的core走per-core CANCEL；prepare-time resident control地址覆盖slot registry不可用，Host直传的Runtime override避免AICPU/AICore因坏 `KernelArgs::runtime_args`读取不同control，affinity越界在进入barrier前失败。上述链路已通过A2/A3、A5全构建和无硬件反例，但CANN大HostArgs/placeholder的真实snapshot与graph lifetime、hidden-stream capture、跨cache可见性及错误路径的真实device行为仍未在device 1证明；A2/A3与A5因此都有显式strong `l1_runtime_supported_impl() == 0`，Python仍拒绝HBG。本文是指导性设计记录，完整上下文优先，不以篇幅压缩为目标。
 >
 > 首期范围：onboard、`tensormap_and_ringbuffer`（TRB）、`@pl.program`、静态 shape、PyTorch 直接调用验证。
 >
@@ -2449,7 +2449,7 @@ P0: WithHostArgs inline payload完整copy且随captured graph存活？
 
 ### N.9 第二阶段建议实施顺序
 
-> **2026-08-18实施快照：** runtime提交 `11b7a4b1`、`10e69df6`、`de2aa0f9`、`f6ad61df`、`ee292037`、`2873feae`、`6228b481`、`ade00349`、`6b356c35` 与 `4a8c3964` 依次完成host-build/H2D拆分、variable HostArgs/placeholder bridge、transactional restore core、frozen execution-slot registration、真实working arena、immutable `HbgGraphPlan`、task-owned完整函数表与task数、函数表hash互证、context generation和device-side slot registry。`18b1fde9` 又增加独立HBG callable registration及binary-lifetime immutable registry；`74d0ff65` 已把此前分离的部件接成完整但尚未开放的per-invocation路径：DeviceRunner构造callable-local 1024项函数表与非零argument snapshot identity，调用A2/A3或A5 strong host builder生成本次plan，再从canonical plan复制fresh writable blob与placeholder，通过 `aclrtLaunchKernelWithHostArgs` 的独立HBG run symbol入队；AICPU先acquire slot/callable两份trust root并byte-copy fixed header，exactly-one leader验证完整variable blob、恢复SM/runtime arena、发布cache与统一verdict，peer在成功后才classify/dispatch。每次eager execution和每次ACLGraph replay都必须重新restore，绝不把已被scheduler/runtime_destroy消费的working image当作可直接复用的graph executable。当前HBG runtime在A2/A3和A5均提供显式strong `l1_runtime_supported_impl() == 0`，Python也继续拒绝HBG，因为CANN runtime-owned source lifetime、大args、placeholder、hidden-stream capture/cache，以及无reset错误收尾仍缺device 1证据。详细过程见10.25～10.40；“源码路径已接通”不得改写成“HBG L1/ACLGraph已supported”。
+> **2026-08-18实施快照：** runtime提交 `11b7a4b1`、`10e69df6`、`de2aa0f9`、`f6ad61df`、`ee292037`、`2873feae`、`6228b481`、`ade00349`、`6b356c35` 与 `4a8c3964` 依次完成host-build/H2D拆分、variable HostArgs/placeholder bridge、transactional restore core、frozen execution-slot registration、真实working arena、immutable `HbgGraphPlan`、task-owned完整函数表与task数、函数表hash互证、context generation和device-side slot registry。`18b1fde9` 又增加独立HBG callable registration及binary-lifetime immutable registry；`74d0ff65` 已把此前分离的部件接成完整但尚未开放的per-invocation路径：DeviceRunner构造callable-local 1024项函数表与非零argument snapshot identity，调用A2/A3或A5 strong host builder生成本次plan，再从canonical plan复制fresh writable blob与placeholder，通过 `aclrtLaunchKernelWithHostArgs` 的独立HBG run symbol入队；AICPU先acquire slot/callable两份trust root并byte-copy fixed header，exactly-one leader验证完整variable blob、恢复SM/runtime arena、发布cache与统一verdict，peer在成功后才classify/dispatch。每次eager execution和每次ACLGraph replay都必须重新restore，绝不把已被scheduler/runtime_destroy消费的working image当作可直接复用的graph executable。`8427ffd7` 又把L2时代依赖reset的已知异常收尾改造成borrowed L1协议：独立prelaunch control、per-core pre-window CANCEL、两阶段completion gate、scheduler init最终裁决、prepare-time control fallback、affinity pre-barrier校验和AICore trusted Runtime override在A2/A3、A5同构实现。当前HBG runtime仍显式strong `l1_runtime_supported_impl() == 0`，Python也继续拒绝HBG，因为CANN runtime-owned source lifetime、大args、placeholder、hidden-stream capture/cache和上述错误路径的真实device行为仍缺device 1证据。详细过程见10.25～10.42；“源码路径已接通”不得改写成“HBG L1/ACLGraph已supported”。
 
 当前进度不能解释成跳过H0：host-only ABI和边界拆分可以先写、先做无硬件fail-closed测试；任何关于CANN snapshot时点、captured-node lifetime、large args、cache可见性和replay恢复正确性的产品结论，仍必须由空闲device 1上的H0/P0实证给出。
 
@@ -2495,6 +2495,8 @@ H0不接入高层API，不声称HBG L1 supported。任一硬门槛失败都回�
 
 `74d0ff65` 的独立HBG run entry现在会先acquire两份registry，再接受task blob中的identity；blob不能再用自己的binding/callable hash自证。host prepare顺序固定为static slot与KernelArgs准备完成、slot registration生成、callable registration生成、AICPU init enqueue、slot registration enqueue、callable registration enqueue。重复registration只有逐byte相同才幂等，冲突fail-closed。close时binary unload失败必须保留registry引用的所有device window与host owner供重试。H3的源码所有权链已经形成，但production完成仍受H0与H4/H7硬件验证约束；尤其registry不拥有任何per-task graph package，它只证明package允许恢复到哪一组persistent destination以及由哪个callable消费。
 
+`8427ffd7` 将registration原来的reserved字段versioned升级为outer Runtime内64-byte prelaunch control的offset，并把同一control地址随prepare-time `simpler_aicpu_init`另行驻留到AICPU SO。正常run仍以full registry为trust root；如果registry处于NotReady/Publishing/Corrupt或device校验失败，AICPU使用init-latched地址发布同值CANCEL，而不是从尚未校验的variable HostArgs里取device pointer。Host在caller stream上一次async memset连续清零control和active handshakes，且每次验证两段地址连续、容量不溢出。该fallback只解决“已经成功init的context后来无法acquire full registry”；若init task本身失败，则prepare必须失败并进入外部close/recovery，不能猜地址继续launch。
+
 #### N.9.5 HBG Phase H4：AICPU leader per-replay restore
 
 - 将restore放在当前classify-ready barrier之前，且exactly one leader执行；
@@ -2507,7 +2509,9 @@ runtime `de2aa0f9` 先提供不依赖device的transactional restore core：逐sp
 
 `74d0ff65` 已把这条restore core接进A2/A3与A5 HBG AICPU execution：run entry复制并校验fixed invocation view；唯一boot leader使用registry中的exact destination、package capacity、callable identity和function binding作为trust root，对Runtime-owned variable blob做full validation，完整恢复pristine SM与runtime arena并执行cache publish；restore success后再次比较header identity与restored `HbgPrebuiltInvocationState`；统一 `hbg_restore_error_` 以release/acquire发布，peer先invalidate working spans，只有错误为0才classify/dispatch。第一次执行结束后被scheduler和 `runtime_destroy`改写的queue、completion、pointer等状态，下一次execution/replay仍从同一task-owned pristine source完整恢复，不能依赖working slot残值。
 
-H4仍不能标记production完成，原因不是“leader尚未接入”，而是三类尚未验证/收口的边界：A2/A3与A5真实cache可见性和runtime args alignment/lifetime尚未上板；GM heap若将来出现有语义initializer span，必须进入manifest，不能把整块workspace盲目清零也不能漏恢复；HBG现有AICPU/AICore错误路径尚未完成与TRB同等级的no-reset、共同epilogue、失联core/CANCEL审计。任何restore/handshake失败都必须证明hidden AICore最终退出，不能靠L2时代的device reset兜底。
+`8427ffd7` 已完成当前能由源码协议与无硬件反例收口的no-reset路径：所有有效AICPU participant无论init/run共享错误均exactly-once进入arrive/finalize/snapshot/depart，last-depart才清代际状态；decoupled orchestrator必须在 `p_func` 前等待全部scheduler handshake/assign的最终裁决；已report core的physical id越界或register mapping为0时收到per-core CANCEL；slot/callable/blob/ABI/platform/affinity等generation前失败写独立prelaunch CANCEL；A5 PMU入口先保护physical-id索引。AICore launch又增加第二个Host直传Runtime pointer，HBG使用immutable slot registration中的outer Runtime，TRB/L2/L3传null继续旧路径，从而避免坏 `KernelArgs::runtime_args`让AICPU和AICore读取不同control。
+
+H4仍不能标记production完成，原因现在收敛为三类硬件/产品事实，而不是仍有已知源码早退洞：A2/A3与A5真实cache可见性、两指针AICore launch和runtime args lifetime尚未上板；GM heap若将来出现有语义initializer span，必须进入manifest，不能把整块workspace盲目清零也不能漏恢复；完全不进入/不report的硬件core不在算子内可恢复模型，需CANN op timeout、driver fault containment或外部context/device recovery。restore/handshake错误仍必须通过N.10的device fault matrix证明hidden AICore实际退出，源码闭环不能替代上板证据。
 
 #### N.9.6 HBG Phase H5：独立L1 registration/runtime路径
 
@@ -2520,7 +2524,7 @@ H4仍不能标记production完成，原因不是“leader尚未接入”，而�
 
 task入队仍复用同一单算子拓扑：caller stream完成handshake memset、start record和 `simpler_aicpu_l1_hbg_exec` WithHostArgs；hidden stream只wait start、launch已注册AICore handle并record done；caller再wait done并recordtail。没有private AICPU stream、capture query、model attach、`rtStreamAddToModel`、early launch、launch-time binary registration或内部sync。HBG path与TRB fixed invocation共享外层fork/join，但使用完全不同的AICPU symbol和variable package ABI。
 
-为防止“源码半接通就被误开放”，A2/A3与A5 HBG runtime maker当前都显式提供strong `l1_runtime_supported_impl() { return 0; }`；注释列出large variable HostArgs/placeholder、hidden-stream capture/replay、重复pristine restore、no-reset错误teardown以及Python高层支持等gate。Python `_RUNTIME_NAME`仍限定TRB并拒绝HBG。只有N.10硬件矩阵和HBG错误路径完成后，才能在单独提交中翻转capability与增加高层API。
+为防止“源码半接通就被误开放”，A2/A3与A5 HBG runtime maker当前都显式提供strong `l1_runtime_supported_impl() { return 0; }`；注释列出large variable HostArgs/placeholder、hidden-stream capture/replay、重复pristine restore、no-reset错误teardown的真实device证明以及Python高层支持等gate。Python `_RUNTIME_NAME`仍限定TRB并拒绝HBG。只有N.10硬件矩阵完成后，才能在单独提交中翻转capability与增加高层API；`8427ffd7`完成源码协议不等价于任何一项device checkbox已经通过。
 
 #### N.9.7 HBG Phase H6：direct external tensors与host-build数据契约
 
@@ -2600,6 +2604,17 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 - [ ] runtime-owned路径失败时，external-source fallback有独立lease和memory accounting，不默默复用单buffer。
 - [ ] 两个graph顺序replay通过；并发replay不在v1 supported matrix中，文档和test均不声称支持。
 
+#### N.10.8 no-reset故障注入与hidden AICore完成性
+
+- [ ] slot registry分别处于NotReady、Publishing、CorruptState和wrong-device时，init-latched control仍收到CANCEL，hidden AICore完成，下一次合法调用无需reset。
+- [ ] callable缺失、bad blob/header/identity/placeholder、platform bridge拒绝时，generation建立前CANCEL在A2/A3和A5都可见。
+- [ ] `allowed_count/launch_count`为0、负数、超过 `MAX_GATE_THREADS`或allowed多于launched时，在任何线程进入affinity barrier前失败；合法over-subscription的dropped thread仍保持正常语义。
+- [ ] 篡改device `KernelArgs::runtime_args`，AICPU向registered Runtime写CANCEL，AICore通过第二个trusted Runtime launch参数读取同一control并退出；验证AIC/AIV两种entry。
+- [ ] physical core id越界和范围内但register address为0时，AICPU只写对应per-core CANCEL，不访问未知SPR；A5 PMU入口不会先OOB。
+- [ ] restore、scheduler-init、assign、dispatch、shutdown和runtime-destroy各阶段注入错误，所有有效AICPU participant均完成arrive/finalize/snapshot/depart，只有last-depart清代际状态。
+- [ ] 每个故障case后caller-stream tail event可达、context不依赖device reset，随后同context合法eager/capture/replay能够成功。
+- [ ] 完全不进入或不report的硬件core按外部op-timeout/driver恢复边界记录，不伪装成PyPTO算子内可恢复case。
+
 ### N.11 独立硬阻塞：host orchestration的tensor-data依赖
 
 当前L2 HBG在 `runtime_maker.cpp:695-766` 为external tensor自行分配device storage、H2D staging并注册host view；`host_tensor_access.cpp:60-84` 让host orchestration通过host view读写device-addressed tensor。这与L1“直接借用PyTorch device tensor、PyPTO不分配/搬运external input/output”的前提不同；而common onboard注释也明确A5当前没有A2/A3同类host-map path。
@@ -2637,6 +2652,7 @@ HBG L1 + ACLGraph只在同时满足下列条件后才可以宣布完成：
 7. caller/AICPU/hidden-AICore entry/exit仍是一个闭合单算子，无sync、capture query、model attach或private AICPU early launch；
 8. external tensor host-build data dependency已分类，不可capture的callable能在可控边界fail-closed；
 9. v1无并发契约、graph destroyed + external quiescence + close顺序在上层文档和测试中一致；
-10. TRB L1、HBG/TRB L2和L3回归通过，当前已确定的API与所有权不被暗中改写。
+10. N.10.8中所有可注入no-reset错误都证明hidden AICore完成、caller tail可达且下一次合法调用无需reset；完全失联core的外部恢复边界有明确结果。
+11. TRB L1、HBG/TRB L2和L3回归通过，当前已确定的API与所有权不被暗中改写。
 
 本附录明确把WithHostArgs inline payload定义为**已经接通源码、仍需要device P0证明的首选路径**，而不是已经得到CANN产品行为保证的能力。它遵循AscendC tiling data的核心所有权形态：每个launch task/captured node带一份immutable inline参数快照；但HBG graph image会被执行消费，所以还必须由该task在每次execution/replay把pristine source恢复到context-owned mutable working slot。任何只保持一份device graph buffer、只在capture时H2D一次、不在每次replay恢复working state，或用临时host source和隐式sync规避lifetime问题的实现，均不满足第二阶段完成定义。

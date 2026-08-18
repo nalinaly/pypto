@@ -3297,3 +3297,357 @@ HBG L1 + ACLGraph: unsupported
 - 同一context并发graph replay得到支持。
 
 本阶段的正确定位是：**源码已经具备进入HBG device capability probe的结构，不再缺“task package如何传到device并在replay前restore”的主链；但产品capability必须保持关闭，直到device 1和错误路径证据完成。**
+
+### 10.41 HBG L1 no-reset收口：把“已经排队的hidden AICore”纳入每条失败路径
+
+#### 10.41.1 继续审查10.40后暴露出的真正问题
+
+10.40已经把HBG dynamic graph建模为task-local immutable package，也把每次执行前的restore接到AICPU run entry。但L1外层fork/join还有一个比graph package本身更基础的硬约束：Host一旦执行到operator launch，就会固定排入以下device工作：
+
+```text
+caller stream:
+  clear launch state
+  record Start
+  launch HBG AICPU task
+  wait AicoreDone
+
+hidden AICore stream:
+  wait Start
+  launch persistent AICore executor
+  record AicoreDone
+```
+
+因此AICPU在任何校验点返回错误，并不等于本算子已经安全失败。只要hidden AICore已经排队，它就必须能够退出并最终record `AicoreDone`；否则caller stream会永远等在fork/join尾部。L2时代可以在外层失败后reset device，但L1借用外部资源，明确不允许把reset或内部sync当作错误收尾。
+
+最终审查把早退分成两类：
+
+1. **已经进入scheduler generation之后的失败。** 这类失败可以依靠N-way completion gate、统一shutdown、最后参与者cleanup以及已经打开register window的EXIT/ACK协议收口。
+2. **scheduler generation建立之前的失败。** 例如slot/callable/blob/ABI/KernelArgs/platform bridge/affinity校验失败；这时没有generation owner，也可能没有任何per-core handshake owner，不能强行跳入后半段barrier。
+
+第二类正是本阶段新增独立prelaunch cancellation协议的原因。它不是“再加一个错误码”，而是确保任何已经排队的AICore kernel都有一个不依赖scheduler generation的退出通道。
+
+#### 10.41.2 为什么不能只复用每个core的Handshake
+
+每个AICore会先把physical core id、core type和 `aicore_done` 作为一整条cache line report出去，然后等待AICPU打开register window。若AICPU在AICore report之前就往同一条Handshake写CANCEL，稍后AICore的whole-cache-line `CACHELINE_OUT` 可能把这个早期CANCEL覆盖掉。
+
+所以当前协议保留两级取消面：
+
+- `Runtime::l1_launch_control`：独立64-byte cache line，处理generation建立前的整次invocation拒绝；
+- `Handshake::aicpu_ready = AICORE_PRE_WINDOW_CANCEL`：处理AICPU已经看到本core report，但physical id越界、对应register address为0等无法打开window的per-core拒绝。
+
+Host在caller stream上用一次async memset连续清零：
+
+```text
+[ HbgL1LaunchControl: 64 bytes ][ active Handshake array ]
+```
+
+这里要求control恰好位于active handshakes之前，Host在prepare时根据HBG Runtime的strong query取得offset，并在每次launch前重新校验两段地址连续、大小不溢出。它没有引入额外stream、event、sync或capture query；clear仍是本算子caller-stream序列的一部分。
+
+AICPU写整次invocation CANCEL时使用同值atomic store并对独立control cache line执行flush。多个AICPU线程同时发现同一错误时可以重复写同一个值，不需要选举一个可能根本进不了generation的leader。AICore在等待window的循环中低频invalidate该control line；只有错误路径命中CANCEL，正常路径仍以register window打开为唯一放行信号，避免恢复历史上被移除的AICPU→AICore正常路径round trip。
+
+#### 10.41.3 generation内部的exactly-once完成协议
+
+本阶段同时把A2/A3和A5 HBG `AicpuExecutor`的错误收尾改为同构的两阶段参与者协议：
+
+```text
+每个有效AICPU participant：
+  init / scheduler verdict
+  -> 无论共享run_error是否已经置位，都进入共同run epilogue
+  -> exactly once arrive
+  -> 唯一last-arriver执行runtime finalize并发布final verdict
+  -> 每个participant snapshot最终error/runtime status
+  -> exactly once depart
+  -> 唯一last-depart执行deinit/reset generation-local host state
+```
+
+之所以arrival之后还需要departure，是因为旧实现可能由某个线程先deinit并清 `run_error_` 或invalid runtime cache，另一个已经arrive但尚未读取最终状态的线程随后看到“成功”或访问已清理状态。现在所有participant先完成final snapshot，再允许last-depart清代际状态。
+
+decoupled模式也不再允许orchestrator在scheduler handshake最终裁决之前进入 `p_func`。所有scheduler完成handshake/assign后汇合，唯一leader发布 `init_done/init_failed`；orchestrator可以与前半段配置、arena和SM初始化重叠，但必须在bind和调用host-built graph入口之前等待最终裁决。这样某个scheduler晚到的handshake失败不会让orchestrator继续向无人消费的ring提交任务。
+
+这部分修复不改变正常graph task调度语义；它只把旧L2路径中隐含依赖device reset的异常清理，改成borrowed L1可以证明的generation-local收尾。
+
+#### 10.41.4 physical core报告异常的no-reset边界
+
+A2/A3与A5 scheduler现在把以下两种报告统一视为invalid mapping：
+
+- `physical_core_id >= register_address_count`；
+- id虽然在范围内，但Host按PG/topology构造的 `regs[physical_core_id] == 0`。
+
+对每个已经report的invalid core，AICPU先发布per-core pre-window CANCEL并flush，再汇总handshake失败；绝不调用 `platform_init_aicore_regs(0)`，也不对未知core猜测、mask或clamp物理id。AICore低频invalidate自己的Handshake，看到CANCEL后在访问任何SPR前直接退出。
+
+A5还补了更早的PMU入口保护：PMU enabled时，kernel entry在索引per-core register table之前先用Host实际分配的精确table长度检查 `get_physical_core_id()`；越界时发布0 PMU base，继续交给正常report→CANCEL协议裁决，避免在取消协议生效前已经OOB。
+
+这条闭环只覆盖“core已经进入kernel并完成report，但report的physical id不可用”。如果某个硬件core完全不进入、不report，AICPU没有安全证据判断哪个Handshake可以取消；在禁止内部reset/sync的L1算子协议内不能伪造恢复。这仍属于CANN op timeout、driver fault containment或外部context/device recovery边界，不能在文档中写成所有硬件失联都由PyPTO恢复。
+
+#### 10.41.5 最终审查发现的三个条件式P1
+
+独立control line与generation completion都实现后，最终逐路径审查仍发现三个“只有异常输入才触发，但一旦触发hidden AICore可能不退出”的P1：
+
+1. **execution-slot registry acquire失败。** HBG outer AICPU entry在 `NotReady/Publishing/CorruptState/device mismatch` 时还拿不到完整slot，原实现直接return，也没有可信control地址。
+2. **affinity正数但越界。** `allowed_count`或 `launch_count`大于固定 `MAX_GATE_THREADS` 时，公共gate返回false；平台wrapper把false当成普通dropped thread，可能所有线程都返回0且无人写CANCEL。
+3. **device KernelArgs中的 `runtime_args` 与registered outer Runtime失配。** AICPU能根据可信slot向正确Runtime写CANCEL，但hidden AICore原来仍从同一个错误KernelArgs读取另一个Runtime地址；两边会轮询不同control line，错误地址不可读时还可能先产生device fault。
+
+这三项不能靠“通常Host不会传错”忽略。C ABI、device memory corruption和故障注入都可以到达这些分支，而当前工作的目标正是让L1错误路径不借reset收尾。
+
+#### 10.41.6 registry失败时的prepare-time独立信任根
+
+不能在slot registry失败后回头信任本次variable HostArgs blob里的pointer。那正是尚未通过identity/ABI/slot校验的输入；拿其中地址做device write会把fail-closed校验变成任意地址写。
+
+当前做法是在 `simpler_aicpu_init` 的 `InitArgs` 末尾增加：
+
+```text
+hbg_l1_prelaunch_control_addr
+```
+
+Host在prepare期间已经完成outer Runtime/device KernelArgs分配并seal immutable execution-slot registration，此时从registration解析control device地址，随init task发布到resident AICPU SO的device-config全局。顺序是：
+
+```text
+prepare/freeze persistent windows
+  -> seal host registration
+  -> enqueue simpler_aicpu_init(control address)
+  -> enqueue full slot registration
+  -> enqueue callable registration
+  -> record PrepareTail
+  -> future invocation task
+```
+
+所有任务仍在用户caller stream上；没有内部sync。正常路径继续使用完整slot registration。只有full registry acquire本身失败时，HBG outer entry才读取prepare-time resident control地址并发布CANCEL。common resolver `hbg_l1_launch_control_or_fallback`明确表达优先级：valid registration优先，registration缺失或字段校验失败才使用init-latched fallback。
+
+TRB L1和L2/L3构造的 `InitArgs` 该字段保持0；它们不会解析或使用HBG fallback。因此这是同一内部InitArgs构建版本上的零值扩展，不会把HBG control语义注入旧执行模式。
+
+这里仍有一个不可伪装成可恢复的前提：如果连prepare-time init task都没有执行成功，则resident SO根本没有可靠信任根，caller stream本身也已处于初始化失败状态。PyPTO不会从后续坏task猜一个地址继续运行；init/prepare失败必须由外部同步观察并走context close/recovery。
+
+#### 10.41.7 affinity必须在进入barrier之前区分“invalid”和“dropped”
+
+公共平台层新增纯函数：
+
+```text
+platform_aicpu_affinity_config_valid(allowed_count, total_launched)
+```
+
+合法条件不是只有两者大于0，还包括：
+
+- `allowed_count <= MAX_GATE_THREADS`；
+- `total_launched <= MAX_GATE_THREADS`；
+- `allowed_count <= total_launched`，否则至少一个scheduler/orchestrator角色永远没有participant。
+
+A2/A3与A5 platform wrapper在任何线程进入filter gate barrier前执行同一校验。invalid config统一记录错误、发布HBG prelaunch CANCEL并返回失败；只有config合法后gate返回false，才解释为本线程被正常淘汰。公共gate内部也复用同一predicate，避免caller校验和数组/barrier实现漂移。
+
+这项区分很重要：`false`不是天然等于error。正常runtime可能有CANN over-subscription，部分线程确实应该drop；只有全局shape非法时才必须让本算子失败并释放hidden AICore。
+
+#### 10.41.8 AICore Runtime不能由正在被校验的KernelArgs决定
+
+第三个P1的本质是一个split-brain：
+
+```text
+AICPU trust root: slot.outer_runtime_base
+AICore old trust root: device KernelArgs.runtime_args
+```
+
+当两者失配时，即使AICPU正确写CANCEL，也无法证明AICore在读同一地址。把第二份pointer再塞回KernelArgs没有解决信任问题；它仍位于同一块被判定异常的device POD里。当前实现改为扩展generic AICore kernel launch ABI：
+
+```text
+arg0: KernelArgs *
+arg1: Runtime *trusted_l1_runtime_override
+```
+
+Host的 `launch_prepared_aicore_kernel`固定构造两个相邻pointer，并用static assert锁定size与offset。HBG L1从immutable host-side slot registration取得 `outer_runtime_base`，作为arg1直接交给CANN kernel launch；AICore entry在访问Runtime/Handshake/prelaunch control之前选择：
+
+```text
+runtime = trusted_l1_runtime_override != nullptr
+            ? trusted_l1_runtime_override
+            : k_args->runtime_args
+```
+
+所以HBG L1的AICPU与AICore都以同一host-sealed Runtime为根。若device KernelArgs里的 `runtime_args` 被修改，AICPU校验失败并向可信Runtime写CANCEL，AICore也在该可信Runtime上读到CANCEL后退出。
+
+TRB L1和所有L2/L3 launch传 `nullptr` override，继续走历史 `KernelArgs::runtime_args`。AICore binary仍由PyPTO context在prepare/legacy init中注册并与Host实现成套构建；没有引入外部public ABI或graph可见参数。
+
+本轮不仅依赖“编译通过”。A2/A3和A5、HBG与TRB四份onboard AICore产物的ELF `__CCE_KernelArgSize` section都检查为：
+
+```text
+0x10, 0x10
+```
+
+分别对应AIC/AIV entry的16-byte参数区，与Host的两个64-bit pointer完全一致。真实CANN launch/capture是否同样消费第二个pointer仍必须在device 1验证，但源码产物和Host blob已不存在8-byte/16-byte静态失配。
+
+#### 10.41.9 为什么没有选择timeout、reset或HostArgs pointer
+
+本阶段明确没有采用以下看似简单的方案：
+
+- **固定spin timeout后AICore自行退出。** 这会把合法但启动较慢的AICPU误判为失败，且阈值跨A2/A3、A5和系统负载不稳定。
+- **失败后Host reset device。** L1不掌控device资源，reset越过单算子边界并破坏同device上的其他工作。
+- **AICPU内部stream sync确认谁没启动。** 违反L1禁止内部sync，也无法在capture中安全使用。
+- **从未校验HostArgs blob取control pointer。** 失败路径会产生不受信任的device write target。
+- **把per-core CANCEL提前写进Handshake。** 可能被稍后的AICore whole-line report覆盖。
+- **恢复旧PyPTO private AICPU stream或model attach。** 这会重新跨越单算子边界；性能应由未来显式HBG operator抽象获得。
+
+当前协议选择的是prepare-time信任根、caller-stream clear、AICPU cache publish、AICore低频cache acquire与完整fork/join完成证明。它更啰嗦，但每一步都能落在L1允许的资源边界内。
+
+#### 10.41.10 本轮验证结果与没有算作通过的测试
+
+当前代码完成后执行并通过：
+
+- runtime editable全量构建；
+- A2/A3、A5 × onboard/sim × HBG/TRB相关目标重新编译和链接；
+- no-hardware CTest：**97/97 passed**，其中**80**项标记 `no_hardware`；
+- PyPTO L1 + simpler ChipWorker Python回归：**51/51 passed**；
+- 新增 `test_platform_aicpu_affinity_config`，覆盖0、负数、超 `MAX_GATE_THREADS`、allowed多于launched和合法边界；
+- 新增 `test_aicpu_device_config`，覆盖HBG control地址在resident invocation之间保持；
+- `test_hbg_execution_slot`新增valid registration优先、坏registration回退、无registration回退和zero fallback反例；
+- completion gate、HBG slot/blob/registry、AICore handshake等定向测试继续通过；
+- `clang-format --dry-run --Werror`与 `git diff --check`通过；
+- 四份onboard AICore产物的kernel arg size均静态核对为16 bytes。
+
+本轮尝试重跑A2/A3与A5 HBG validation simulator时，过程里出现两类环境/调用问题，不能写成产品测试失败，也不能写成通过：
+
+1. 第一次从top repo目录启动，resource child的pytest root落在top repo，没有加载runtime自己的 `conftest.py`，child因此不认识 `--runtime/--device/--platform`；修正为从runtime目录启动。
+2. 修正root后，当前机器PATH没有 `g++-15`，四个case在编译sim incore kernel前即报 `g++-15 not found`。确认是工具链缺失后主动终止剩余重复case。
+
+所以本轮的准确记录是：此前阶段曾完成A2/A3与A5 HBG simulator的exact-error定向回归；当前最终diff完成后，sim目标在editable build中编译通过，但完整scene执行没有因缺 `g++-15`重跑成功。它不能替代device 1，也不会被计入上面的97/97或51/51。
+
+本轮仍没有向任何NPU提交task，device 0没有被使用；命令中的 `--device 0` 只属于CPU simulator的逻辑slot，不是NPU device 0。
+
+最终收口前又只读查询了一次真实device 1（card 7 / chip 1 / physical id 15）：HBM usage仍为4%，AICore 100%，AIVector 90%。它继续不满足仓库“HBM为0才视为空闲”的上板条件，所以没有抢占、没有把device 0当fallback，也没有启动TRB或HBG ACLGraph ST。
+
+#### 10.41.11 本节更新10.40中的哪些结论
+
+10.40.4记录的是当时尚未完成的审查清单。到本节为止，可以把以下源码级问题更新为已闭环：
+
+- HBG有效AICPU participant的exactly-once arrive/finalize/snapshot/depart；
+- scheduler最终init verdict对orchestrator `p_func` 的硬门槛；
+- 已report core的physical id越界或register mapping为0时的pre-window CANCEL；
+- A5 PMU在handshake前按physical id索引的OOB保护；
+- generation建立前slot/callable/blob/ABI/KernelArgs/platform/affinity失败对hidden AICore的独立CANCEL；
+- registry acquire失败的prepare-timecontrol fallback；
+- affinity全员silent-drop与角色数不足；
+- `KernelArgs::runtime_args`失配导致AICPU/AICore control地址分叉。
+
+仍然不能把HBG capability翻为true，原因没有变化：
+
+- large variable `aclrtLaunchKernelWithHostArgs`与placeholder的真实runtime-owned lifetime未上板；
+- hidden-stream event-only ACLGraph capture/replay未上板；
+- repeated pristine restore和cache可见性未上板；
+- graph多次replay期间task package owner未上板；
+- 完全不report的硬件core不在算子内可恢复模型；
+- HBG Python公开路径仍然关闭；
+- GM heap是否存在需显式initializer region的program类别还需审计与poison test。
+
+所以当前新的准确表述是：**HBG L1 no-reset错误路径的已知源码协议缺口已经收口，但HBG L1/ACLGraph仍是capability=false；硬件与CANN所有权事实没有因为源码审查完成而被假定成立。**
+
+### 10.42 第二阶段HBG graph内存继续按tiling-like task参数建模
+
+#### 10.42.1 用户补充原则的正式落点
+
+用户明确指出：第二阶段每次dynamic build得到的graph，在H2D到device时，本质上就是本次task的AscendC tiling-like输入。AscendC tiling data由CANN runtime随launch task管理；HBG graph内存也应尽量获得同等级的task/captured-node lifetime，而不是让PyPTO维护一个无法知道何时安全复用的device task buffer池。
+
+当前设计继续接受这个原则，并把它拆成四个不可混淆的owner：
+
+| 对象 | owner/lifetime | 是否会被执行修改 | 是否允许多个captured node共享 |
+|---|---|---:|---:|
+| canonical `HbgGraphPlan` | 本次Host build到launch enqueue | 否 | 否；每次build独立 |
+| writable serialized HostArgs scratch | 仅到CANN成功snapshot本次launch参数 | CANN可能原地patch placeholder | 否 |
+| runtime-owned immutable graph package | eager task或ACLGraph captured node | 否，只作为pristine source | 否；每个node必须拥有自己的bytes |
+| context-owned mutable execution slot | PyPTO context到外部quiescence、graph销毁、close成功 | 是 | v1只允许串行共享 |
+
+这里最关键的不是“H2D一份graph”这一动作，而是**source与working state分离**。当前HBG graph image包含scheduler queue、task state、completion flag、mailbox、runtime pointer等执行中原地变化的字段；它不像普通只读tiling bytes那样可以直接反复执行。正确序列必须是：
+
+```text
+captured-node-owned immutable package
+  -> 每次eager execution / 每次graph replay
+  -> restore pristine SM + runtime arena（未来可能还有显式GM initializer region）
+  -> attach/wire mutable working slot
+  -> scheduler execution mutates only working slot
+```
+
+因此“让CANN拥有task参数”和“PyPTO每次restore working state”不是替代关系，而是两条正交要求：前者解决immutable source活多久，后者解决同一node第二次replay为什么不会读到第一次执行后的残留状态。
+
+#### 10.42.2 `aclrtLaunchKernelWithHostArgs`当前承担的角色
+
+当前首选路径把variable-length HBG header、region descriptors、pristine SM和pristine runtime-arena bytes序列化到一份fresh writable HostArgs scratch。placeholder把blob里的source pointer patch到CANN runtime-owned device args blob内部的inline payload；AICPU收到的pointer因此应指向本次task自己的snapshot，而不是PyPTO共享device buffer。
+
+这个方案与AscendC tiling data最接近，但仍必须通过device事实验证：
+
+- API是否对实际HBG大小完整deep-copy，而不是只复制fixed header；
+- placeholder是否在A2/A3和A5均按期望patch；
+- API返回后立即poison/free/reuseHost scratch，device仍读到原始package；
+- capture/instantiate后多次replay，captured node仍持有package；
+- 两个不同node的A/B package不会落到同一CANN args pool slot后互相覆盖；
+- internal args size上限、对齐和capture行为不能从源码常量推断，必须用真实大小probe。
+
+canonical plan本身不能直接交给可写C API。即使当前placeholder实现只应修改scratch，接口签名和Runtime内部实现都允许原地patch；所以必须保持：
+
+```text
+const canonical plan
+  -> fresh writable serialized scratch
+  -> CANN snapshot / placeholder patch
+  -> runtime-owned task package
+```
+
+Host canonical、一次性scratch和device task owner三层不能折叠成一层。
+
+#### 10.42.3 workspace继续内部管理并不与task package冲突
+
+当前PyPTO仍内部申请workspace、outer Runtime、KernelArgs、working SM、runtime arena和GM heap。用户已经明确本阶段不要求workspace外传；同时PyPTO占满全部AICore，v1禁止并发执行，所以单context只有一个mutable working slot不会产生合法并发踩踏。
+
+但“workspace可以共享”不能外推成“graph package也可以共享”：
+
+- workspace/working slot只在执行期间被当前串行task修改；
+- graph package属于未来仍可能replay的captured node；
+- PyPTO不感知graph何时销毁，不能在launch返回、event query成功或某次replay结束后回收另一个node仍可能引用的source；
+- graph replay可能绕过Python和PyPTO Host入口，Host mutex看不到它。
+
+因此v1可以继续共享一份context working slot，但每个captured node必须有独立immutable package owner。若未来开放并发graph replay，共享working slot本身也必须升级为per-node/per-flight execution slot或device-side串行gate；仅靠“PyPTO占满AICore”并不能自动防止两个graph从不同外部stream并发replay。
+
+#### 10.42.4 如果runtime-owned inline package上板失败
+
+fallback优先级仍保持保守：
+
+1. 先确认是否有CANN正式的task/graph retain-release或等价tiling owner接口；若有，PyPTO只保存opaque lease，不猜completion。
+2. 若只能传external device source，则每个captured node需要独立immutable allocation，并由graph lifetime lease持有。
+3. 若当前wrapper/runtime没有graph销毁回调，唯一正确的临时fallback是append-only pin到context close，同时提供明确memory accounting、limit和OOM错误。
+4. 在任何fallback中，binary仍可按context lifetime append-only持有；本阶段不做incore binary device内存复用。
+5. 无论source owner为何，每次execution/replay的restore都不能删除。
+
+明确禁止以下回收依据：
+
+- 固定约2048次kernel launch；
+- CANN args pool观察到的slot数量；
+- Host调用已经返回；
+- AICPU task已经enqueue；
+- 某次event query显示完成；
+- 当前没有Python引用某个input tensor。
+
+这些事实都不能证明ACLGraph未来不会再replay该node。只有CANN task/graph owner或显式外部lease release能成为回收边界。
+
+#### 10.42.5 HBG capability probe必须同时验证lifetime与no-reset
+
+未来device 1的HBG probe不能只验一个数值结果。至少要形成以下矩阵：
+
+1. eager单次：真实大小package、placeholder、restore、数值正确；
+2. eager连续A/B/A：不同package交替恢复同一working slot；
+3. 单graph连续replay至少两次：第二次不读取第一次的mutable残留；
+4. 同graph多个不同HBG node：各node保持自己的package，不退化为最后一次build；
+5. Host scratch在launch API返回后立即poison/free/reuse；
+6. capture完成后销毁Host canonical/scratch，保留graph/context owner仍可replay；
+7. 坏blob、缺callable、registry不可用、非法affinity、Runtime pointer失配、zero register mapping分别失败；
+8. 每个失败后hidden AICore完成、caller tail可达，下一次合法调用无需reset；
+9. graph teardown严格外部quiescence、graph reset/destroy、context close；
+10. 全过程不出现PyPTO内部stream/device sync、reset、capture query或model attach。
+
+只有lifetime和no-reset两组同时成立，HBG graph package才真正具备“像AscendC tiling参数一样随task进入ACLGraph”的语义。单纯证明H2D成功、AICPU能读到一次bytes，远远不够。
+
+#### 10.42.6 当前阶段的最终状态
+
+截至本节：
+
+- graph package已经按task-local immutable tiling-like输入建模；
+- working state与source严格分离，每次execution/replay都要求restore；
+- known pre-generation与generation-internal no-reset源码路径已经收口；
+- HBG AICPU/AICore对Runtime cancellation root不再split-brain；
+- workspace继续由PyPTO context内部持有，符合当前决策；
+- TRB L1、L2/L3不采用HBG task package或control fallback语义；
+- HBG capability仍显式false，Python仍fail-closed；
+- device 1 ACLGraph、CANN args owner和真实cache/order证据仍未取得。
+
+这意味着第二阶段的架构方向已经清楚：**graph package跟task/captured node走，mutable execution state跟context slot走，二者由每次replay restore连接；任何性能优化都必须留在显式HBG operator边界内，不能重新引入旧PyPTO那种提前启动并跨越单算子边界的hidden行为。**
