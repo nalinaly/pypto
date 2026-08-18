@@ -8,6 +8,8 @@
 >
 > 首轮device 1验证已经证明：同一Host进程先执行TRB后，第一个HBG context的eager、独立stream capture和连续replay可以通过；它同时暴露并修复了两个不能从Host UT推断的真实问题。第一，TRB/HBG AICPU inner SO曾在CANN全局ELF namespace中暴露225个重名C++符号，HBG现以version script只导出5个CANN entry。第二，CANN在ACL binary unload后仍可能保留HBG inner DSO及static registry；当前工作树以context generation在新context的有序init task中reset execution-slot与callable registry，同generation配置re-latch保持幂等。generation在支持范围内只严格保证同一Host进程的顺序context唯一；`CLOCK_MONOTONIC`对跨Host进程顺序复用只是best-effort降重，不是跨进程lease或正式支持面。最新C++无硬件回归为98/98，runtime Python UT串行为1103 passed、8 skipped，顶层compile/JIT/L1相关集合为420 passed，A2/A3与A5的TRB/HBG host、AICPU、AICore共12套onboard产物均构建通过。最后的“同一进程顺序创建第二个HBG context”和双HBG callable capture/replay仍须在device 1恢复可验证状态后复验；完成前不能把HBG第二阶段写成最终上板闭环。本文是指导性设计记录，完整上下文优先，不以篇幅压缩为目标。
 >
+> 后续完成度审计又把可直接上板的矩阵扩展到runtime scalar与tensor地址异步快照、多输出、多child与内部workspace、两个HBG graph交替replay，以及两个不同HBG context顺序eager/capture/replay。A2/A3、A5在TRB/HBG组合下的lowering和PTOAS完整Host codegen均通过，但这些新增case尚未在device 1执行；large HostArgs边界、runtime args allocator压力、cache多线可见性、memory accounting和N.10.8故障注入仍必须使用专用probe，不能由普通数值ST替代。
+>
 > 首期范围：onboard、`tensormap_and_ringbuffer`（TRB）、`@pl.program`、静态 shape、PyTorch 直接调用验证。
 >
 > 本文中的接口名是实现建议；编码时可以做小幅命名调整，但不得改变本文确定的所有权、生命周期和流语义。

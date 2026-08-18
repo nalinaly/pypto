@@ -4568,3 +4568,77 @@ device 0/physical 14仍为AICore 100%、HBM 3246 MiB，device 1/physical 15仍�
 AICore 100%、HBM 2874 MiB，process table仍为空。该证据只能排除`npu-smi`可见的
 活跃Host进程，不能证明device已经quiescent；因此没有在此状态下执行第二个HBG
 context、双callable ACLGraph replay或任何reset。
+
+### 10.46 完成度审计后的扩展上板矩阵
+
+#### 10.46.1 为什么已有两个ST仍不足以宣称完成
+
+按设计文档第13、15节、附录I和N.10逐项反查当前测试后，原有
+`test_l1_aclgraph.py`只能直接证明以下事实：单个add callable的eager/warmup、
+PyTorch pre-op -> L1 -> post-op顺序、固定地址三次replay，以及一个graph内两个
+HBG callable的package/函数表隔离。它没有形成同等级device证据的项目包括：
+
+- runtime scalar与tensor地址在多次Host异步调用中的独立snapshot；
+- 多output方向、同一program内多个child kernel和`pl.create_tensor`内部workspace；
+- 两个独立captured graph长期同时存活时的地址/scalar package隔离；
+- graph reset/close后，在同一Host进程中创建第二个不同HBG context并重新使用
+  `callable_id=0`/`func_id=0`；
+- N.10中的large HostArgs、allocator环绕、cache多线、memory accounting和no-reset
+  fault injection。
+
+因此本轮没有把“Host UT很多”换算成“上板矩阵已完成”，而是新增独立文件
+`tests/st/runtime/l1/test_l1_extended_matrix.py`，把无需production test hook的四组
+场景先变成可直接执行的正式ST；剩余专用probe继续显式保留。
+
+#### 10.46.2 新增四组正式ST
+
+1. `test_l1_async_tensor_and_scalar_snapshots_do_not_alias`同时参数化TRB/HBG。先完成
+   prepare/warmup，再连续enqueue四组不同input/output地址和FP32 scalar，中间不做
+   任何同步；所有临时queue-call/HostArgs容器离开作用域后才统一device synchronize并
+   逐项验值。这对应ST-E-006/ST-E-007，不通过保留Python list假装参数仍存活。
+2. `test_l1_multi_output_multi_child_workspace_aclgraph`在同一个context注册两个program：
+   第一个child同时写sum/diff两个output，第二个program由两个`@pl.jit.incore` child和
+   一块`pl.create_tensor` intermediate组成。graph捕获两个连续L1 node，多次replay后
+   验证`(lhs + rhs + lhs - rhs) * 2 == 4 * lhs`。它覆盖ST-E-003/004/005与
+   ST-G-005/006/007，并同时验证多output返回值仍是调用方原tensor身份。
+3. `test_hbg_two_graphs_retain_distinct_addresses_and_scalars`让graph A/B同时存活，使用
+   同一callable但不同input/output地址和scalar，按A/B/A/B交替replay。该case直接针对
+   “所有captured node退化为最后一份Host graph blob”的错误实现，对应N.10.3和
+   N.10.4中可由普通数值ST覆盖的部分。
+4. `test_hbg_sequential_context_generation_resets_resident_registries`在一个pytest进程内
+   先用scalar callable创建、warmup、capture/replay、reset并close第一context，再用
+   不同multi-child callable创建第二context并完成同一流程。两份program在各自context
+   都从callable/func id 0开始，专门复现10.45首次上板发现的resident registry冲突。
+
+所有test的finally路径都保持统一顺序：调用方device synchronize，逆序reset所有graph，
+最后`context.close()`；graph-bound tensor局部变量在该顺序完成前始终保持强引用。
+
+#### 10.46.3 Host侧验证结果
+
+新增文件没有在当前残留device状态下执行测试体，只完成以下无NPU验证：
+
+- GPT editable `_task_interface`最初仍带`80615b1e` build stamp，Python按设计主动拒绝
+  与`f8b9056a`源码混用；仅在`gpt_pypto/runtime/.venv`内以并发2重新editable build后，
+  extension的`__build_commit__`精确为`f8b9056ae769...`；
+- isolated Ruff lint与format均通过，文件379行，`git diff --check`通过；
+- `--collect-only --platform=a2a3 --device=1`与A5对应命令各选择6项、deselect 6项，
+  两平台合计形成12个待上板case；collect只导入模块，没有创建NPU tensor或context；
+- A2/A3与A5分别在独立Host进程lower三个program：scalar和multi-output均得到
+  orchestration + 1个child，multi-child得到orchestration + 2个child；两平台全部通过；
+- 显式使用仓库PTOAS后，A2/A3与A5各自对TRB/HBG编译scalar、multi-output、
+  multi-child，共12份完整Host artifact全部成功。每份都生成`kernel_config.py`并写入
+  请求的runtime；orchestration均导出`pypto_orchestration_requirements_v1`，
+  multi-child artifact同时含`_child_add`与`_child_scale`两份内核产物。
+
+这组证据证明新增矩阵已经通过Parser、passes、双架构codegen、PTOAS和runtime manifest
+边界，但不证明任何CANN launch/capture/replay行为。最后一次检查device 1仍为AICore
+100%、HBM 2874 MiB，`npu-smi` process table与device fd扫描均为空；本轮没有执行
+ACL/NPU task或reset。
+
+#### 10.46.4 仍不能被普通数值ST替代的门槛
+
+扩展矩阵完成后，第二阶段仍至少需要独立证明：64 KiB到真实最大image的HostArgs完整
+copy与失败边界、capture后args allocator压力/环绕、placeholder实际device地址、canonical
+plan不被原地patch、restore首中尾cache-line可见性、graph destroy前后memory accounting，
+以及N.10.8列出的slot/callable/blob/affinity/KernelArgs/physical-core/scheduler阶段故障注入。
+这些case需要runtime测试入口、trace或fault hook；不能因为普通eager/replay数值正确就勾选。
