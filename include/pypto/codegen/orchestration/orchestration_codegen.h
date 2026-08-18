@@ -48,6 +48,10 @@ struct OrchestrationResult {
   /// Number of scalar/CommCtx parameters in the orchestration entry. Kept
   /// separate because ChipCallable.signature_ is tensor-only.
   int32_t orchestration_scalar_count{0};
+  /// Version-1 host-build requirements exported by the generated
+  /// ``pypto_orchestration_requirements_v1`` symbol. Bit 0 means the host
+  /// orchestration reads tensor contents; bit 1 means it writes them.
+  uint64_t orchestration_requirements_v1{0};
 };
 
 /**

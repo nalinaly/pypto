@@ -65,7 +65,9 @@ void BindCodegen(nb::module_& m) {
               "Orchestration entry per-tensor ArgDirection name list (scalars excluded), in "
               "orch_args tensor order; sets the ChipCallable signature")
       .def_ro("orchestration_scalar_count", &OrchestrationResult::orchestration_scalar_count,
-              "Number of scalar/CommCtx orchestration parameters");
+              "Number of scalar/CommCtx orchestration parameters")
+      .def_ro("orchestration_requirements_v1", &OrchestrationResult::orchestration_requirements_v1,
+              "Host-build requirements exported by pypto_orchestration_requirements_v1");
 
   // Free functions for orchestration codegen (backend-agnostic)
   codegen_module.def("generate_orchestration", &GenerateOrchestration, nb::arg("program"), nb::arg("func"),

@@ -88,6 +88,10 @@ def test_predicate_emits_set_predicate_block():
     assert ".set_predicate(" in code, code
     # Exactly one predicated task (the expert), not the gate.
     assert code.count("set_predicate(") == 1, code
+    # The predicate read is encoded for the device scheduler; host graph build
+    # does not call get_tensor_data and must remain HBG-L1-safe.
+    assert "return UINT64_C(0);" in code
+    assert "get_tensor_data" not in code
 
 
 def test_no_predicate_emits_no_set_predicate():

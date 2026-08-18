@@ -81,6 +81,11 @@ class TestOrchestration:
             }
 
             __attribute__((visibility("default")))
+            uint64_t pypto_orchestration_requirements_v1(void) {
+                return UINT64_C(0);
+            }
+
+            __attribute__((visibility("default")))
             void aicpu_orchestration_entry(const L2TaskArgs& orch_args) {
                 // External tensors
                 const Tensor& ext_a = orch_args.tensor(0).ref();
@@ -339,6 +344,8 @@ class TestOrchestration:
 
         assert "kernel_add" in result.func_name_to_id
         assert "kernel_add" in result.func_name_to_core_type
+        assert result.orchestration_requirements_v1 == 0
+        assert "return UINT64_C(0);" in result.code
 
         # The kernel's ArgDirection signature is exported so kernel_config.py can
         # build a non-empty CoreCallable signature (issue #1458 — required for
@@ -533,6 +540,11 @@ class TestOrchestration:
                 return PTO2OrchestrationConfig{
                     .expected_arg_count = 3,
                 };
+            }
+
+            __attribute__((visibility("default")))
+            uint64_t pypto_orchestration_requirements_v1(void) {
+                return UINT64_C(0);
             }
 
             __attribute__((visibility("default")))
@@ -1571,6 +1583,11 @@ class TestOrchestration:
                 return PTO2OrchestrationConfig{
                     .expected_arg_count = 7,
                 };
+            }
+
+            __attribute__((visibility("default")))
+            uint64_t pypto_orchestration_requirements_v1(void) {
+                return UINT64_C(0);
             }
 
             __attribute__((visibility("default")))

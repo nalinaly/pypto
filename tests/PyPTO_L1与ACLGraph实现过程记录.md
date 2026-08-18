@@ -4097,3 +4097,150 @@ runtime/.venv/bin/python -m pytest -q \
 - NPU硬件没有进程级命名空间隔离。GPT命令只传`--device=1`，不使用device 0；运行前仍需检查设备占用。一次复核中`npu-smi`没有列出host进程，`fuser /dev/davinci15`也为空，但两颗device仍显示AICore 100%和残留HBM；这只能表明存在设备侧残留状态，不能归因于Grok正在使用NPU。
 
 因此“代码、Python包、native产物、build cache”已经物理隔离；“device 0/device 1”是明确的session约定和运行前门禁，而不是硬件级namespace。
+
+#### 10.43.17 隔离门禁的实际触发与当前状态
+
+在runtime继续提交到`80615b1e`后，再次使用GPT专属环境导入时，源码/native哈希门禁按预期拒绝了旧产物：
+
+```text
+_task_interface was built from 3631ea0d0a39,
+but this source tree is at 80615b1ef126
+```
+
+这次失败不是导入了Grok的SO，而是GPT自己的`_task_interface`落后于GPT runtime源码。该门禁的价值正是防止Python以一个版本的struct布局驱动另一个版本的native扩展，避免把ABI错配误判为L1运行时故障。
+
+随后只在GPT虚拟环境中，使用独立构建目录重建runtime editable产物：
+
+```bash
+cd /mnt/workspace/inductor/pto/gpt_pypto/runtime
+PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 \
+PYTHONPATH=/mnt/workspace/inductor/pto/gpt_pypto/python:\
+/mnt/workspace/inductor/pto/gpt_pypto/runtime/python:\
+/mnt/workspace/inductor/pto/gpt_pypto/runtime \
+.venv/bin/python -m pip install --no-build-isolation \
+  --config-settings=build-dir=build/editable-gpt-runtime-80615b1e -e .
+```
+
+重建后逐项核对的实际加载路径为：
+
+```text
+pypto:          /mnt/workspace/inductor/pto/gpt_pypto/python/pypto/__init__.py
+simpler:        /mnt/workspace/inductor/pto/gpt_pypto/runtime/python/simpler/__init__.py
+pypto_core:     /mnt/workspace/inductor/pto/gpt_pypto/runtime/.venv/.../pypto_core...so
+_task_interface:/mnt/workspace/inductor/pto/gpt_pypto/runtime/.venv/.../_task_interface...so
+runtime source/native hash guard: PASS
+```
+
+四者都在`gpt_pypto`树下，没有任何一项位于Grok的`/mnt/workspace/inductor/pto/pypto`。用户级editable仍指向Grok，但`PYTHONNOUSERSITE=1`使它对GPT命令不可见；该用户级文件不作任何修改。
+
+### 10.44 HBG orchestration requirements生产/消费闭环
+
+#### 10.44.1 为什么这不是一个可选的优化项
+
+HBG L1的Host graph build与历史HBG L2有一个关键差别：L2拥有tensor staging、D2H/H2D以及整次run的同步边界，而L1借用的是caller传入的device tensor，prepare/capture launch均不允许为了Host读取tensor内容而做stream/device synchronize或隐式D2H。因此，HBG L1在调用Host orchestration生成graph image之前，必须能证明该orchestration只使用shape/stride/dtype、scalar、callable identity和可静态获取的元数据，不会解引用外部tensor数据。
+
+在本节修复前，runtime已经有fail-closed validator，但PyPTO codegen没有任何producer导出它所要求的符号。这意味着并非“某些有Host tensor read的程序被拒绝”，而是所有现有PyPTO生成的HBG orchestration SO都会因`MetadataUnavailable`被拒绝。在开启HBG capability之前，producer/consumer必须一起完成，不能以“runtime已经fail-closed”替代端到端协议。
+
+#### 10.44.2 元数据的判定点必须是真正的Host数据访问生成点
+
+version 1定义两个bit：
+
+- bit 0：Host orchestration读取tensor contents；
+- bit 1：Host orchestration写入tensor contents。
+
+不能简单遍历IR中所有`tensor.read`文本就置bit 0。`Submit`的predicate也会以tensor element为条件，但这类read会被`EmitPredicateHint`编码成device scheduler使用的predicate metadata，Host graph build并不调用`get_tensor_data`。如果在过早的IR visitor中置位，会错误禁用本来是HBG的重要使用场景。
+
+本次因此把置位放在`OrchestrationStmtCodegen::GenerateTensorOpCode`的真正发射点：
+
+- 只有正常`tensor.read`即将生成`get_tensor_data<T>`时置read bit；
+- 只有正常`tensor.write`即将生成`set_tensor_data<T>`时置write bit；
+- predicate hint不经过这一发射路径，因此requirements保持为0。
+
+`OrchestrationResult` 同时增加`orchestration_requirements_v1`字段，并经nanobind暴露给Python。这一字段用于单元测试和诊断；runtime不信任Python侧另行传入的一份flag，它信任的是最终被编译进orchestration SO的versioned符号。
+
+#### 10.44.3 SO ABI与L2兼容性
+
+新codegen在每个orchestration source中生成：
+
+```cpp
+__attribute__((visibility("default")))
+uint64_t pypto_orchestration_requirements_v1(void) {
+    return UINT64_C(flags);
+}
+```
+
+采用独立符号，而不是修改既有`PTO2OrchestrationConfig`返回struct，目的是避免破坏现有orchestration SO ABI。runtime A2/A3与A5的HBG loader在`dlopen`时用`dlsym`可选解析该符号：
+
+- 历史SO没有该符号时，仍可正常注册并走L2；
+- 只有`build_l1_hbg_graph_plan_impl`会强制调用validator；
+- metadata缺失、未知future bit、read bit、write bit全部fail-closed；
+- 当前只有明确存在且flags为0的version 1 metadata允许HBG L1继续构图。
+
+这个设计保持了L2历史产物的可加载性，同时不把“缺少证据”当成HBG L1安全。runtime消费侧已形成独立提交：
+
+```text
+80615b1e Add: 建立HBG L1 orchestration需求元数据门禁
+```
+
+#### 10.44.4 当前验证证据
+
+runtime validator反例覆盖了metadata缺失、空位图、单独read、单独write、read+write和未知高位bit。使用当前runtime HEAD执行：
+
+```bash
+ctest --test-dir runtime/tests/ut/cpp/build \
+  --output-on-failure -R '^test_orchestration_requirements$'
+```
+
+结果：
+
+```text
+1/1 Test #20: test_orchestration_requirements ... Passed
+100% tests passed, 0 tests failed out of 1
+```
+
+PyPTO producer侧使用GPT隔离环境执行三个codegen文件：
+
+```bash
+PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 \
+PYTHONPATH=/mnt/workspace/inductor/pto/gpt_pypto/python:\
+/mnt/workspace/inductor/pto/gpt_pypto/runtime/python:\
+/mnt/workspace/inductor/pto/gpt_pypto/runtime \
+runtime/.venv/bin/python -m pytest -q \
+  tests/ut/codegen/test_orchestration_codegen.py \
+  tests/ut/codegen/test_orchestration_tensor_rw.py \
+  tests/ut/codegen/test_predicate_codegen.py
+```
+
+结果：
+
+```text
+79 passed, 10 warnings in 40.86s
+```
+
+关键断言包括：
+
+- 无Host tensor access的基本orchestration为0；
+- 普通tensor read为1；
+- 同时read/write为3；
+- predicate tensor read为0，且生成源码中没有`get_tensor_data`。
+
+为避免只验证C++源码字符串，又通过`pl.parse_program(string)`构造无Host tensor access的program，用`KernelCompiler(platform="a2a3").compile_orchestration("host_build_graph", ...)`真实生成Host HBG SO，再查动态符号表。结果为：
+
+```text
+0000000000003f10 T pypto_orchestration_requirements_v1
+requirements_value=0
+```
+
+这证明符号具有default visibility，位于最终SO的dynamic symbol table，runtime `dlsym`能够消费，而不是只存在于中间源码。首次尝试直接在stdin中使用`@pl.program`时，DSL因`inspect`无法回取stdin class源码而拒绝；改用正式支持的`pl.parse_program(string)`后完成真实链接验证。
+
+#### 10.44.5 完成这一节后仍不能宣称的事情
+
+requirements门禁只解决“Host graph build是否会解引用借用tensor数据”。它不能证明以下device语义：
+
+- `aclrtLaunchKernelWithHostArgs`对大型可变HostArgs blob和placeholder的snapshot/patch在ACLGraph capture与多次replay中符合预期；
+- 每个captured node持有自己的immutable graph package，不会被后续Host launch覆盖；
+- 每次replay在AICore/AICPU放行前完整恢复working shared-memory image与runtime arena；
+- restore的cache visibility、completion/control reset和错误路径在真实device上能无reset收口；
+- graph/context/package的销毁顺序满足“外部quiescence后才释放”。
+
+因此当前HBG的`l1_runtime_supported_impl()`仍必须保持0，Python也必须继续拒绝HBG L1。下一步将以这些未证明项为门禁，逐项审计已有`HbgGraphPlan`/launch blob/execution slot/restore链，然后才在device 1上开启能力并执行eager与ACLGraph replay验收。

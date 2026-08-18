@@ -110,6 +110,8 @@ CoreType InferFunctionCoreType(const FunctionPtr& func) {
 namespace {
 
 constexpr const char* kDualAivDispatchAttr = "dual_aiv_dispatch";
+constexpr uint64_t kRequirementTensorDataRead = UINT64_C(1) << 0;
+constexpr uint64_t kRequirementTensorDataWrite = UINT64_C(1) << 1;
 
 const char* ParamDirectionToRuntimeName(ParamDirection dir) {
   switch (dir) {
@@ -166,6 +168,15 @@ std::string GenerateConfigFunction(int expected_arg_count) {
   oss << "    return PTO2OrchestrationConfig{\n";
   oss << "        .expected_arg_count = " << expected_arg_count << ",\n";
   oss << "    };\n";
+  oss << "}\n\n";
+  return oss.str();
+}
+
+std::string GenerateRequirementsFunction(uint64_t requirements) {
+  std::ostringstream oss;
+  oss << "__attribute__((visibility(\"default\")))\n";
+  oss << "uint64_t pypto_orchestration_requirements_v1(void) {\n";
+  oss << "    return UINT64_C(" << requirements << ");\n";
   oss << "}\n\n";
   return oss.str();
 }
@@ -277,6 +288,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
   void SetEffectiveUses(std::unordered_set<const Var*> uses) { effective_uses_ = std::move(uses); }
   [[nodiscard]] bool NeedsVectorInclude() const { return needs_vector_include_; }
+  [[nodiscard]] uint64_t OrchestrationRequirementsV1() const { return orchestration_requirements_v1_; }
 
   void PrepareCrossScopeTaskIdHoists(const StmtPtr& body) {
     struct ScopeInfo {
@@ -1980,6 +1992,16 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
   void GenerateTensorOpCode(const CallPtr& call, const std::string& result_var, const VarPtr& assign_var) {
     const std::string& op_name = call->op_->name_;
+
+    // Record only tensor-content accesses that are actually emitted as host
+    // get_tensor_data/set_tensor_data calls. A tensor.read nested in a Submit
+    // predicate is consumed by EmitPredicateHint as device-side scheduler
+    // metadata and never reaches this function, so it remains HBG-L1-safe.
+    if (IsOp(call, "tensor.read")) {
+      orchestration_requirements_v1_ |= kRequirementTensorDataRead;
+    } else if (IsOp(call, "tensor.write")) {
+      orchestration_requirements_v1_ |= kRequirementTensorDataWrite;
+    }
 
     auto& registry = OrchestrationOpRegistry::GetInstance();
     auto codegen_func = registry.Get(op_name);
@@ -4030,6 +4052,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::unordered_map<const Var*, ArrayCarryEntry> array_carry_vars_;
   std::unordered_map<const Var*, DynamicTaskIdCollection> dynamic_task_id_collections_;
   bool needs_vector_include_ = false;
+  uint64_t orchestration_requirements_v1_ = 0;
   /// Names of mutable Tensor values declared in each generated C++ block.
   /// Tuple-output alias emission must avoid redeclaring names already declared
   /// in the same block, but must not treat outer-block declarations as aliases:
@@ -4205,6 +4228,9 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
 
   oss << GenerateConfigFunction(expected_arg_count);
 
+  const uint64_t orchestration_requirements_v1 = stmt_codegen.OrchestrationRequirementsV1();
+  oss << GenerateRequirementsFunction(orchestration_requirements_v1);
+
   oss << "__attribute__((visibility(\"default\")))\n";
   oss << "void aicpu_orchestration_entry(const L2TaskArgs& orch_args) {\n";
 
@@ -4297,7 +4323,8 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
                              std::move(func_name_to_core_type),
                              std::move(func_name_to_signature),
                              std::move(orchestration_signature),
-                             static_cast<int32_t>(scalar_params.size())};
+                             static_cast<int32_t>(scalar_params.size()),
+                             orchestration_requirements_v1};
 }
 
 }  // namespace codegen

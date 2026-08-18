@@ -38,9 +38,13 @@ class TestTensorReadWriteOffsetCodegen:
                 val: pl.Scalar[pl.FP32] = pl.tensor.read(t, [3])  # noqa: F841
                 return t
 
-        code = _generate_orch_code(Prog)
+        result = _generate_orch_result(Prog)
+        code = result.code
         assert "uint32_t indices_val[1] = {3};" in code
         assert "float val = get_tensor_data<float>(ext_t, 1, indices_val);" in code
+        assert result.orchestration_requirements_v1 == 1
+        assert "uint64_t pypto_orchestration_requirements_v1(void)" in code
+        assert "return UINT64_C(1);" in code
         assert "data_as<void>" not in code
         assert "buffer.addr" not in code
 
@@ -56,7 +60,8 @@ class TestTensorReadWriteOffsetCodegen:
                 val: pl.Scalar[pl.FP32] = pl.tensor.read(t, [1, 3])  # noqa: F841
                 return t
 
-        code = _generate_orch_code(Prog)
+        result = _generate_orch_result(Prog)
+        code = result.code
         # Multi-dim indices are passed as a uint32_t[N] array — the runtime
         # computes the flat offset itself, so no `1 * 8 + 3` arithmetic appears.
         assert "uint32_t indices_val[2] = {1, 3};" in code
@@ -120,13 +125,16 @@ class TestTensorReadWriteOffsetCodegen:
                 pl.tensor.write(t, [1, 3], val)
                 return t
 
-        code = _generate_orch_code(Prog)
+        result = _generate_orch_result(Prog)
+        code = result.code
         # Read uses get_tensor_data<T>; write goes through the symmetric
         # set_tensor_data<T> API so the runtime owns access validation and any
         # producer/consumer synchronization.
         assert "float val = get_tensor_data<float>(ext_t, 2, indices_val);" in code
         assert "uint32_t indices_t[2] = {1, 3};" in code
         assert "set_tensor_data<float>(ext_t, 2, indices_t, val);" in code
+        assert result.orchestration_requirements_v1 == 3
+        assert "return UINT64_C(3);" in code
         # Old raw-store form must not return.
         assert "data_as<void>" not in code
         assert "buffer.addr" not in code
