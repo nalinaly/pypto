@@ -30,6 +30,7 @@ _FAULT_STAGES = (
     "before_dispatch",
     "shutdown",
     "runtime_destroy",
+    "scheduler_init",
 )
 
 

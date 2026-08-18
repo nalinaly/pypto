@@ -2582,10 +2582,13 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 > 校验blob后才通过已有release/acquire屏障发布统一stage，避免resident全局状态和多AICPU
 > 线程分叉。A2/A3 device0已经连续执行`restore_copy`、`restore_publish`、
 > `after_scheduler_init`、`before_classify`、`before_dispatch`、`shutdown`、
-> `runtime_destroy`七个受控中止点；每次外部device synchronize均返回，pre-dispatch output
+> `runtime_destroy`七个受控中止点；runtime `50c3badd`进一步增加`scheduler_init`，在真实
+> `post_handshake_init()`成功、AICore window已分配后让`init_rc`失败，并修正该分支原先未逐线程
+> `shutdown()`便进入completion gate的缺口。A2/A3 device0现已连续执行上述八个中止点；每次
+> 外部device synchronize均返回，pre-dispatch output
 > 保持sentinel，随后同一context的正常generation恢复完整working slot并验数，最后同一context
 > 又完成ACLGraph capture和两次replay。该ST没有调用device reset。它直接闭合restore失败和
-> 这七个stage的tail/reuse证据，但不替代slot/callable/affinity/KernelArgs/physical-core、
+> 这八个stage的tail/reuse证据，但不替代slot/callable/affinity/KernelArgs/physical-core、
 > assign内部或真实scheduler-dispatch内部故障，因此N.10.8对应的大集合checkbox仍按边界保留。
 >
 > **2026-08-18 device0兼容性回归证据：** 在同一GPT隔离工作树和native build上，
@@ -2650,10 +2653,11 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 
 #### N.10.8 no-reset故障注入与hidden AICore完成性
 
-- [x] task-local hook在A2/A3 device0覆盖restore copy/publish、scheduler init完成后、classify前、
-  dispatch前、shutdown后和runtime destroy后七个stage；受控错误只有在内部实际命中且共享
+- [x] task-local hook在A2/A3 device0覆盖restore copy/publish、真实scheduler init失败、
+  scheduler init完成后、classify前、dispatch前、shutdown后和runtime destroy后八个stage；
+  受控错误只有在内部实际命中且共享
   error等于该stage专属值时才转成测试成功，不吞掉自然错误。
-- [x] 上述七个case逐一证明caller tail可达、无dispatch阶段output保持sentinel、下一次同context
+- [x] 上述八个case逐一证明caller tail可达、无dispatch阶段output保持sentinel、下一次同context
   合法eager恢复并验数；全部case后同一context继续完成ACLGraph capture与两次replay，全程无reset。
 
 - [ ] slot registry分别处于NotReady、Publishing、CorruptState和wrong-device时，init-latched control仍收到CANCEL，hidden AICore完成，下一次合法调用无需reset。
@@ -2661,7 +2665,7 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 - [ ] `allowed_count/launch_count`为0、负数、超过 `MAX_GATE_THREADS`或allowed多于launched时，在任何线程进入affinity barrier前失败；合法over-subscription的dropped thread仍保持正常语义。
 - [ ] 篡改device `KernelArgs::runtime_args`，AICPU向registered Runtime写CANCEL，AICore通过第二个trusted Runtime launch参数读取同一control并退出；验证AIC/AIV两种entry。
 - [ ] physical core id越界和范围内但register address为0时，AICPU只写对应per-core CANCEL，不访问未知SPR；A5 PMU入口不会先OOB。
-- [ ] restore、scheduler-init、assign、dispatch、shutdown和runtime-destroy各阶段注入错误，所有有效AICPU participant均完成arrive/finalize/snapshot/depart，只有last-depart清代际状态。
+- [ ] restore、scheduler-init、assign、dispatch、shutdown和runtime-destroy各阶段注入错误，所有有效AICPU participant均完成arrive/finalize/snapshot/depart，只有last-depart清代际状态。真实scheduler-init失败已覆盖；assign内部与scheduler dispatch内部故障仍未逐点覆盖。
 - [ ] 每个故障case后caller-stream tail event可达、context不依赖device reset，随后同context合法eager/capture/replay能够成功。
 - [ ] 完全不进入或不report的硬件core按外部op-timeout/driver恢复边界记录，不伪装成PyPTO算子内可恢复case。
 

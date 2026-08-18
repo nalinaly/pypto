@@ -5290,3 +5290,112 @@ pytest -q tests/st/distributed/test_l3_device_tensor.py \
 本轮可以将“L2 one-shot/reuse与L3 persistent/pipeline定向回归”标为A2/A3 device0
 通过。但这不是整个L2/L3 ST suite，也不是A5上板证据；两者继续作为更广
 发布矩阵，不用这四个绿色用例过度声称“全量回归完成”。
+
+### 10.51 真实scheduler-init失败的红绿上板闭环
+
+#### 10.51.1 为什么原有`after_scheduler_init`还不够
+
+10.49中的`after_scheduler_init`发生在`AicpuExecutor::init()`已经成功返回之后：AICore
+handshake和core assignment确实已经完成，但故障由后续`run()`中的restore流程消费，再走
+`run_epilogue`。它可以证明“初始化完成后的早退”会执行逐线程shutdown，却没有实际覆盖
+`init_rc != 0`这一条独立分支。
+
+这一差别对L1 borrowed-device语义是关键的。`post_handshake_init()`成功时，AICPU已经为各个
+AICore打开register window并把core分配给不同scheduler thread；如果随后初始化失败，每个有效
+AICPU participant仍必须关闭自己负责的window。仅仅让N个participant进入completion gate，只能
+证明Host/AICPU状态到齐，不能让hidden stream上的AICore kernel退出。
+
+runtime提交`50c3badd`保留原有1～7的数值，追加`SchedulerInit = 8`。Host仍只通过内部测试变量
+`SIMPLER_INTERNAL_HBG_L1_TEST_FAULT=scheduler_init`在fresh task package中写marker，没有增加
+production导出符号或resident全局故障状态。与run阶段故障不同，stage 8必须在调用
+`AicpuExecutor::init()`之前确定，因此每个AICPU participant只在private test flag存在时：
+
+1. invalidate本次CANN-owned完整HostArgs blob；
+2. 按`DevicePatched`模式重新校验完整header、region、slot binding、identity、bounds、overlap和
+   `plan_hash`；
+3. 只有校验成功才把stage传入`init()`，校验失败不修改caller提供的stage output；
+4. leader仅在真实`post_handshake_init()`成功后写入专属错误`-1708`并发布`init_failed_`。
+
+正常调用没有private flag，不新增整包hash扫描；错误marker也不能借“测试成功”绕过真实package
+校验。
+
+#### 10.51.2 第一次device0运行暴露的真实缺口
+
+第一次把stage 8加入正式ST后，device0日志依次出现stage 1～8。stage 1～7仍逐一返回，但stage 8
+到达Host注入记录后，`torch_npu.npu.synchronize(0)`不再返回。此时pytest进程仍在device0，Host
+线程进入不可中断等待；没有调用device reset。终止Host进程后仍等待CANN现有op-timeout/进程清理
+回收，最终process table恢复为空且device0 AICore利用率回到0，再进行下一轮验证。
+
+源码时序与这个现象严格对应：`execute_runtime_generation()`的`init_rc != 0`分支原来直接执行
+`latch_run_error(-1) -> arrive_and_finalize_run()`。由于本次故障发生在成功的
+`post_handshake_init()`之后，`core_trackers_`中已经有完整assignment，但这条分支从未调用
+`SchedulerContext::shutdown(thread_idx)`。结果是AICPU completion gate可以完成，hidden AICore却
+没有收到register EXIT，caller stream又必须等待hidden done event，因而整个算子tail不可达。
+
+这次先红后绿的device结果说明该case不是为了增加覆盖数字：它直接找到了正常数值与原七阶段都
+没有触发的no-reset错误路径。
+
+#### 10.51.3 修正后的N路收尾
+
+A2/A3与A5的HBG AICPU实现保持逐字一致。每个`init_rc != 0`的有效participant现在按自己的
+affinity thread index执行：
+
+```text
+sched_ctx_.shutdown(thread_idx)
+  -> 首个真实shutdown错误写入hbg_unexpected_teardown_error_
+  -> first-wins latch保留原始init/stage错误
+  -> arrive_and_finalize_run()
+  -> wait_for_finalization()
+  -> snapshot共享错误与runtime status
+  -> depart；只有last-depart执行deinit/reset
+```
+
+`shutdown()`对已经走过`emergency_shutdown()`的初始化失败保持幂等，所以同一分支也能安全覆盖
+pre/post-handshake的既有失败。若任何participant真实关闭AICore window失败，独立的
+`hbg_unexpected_teardown_error_`优先于`controlled_fault`返回；只有全部真实teardown成功时，
+`-1708`才会转成测试所需的task success。这样不会用合成错误掩盖硬件清理失败。
+
+#### 10.51.4 最终验证结果
+
+无硬件与交叉编译结果：
+
+```text
+A2/A3 onboard HBG AICPU                         build passed
+A5 onboard HBG AICPU                            build passed
+A2/A3 sim HBG AICPU                             build passed
+A5 sim HBG AICPU                                build passed
+test_hbg_launch_blob + test_hbg_aicpu_invocation 2/2 passed
+runtime C++ ctest -LE requires_hardware           99/99 passed
+L1 Python wrapper/simpler tests                   57/57 passed
+git diff --check                                  passed
+```
+
+重新构建GPT worktree自己的editable runtime后，在device0重跑完整八阶段矩阵：
+
+```text
+pytest -q -s tests/st/runtime/l1/test_l1_hbg_fault_injection.py \
+  --platform=a2a3 --device=0
+
+1 passed, 1 deselected in 23.50s
+```
+
+stage 8这次与前七项一样到达caller tail；output保持`-777`，紧邻的同context正常generation重新
+restore并得到7。八项完成后，同一context仍完成ACLGraph capture，输入11与-3的两次replay分别
+得到16与2。测试finally继续遵守external synchronize、graph reset、context close顺序，全程没有
+device reset。
+
+随后在未设置fault变量的独立进程中重跑正常HBG L1选择集：
+
+```text
+pytest -q \
+  tests/st/runtime/l1/test_l1_aclgraph.py \
+  tests/st/runtime/l1/test_l1_extended_matrix.py \
+  --platform=a2a3 --device=0 -k 'host_build_graph or hbg'
+
+6 passed, 12 deselected in 46.70s
+```
+
+因此可以明确新增一条证据：**真实scheduler-init失败后，所有有效AICPU participant都会关闭各自
+AICore window并完成arrive/finalize/snapshot/depart，caller tail可达，下一代及ACLGraph replay不
+依赖reset。** N.10.8仍不能整体标完：assign函数内部、scheduler dispatch内部、generation建立前
+的slot/callable/affinity/KernelArgs错误、physical-core故障和A5真实硬件仍分别缺少同等级注入证据。
