@@ -6067,3 +6067,135 @@ caller-stream AICore和early launch计数全部为0。TRB与HBG replay数值均�
 这项证据只覆盖当前A2/A3+CANN 9.2进程内实际导出的符号集合；第三方CANN在一个允许API内部执行
 的实现细节不会被错误归因为PyPTO直接调用。未来若CANN增加新的同义禁止入口，应同时扩展源码token
 集合和interposer列表。本轮没有构建或运行A5/A5 simulator，也没有据A2/A3结果外推A5。
+
+### 10.60 A2/A3范围冻结与L2/L3兼容性收口
+
+#### 10.60.1 验收范围只保留A2/A3
+
+用户在本轮再次明确：当前没有A5实机，不需要处理A5 simulator，后续只管A2/A3。因此从本节开始，
+A5源码、交叉构建、simulator和上板结果都不再作为当前L1/HBG交付的完成门槛；历史文档中保留的A5
+分析仅作为未来重新开启该架构时的背景，不能把A2/A3结果外推成A5结论。
+
+所有本轮设备命令执行前都先加载`.claude/skills/testing/load-env.sh`，并显式把`PYTHONPATH`、
+`PATH`和Python解释器固定到`pto/gpt_pypto`及其`runtime/.venv`。环境脚本仍打印一条既有的
+`dirname: unrecognized option '--path-format=absolute ...'`提示，但后续导入路径、native binding和
+测试产物均来自GPT隔离工作树；这条提示没有改变测试选择或结果。
+
+#### 10.60.2 A2/A3 L2全量尝试暴露一个可独立复现的长序列遗留失败
+
+首先在device0运行A2/A3 runtime level-2选择集：
+
+```text
+pytest -q -s tests/st/a2a3 \
+  --platform=a2a3 --device=0 --level=2 \
+  --max-parallel=1 --pto-session-timeout=1800
+```
+
+pytest收集到65个level-2节点，另有14个节点因level/platform过滤而deselect。首个根失败位于
+`TestSpmdPagedAttentionHighPerf`的普通非manual case
+`b1_h32_kv8_s8192_bs128_fp16`：device分类为`sched_error_code=100`、
+`S1:running-stalled`，第一次运行观察到core 22停滞以及8个core未完成deinit，随后AICPU返回
+`507018/0x2a`并最终触发AICore op timeout。紧随其后的`TestSpmdStarvation`失败时复用了已经不可用的
+L2 runner，因此属于根失败后的级联，而不是第二个独立根因。中断时pytest报告为：
+
+```text
+2 failed, 60 passed, 1 skipped, 14 deselected, 14 warnings in 325.42s
+```
+
+这里必须如实记录一个与L1 no-reset契约不同的事实：旧L2 runner在上述错误finalize路径中自动调用了
+`aclrtResetDeviceForce(0)`。这是既有L2全资源掌控恢复逻辑由测试失败触发，并非本轮人工执行reset，
+但它确实发生了，所以本次L2兼容性尝试不能被描述成“全过程无reset”。L1/HBG的16阶段fault matrix
+仍是独立的无reset证据，不应与这里的legacy L2错误恢复混为一谈。
+
+为了验证该失败是否由本分支新增的L1 pre-window CANCEL polling误入L2，曾做过一次最小诊断实验：
+临时把A2/A3 TRB/HBG的AICore cancel polling限定为L1，重编对应两个onboard AICore target，并只运行
+上述`s8192` case。它仍然独立复现，停滞core变为24，但错误分类、`507018`和op timeout保持一致：
+
+```text
+1 failed in 76.85s
+```
+
+该次legacy L2 finalize也再次自动force-reset device0。实验直接否定了“L1 cancel polling导致此
+case回归”的假设；临时代码已用patch完整恢复，A2/A3 TRB/HBG AICore cache随后从恢复后的源码重建，
+顶层与runtime仓都重新确认clean。没有把这项猜测或实验改动提交到分支。
+
+静态对照还确认：失败case、其kernel和L2 launch路径都没有被本次L1提交直接改写；该case在当前环境
+单独运行即可稳定卡在8个AIV worker的FFTS/internal wait。因此当前证据支持把它记为独立的旧L2
+高性能长序列/环境问题，而不是已证明的L1回归；但在没有一份同环境基线分支成功结果前，也不能把
+“A2/A3 L2全量suite绿色”写进结论。
+
+#### 10.60.3 级联之后的7个L2场景在干净进程全部通过
+
+为确认根失败之后未完成或受污染的尾部节点，使用全新pytest进程运行以下7组目录：
+
+```text
+tests/st/a2a3/tensormap_and_ringbuffer/spmd_starvation
+tests/st/a2a3/tensormap_and_ringbuffer/spmd_sync_start
+tests/st/a2a3/tensormap_and_ringbuffer/spmd_sync_start_aiv
+tests/st/a2a3/tensormap_and_ringbuffer/spmd_sync_start_early_dispatch
+tests/st/a2a3/tensormap_and_ringbuffer/spmd_sync_start_edge
+tests/st/a2a3/tensormap_and_ringbuffer/spmd_sync_start_mix_spill
+tests/st/a2a3/tensormap_and_ringbuffer/spmd_sync_start_stress
+```
+
+结果为：
+
+```text
+7 passed, 14 warnings in 36.32s
+```
+
+特别是`spmd_starvation`在干净runner中通过，证明全量尝试里的第二个失败确属级联。把首次运行中已完成
+节点与这次干净尾部覆盖按节点去重后，65个A2/A3 L2节点的当前证据是：63个通过、1个skip、1个
+可独立复现的`s8192`失败。这个结果足以说明没有出现一片新的L2功能回归，但不冒充65/65全绿。
+
+#### 10.60.4 A2/A3 L3选择集7/7通过
+
+随后运行A2/A3 runtime level-3选择集。只传`--device=0`时，6个单卡可执行节点全部通过，唯一error
+来自`TestL3Group`测试自身要求两张设备而setup缺少第二个device：
+
+```text
+6 passed, 72 deselected, 1 error in 31.04s
+```
+
+检查`npu-smi info`确认NPU process table没有列出使用者后，仅对该双卡节点显式使用
+`--device=0-1`重跑：
+
+```text
+1 passed in 9.66s
+```
+
+因此A2/A3 L3选择集的最终设备证据是7/7通过：6个device0节点加1个device0-1 group节点。
+运行结束出现的Python resource-tracker“shared memory已unlink”告警没有改变测试结果，按既有L3
+进程清理告警记录，不作为功能失败。
+
+#### 10.60.5 legacy L2 reset之后的L1最终复验
+
+由于L2失败恢复期间真实发生过两次device reset，文档收口前再次检查`npu-smi`：process table为
+`No running processes found`。随后只在A2/A3 device0运行基础L1 ACLGraph与HBG no-reset fault ST：
+
+```text
+pytest -q -s \
+  tests/st/runtime/l1/test_l1_aclgraph.py \
+  tests/st/runtime/l1/test_l1_hbg_fault_injection.py \
+  --platform=a2a3 --device=0
+
+4 passed, 4 deselected, 1 warning in 59.76s
+```
+
+选中的4项覆盖TRB eager/warmup/capture/replay、HBG eager/warmup/capture/replay、同一context中两个
+HBG callable的独立task package与重复replay，以及HBG 16阶段故障后caller tail、同context恢复和
+最终ACLGraph replay。它证明两次legacy L2 reset之后GPT分支的A2/A3 L1主链仍可正常初始化、执行和
+关闭；测试自身没有调用device reset。4个deselection仅来自A5平台参数过滤，符合当前范围。
+
+#### 10.60.6 当前兼容性结论
+
+截至本节，A2/A3范围内可以给出以下精确结论：
+
+1. TRB L1与HBG L1的eager、ACLGraph、双callable、单算子stream边界、真实CANN禁止API trace和
+   16阶段no-reset故障恢复已经有device0证据；
+2. A2/A3 L3当前选择集7/7通过；
+3. A2/A3 L2的65节点中按独立进程去重后63个通过、1个skip，唯一根失败是可单独复现的
+   `b1_h32_kv8_s8192_bs128_fp16`；由它污染的`spmd_starvation`已在干净进程通过；
+4. 临时L1 polling诊断改动已完全回滚，两个git仓都没有遗留源码差异；
+5. 因此当前没有发现由L1实现引入的A2/A3 L2/L3功能回归，但“L2全量绿色”仍有上述一个明确例外，
+   不能在交付说明中省略；A5实机与A5 simulator不属于当前结论。

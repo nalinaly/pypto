@@ -2179,7 +2179,9 @@ v1 契约仍禁止并发 replay，但需观察两个图共享 context events时 
 - [x] 连续异步 args不串包。
 - [x] eager、multi-kernel、workspace、graph pre/post op均覆盖。
 - [x] replay stress不编码 runtime内部上限。
-- [x] L2 one-shot/reuse和 L3 persistent/pipeline定向回归在A2/A3 device0通过；全量与A5仍按上述边界单列。
+- [x] L2 one-shot/reuse定向回归在A2/A3 device0通过。
+- [ ] A2/A3 L2全量65节点按干净进程证据去重后为63 passed、1 skipped、1个可独立复现的paged-attention `s8192`遗留失败，不能写成全量绿色；其后`spmd_starvation`已在干净进程通过，证明原第二失败为runner污染级联。
+- [x] A2/A3 L3当前选择集7/7通过：6个device0节点，加1个显式`--device=0-1`的`TestL3Group`节点；A5不在当前范围。
 - [x] poisoned/close/device ownership负面路径通过。
 
 ## 附录 M：最终交付物
@@ -2618,6 +2620,16 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 > A5专属源码改造、A5交叉构建、A5 simulator或A5上板结果来判定本阶段是否完成。以下device
 > checkbox未特别注明时，当前验收主体均为A2/A3；未来若重新开启A5工作，应建立独立证据矩阵，
 > 不能把A2/A3结果直接外推。
+>
+> **2026-08-18 A2/A3 L2/L3收口证据：** runtime level-3当前选择集全部通过：6个单卡节点在
+> device0通过，唯一要求双卡的`TestL3Group`在确认无可见NPU进程后使用device0-1通过，合计7/7。
+> runtime level-2收集65个节点；首次长进程在paged-attention
+> `b1_h32_kv8_s8192_bs128_fp16`发生`S1:running-stalled`/507018并污染随后runner，legacy L2
+> finalize自动force-reset device。该case单独运行仍复现；一次把L1 pre-window polling临时限定为
+> L1的诊断实验未改变失败，且实验patch已完整回滚。随后7个尾部目录在干净进程7/7通过，包含原先
+> 级联失败的`spmd_starvation`。按节点去重，当前L2证据为63 passed、1 skipped、1个独立根失败；
+> 因此定向兼容性与其余节点通过，但不把L2全量写成绿色。两次legacy L2自动reset后又复验A2/A3
+> TRB/HBG ACLGraph、双callable和16阶段HBG no-reset矩阵，结果4 passed，确认L1主链未被污染。
 
 #### N.10.1 placeholder、snapshot与canonical immutability
 
