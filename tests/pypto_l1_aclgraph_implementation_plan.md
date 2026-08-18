@@ -2175,7 +2175,7 @@ v1 契约仍禁止并发 replay，但需观察两个图共享 context events时 
 - [x] Phase 0硬门槛在当前A2/A3范围有正式结果；A5按用户要求移出当前gate。
 - [ ] launch禁止项有可自动检查的 trace/counter。
 - [ ] trace/counter 明确检查 capture query、model attach、private AICPU launch 和 early-mode 均为零。
-- [ ] eager/ACLGraph 都有延迟 predecessor 和延迟 AICore tail 的 entry/exit 边界测试。
+- [x] A2/A3 device0已有独立边界压力ST：caller stream在L1前后各连续排入24个PyTorch节点，L1内部连续执行8个child kernel；同一拓扑在eager和ACLGraph三次replay中均完成数值依赖校验，覆盖entry不能越过predecessor、exit不能被immediate successor越过。该结果是device顺序证据，不替代下一项仍缺的runtime trace/counter。
 - [x] 连续异步 args不串包。
 - [x] eager、multi-kernel、workspace、graph pre/post op均覆盖。
 - [x] replay stress不编码 runtime内部上限。
@@ -2663,7 +2663,7 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 
 - [ ] trace中无PyPTO `aclrtSynchronizeStream/Device`或runtime同类sync。
 - [ ] 无capture query、model attach、`rtStreamAddToModel`、private AICPU stream和capture-only early launch。
-- [ ] 延迟predecessor能阻止restore/AICPU/AICore越过op entry；延迟AICore tail能阻止successor越过op exit。
+- [x] A2/A3 device0对TRB与HBG均通过专用边界压力ST：24级caller predecessor产生L1真实输入，8-child L1拉长hidden AICore分支，随后24级immediate successor立即消费L1输出；eager与ACLGraph三次replay全部验数通过。它证明公开单算子拓扑在该device压力下保持entry/exit依赖，但不冒充event时间戳trace或任意硬件stall故障注入。
 - [ ] restore是每次captured AICPU node执行的内部阶段，不是capture之前提前启动的orchestrator。
 
 #### N.10.7 close、fallback和无并发契约

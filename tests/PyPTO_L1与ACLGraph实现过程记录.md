@@ -5917,3 +5917,70 @@ fault环境变量未设置时再次运行A2/A3正常HBG L1 selection：
 NotReady/Publishing/CorruptState/wrong-device四种真实registry状态整体勾选。要覆盖它们，必须
 保持validator自然拒绝语义，同时另行决定如何观察CANN task非零返回后的context/device状态；不能
 为了让ST继续执行而把未认证registry错误改成0。本轮继续没有修改、构建或运行A5专属路径。
+
+### 10.58 A2/A3单算子entry/exit流边界压力验证
+
+#### 10.58.1 为什么普通pre-op/post-op还不够
+
+此前基础ACLGraph ST已经包含`torch.add -> PyPTO L1 -> torch.mul`，能够证明最小数值顺序，但前后
+各只有一个节点，L1本身也只有一个child kernel。这样的case对功能冒烟足够，却没有主动放大两类
+错误窗口：hidden AICore分支若越过caller stream上的Start gate，可能在前驱数据尚未完成时读取；
+caller stream若没有在单算子出口完整join hidden分支，紧邻后继可能读取尚未由最后一个child提交完成
+的输出。
+
+本轮新增A2/A3专属
+`tests/st/runtime/l1/test_l1_stream_boundaries.py`，不增加capture查询、内部同步或测试专用device
+控制通道。测试通过真实工作量扩大窗口：
+
+- caller stream在L1入口前连续排入24个`torch.add(..., out=...)`节点，最终buffer是L1的真实输入；
+- L1 orchestration使用7份内部workspace tensor串接8次`@pl.jit.incore` child add，最后一次才写外部
+  output，从而拉长真实hidden AICore工作链；
+- caller stream在L1之后立即再排入24个`torch.add(..., out=...)`节点，第一个节点直接读取L1 output；
+- eager warmup与ACLGraph capture使用完全相同的前驱/L1/后继拓扑，graph对三个不同输入连续replay；
+- 最终期望值同时包含48次PyTorch增量和8次L1 bias，entry早读、exit越过或任一child丢失都会导致
+  数值不一致。
+
+该case只参数化`platform="a2a3"`，runtime分别为TRB与HBG。它遵守现有生命周期契约：warmup后由
+调用方外部synchronize再切换capture stream，graph reset以前保持context与全部graph tensor强引用，
+最终先外部quiescence、再reset graph、最后显式close context。PyPTO内部没有新增sync或reset。
+
+#### 10.58.2 Host门槛与device0结果
+
+新程序先在无NPU任务的Host流程完成pytest collection，以及A2/A3 TRB/HBG两份独立lowering和
+PTOAS产物生成。确认NPU process table为`No running processes found`后，在GPT隔离工作树用device0
+执行：
+
+```text
+pytest -q -s tests/st/runtime/l1/test_l1_stream_boundaries.py \
+  --platform=a2a3 --device=0
+
+2 passed in 9.18s
+```
+
+两项分别证明TRB和HBG在eager及ACLGraph三次replay下都保持caller predecessor→L1 hidden branch→
+caller successor的单算子边界。附录L.6与N.10.6对应边界项据此勾选。
+
+证据边界仍保持明确：这是由真实device工作量制造窗口的顺序/数值验证，不是event时间戳或CANN
+runtime trace；它不证明任意人为无限stall均可恢复，也不替代仍未完成的禁止API自动trace/counter。
+本轮按最新验收范围只处理A2/A3，没有构建或运行A5实机、A5 simulator或A5专属target。
+
+#### 10.58.3 A2/A3 L1定向矩阵复验
+
+为避免新case只在单独进程中偶然通过，随后在device0同一pytest进程合并运行基础ACLGraph、扩展
+task/package lifetime矩阵和本轮边界ST：
+
+```text
+pytest -q -s \
+  tests/st/runtime/l1/test_l1_aclgraph.py \
+  tests/st/runtime/l1/test_l1_extended_matrix.py \
+  tests/st/runtime/l1/test_l1_stream_boundaries.py \
+  --platform=a2a3 --device=0
+
+11 passed, 9 deselected in 64.22s
+```
+
+该矩阵同时覆盖TRB/HBG基础capture/replay、两个HBG callable、异步tensor/scalar快照、多输出、
+multi-child与内部workspace、两个HBG graph交替replay、同进程顺序context generation，以及本轮
+entry/exit压力拓扑。20个deselection/selection中的9项来自平台参数过滤或不匹配的case，不代表失败；
+本次实际选择的11项全部通过。运行前再次确认NPU process table为空，运行中与teardown均未调用
+device reset。
