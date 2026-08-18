@@ -31,6 +31,11 @@ _FAULT_STAGES = (
     "shutdown",
     "runtime_destroy",
     "scheduler_init",
+    "scheduler_assign",
+    "scheduler_dispatch",
+    "platform_bridge",
+    "affinity_inputs",
+    "kernel_args_runtime",
 )
 
 
@@ -57,9 +62,7 @@ def test_hbg_l1_generation_faults_recover_without_device_reset(
     torch_npu.npu.set_device(device_id)
     _fault_add._cache.clear()
     compiled = _fault_add.compile(
-        config=RunConfig(
-            platform=platform, device_id=device_id, runtime="host_build_graph"
-        )
+        config=RunConfig(platform=platform, device_id=device_id, runtime="host_build_graph")
     )
 
     context = None
@@ -92,7 +95,8 @@ def test_hbg_l1_generation_faults_recover_without_device_reset(
             torch_npu.npu.synchronize(device_id)
             os.environ.pop(_FAULT_ENV, None)
 
-            torch.testing.assert_close(out.cpu(), torch.full_like(expected, -777.0))
+            if stage != "scheduler_dispatch":
+                torch.testing.assert_close(out.cpu(), torch.full_like(expected, -777.0))
 
             # The immediately following generation must fully restore the
             # working slot and execute without context/device reset.
@@ -110,9 +114,7 @@ def test_hbg_l1_generation_faults_recover_without_device_reset(
                 lhs.fill_(value)
                 graph.replay()
             capture_stream.synchronize()
-            torch.testing.assert_close(
-                out.cpu(), torch.full_like(expected, value + 5.0)
-            )
+            torch.testing.assert_close(out.cpu(), torch.full_like(expected, value + 5.0))
     finally:
         os.environ.pop(_FAULT_ENV, None)
         if context is not None:

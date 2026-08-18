@@ -5399,3 +5399,198 @@ pytest -q \
 AICore window并完成arrive/finalize/snapshot/depart，caller tail可达，下一代及ACLGraph replay不
 依赖reset。** N.10.8仍不能整体标完：assign函数内部、scheduler dispatch内部、generation建立前
 的slot/callable/affinity/KernelArgs错误、physical-core故障和A5真实硬件仍分别缺少同等级注入证据。
+
+### 10.52 A2/A3专属13阶段no-reset矩阵与当前范围收口
+
+#### 10.52.1 验收范围修订与工作树隔离
+
+用户在本轮明确：当前只管A2/A3；没有A5实机，A5 simulator也不用作为完成条件。因此从本节
+开始，A5专属源码、A5交叉构建、A5 simulator和A5上板均不再是本阶段completion gate。历史记录
+中已经完成的A5静态分析仍保留，因为它解释了common ABI为何如此设计，但不能再用来拖延A2/A3
+收口，也不能把A2/A3实机结果外推成A5结论。
+
+本轮继续只在GPT隔离工作树中修改：
+
+```text
+/mnt/workspace/inductor/pto/gpt_pypto
+branch: gpt/pypto-l1-aclgraph
+```
+
+最终dirty文件检查中，runtime差异只包含`src/a2a3/**`、common task/host test plumbing和common
+UT；没有`src/a5/**`文件。此前为了保持两架构同构而产生、但尚未提交的A5 scheduler改动已经撤回。
+top层仍只有runtime gitlink、A2/A3 HBG fault ST和本设计/过程文档。所有Python命令继续显式使用
+`gpt_pypto/runtime/.venv`以及GPT自己的`PYTHONPATH`，没有加载或修改同级Grok工作树
+`/mnt/workspace/inductor/pto/pypto`。
+
+运行device0前再次执行`npu-smi info`：CANN NPU process table显示`No running processes found`。
+Host进程表中可见一个Grok sibling worktree的Python pytest，但其命令是纯Host L1 Python API UT，
+没有NPU进程记录；用户已明确授权本轮使用device0。因此本轮device命令只指定`--device=0`，没有
+访问device1，也没有执行任何device reset。
+
+#### 10.52.2 stage 9：真实core assignment入口
+
+原stage 8是在`post_handshake_init()`已经完成assignment以后制造`init_rc != 0`。它证明了
+assignment完成后的逐线程window shutdown，却没有进入`assign_cores_to_threads()`之前的失败
+边界。新增`SchedulerAssign = 9`后，A2/A3 leader按如下顺序运行：
+
+```text
+handshake全部participant到齐
+  -> physical core discovery完成
+  -> 统计AIC/AIV数量
+  -> 命中SchedulerAssign
+  -> emergency_shutdown(runtime)
+  -> 返回stage专属-1709
+  -> 发布init_failed最终裁决
+  -> 每个有效participant执行自己的shutdown
+  -> arrive/finalize/snapshot/depart
+```
+
+故障点位于`assign_cores_to_threads()`之前，不伪造assignment结果；如果是自然的handshake或
+assignment失败，仍返回原始失败，不会因为test marker变成success。Host parser、task-local marker
+编码/解码和完整package认证均新增对应反例。A2/A3 onboard HBG AICPU重编通过，device0九阶段
+矩阵结果为：
+
+```text
+1 passed, 1 deselected in 25.46s
+```
+
+#### 10.52.3 stage 10：实际publish之后的scheduler dispatch错误
+
+早先的`before_dispatch`只在进入scheduler loop以前中止，不能证明已经开始发布task后，多个
+scheduler participant如何共同停止。新增`SchedulerDispatch = 10`把故障放进A2/A3
+`SchedulerContext::resolve_and_dispatch()`：只有`dispatch_ready_tasks()`返回`try_pushed=true`，
+即当前线程已经真实publish过工作后，才执行以下动作：
+
+1. CAS写入stage专属`sched_error_code=-1710`并记录thread/bitmap；
+2. 通过`completed_.exchange(true)`选出唯一执行`emergency_shutdown(runtime)`的线程；
+3. 当前scheduler返回准确的stage error；
+4. 全部AICPU participant仍进入既有shutdown和两阶段completion gate；
+5. 因为task可能已经publish，测试不再要求这一stage的output保持`-777`，但仍要求caller tail可达，
+   紧邻的正常generation必须重新restore并得到正确结果。
+
+第一次device0十阶段运行没有hang，但stage 10由CANN报`507018`并使pytest失败。根因不是AICore
+遗留，而是`execute_runtime_generation()`先无条件返回inner runtime status；即使共享error已经被
+认证为本stage实际产生的`-1710`，它仍在`controlled_fault`分支之前返回。修正没有粗暴吞掉所有
+runtime错误，而是计算`requested_fault_error`并使用精确三条件：
+
+```text
+test package完整认证成功
+&& 本stage内部确实置位hbg_fault_injected_
+&& runtime_rc/shared_error恰好等于本stage专属值
+```
+
+只有三者同时满足，完全相同的synthetic runtime status才允许进入controlled success；任何其他
+runtime status、自然scheduler错误或unexpected teardown error仍优先返回。修正后十阶段device0
+结果为：
+
+```text
+1 passed, 1 deselected in 27.70s
+```
+
+#### 10.52.4 stage 11～12：generation建立前的平台与affinity闭包
+
+`PlatformBridge = 11`发生在A2/A3 runtime public HBG AICPU entry已经取得可信execution slot、
+callable和fixed invocation之后。test flag存在时先invalidate完整CANN-owned HostArgs blob，再按
+DevicePatched模式验证全部region、identity、placeholder、bounds、overlap与`plan_hash`。只有完整
+认证的marker才能在进入platform bridge/generation以前向独立`HbgL1LaunchControl`写release
+`PRELAUNCH_CANCEL`并flush；hidden AICore读取同一个prepare-time可信control后退出。缺bridge、
+坏package或无control仍是自然失败，不被转换为0。十一阶段device0结果为：
+
+```text
+1 passed, 1 deselected in 32.39s
+```
+
+`AffinityInputs = 12`继续使用上述已认证invocation，在A2/A3 platform AICPU入口把代表性非法值
+`allowed_cpu_count=-1`送进production `platform_aicpu_affinity_config_valid()`。校验发生在任何
+线程进入affinity gate/barrier之前；命中后写同一prelaunch CANCEL，只有这一个已认证stage返回
+controlled success。无硬件`test_platform_aicpu_affinity_config`继续覆盖0、负数、超过
+`MAX_GATE_THREADS`、allowed大于launch以及合法配置，避免把所有输入组合都塞进device ST。
+十二阶段device0结果为：
+
+```text
+1 passed, 1 deselected in 34.43s
+```
+
+#### 10.52.5 stage 13：persistent KernelArgs/Runtime binding拒绝闭包
+
+HBG L1 prepare会持久化device `KernelArgs`，AICPU public entry必须验证其中`runtime_args`非空且
+等于immutable execution-slot registration中的`outer_runtime_base`。hidden AICore又通过Host直传
+trusted Runtime override读取同一Runtime/control；这条绑定是防止坏KernelArgs造成AICPU/AICore
+split-brain的关键。
+
+新增`KernelArgsRuntime = 13`时先写UT引用，再运行C++ build，得到预期红灯：
+
+```text
+error: ‘KernelArgsRuntime’ is not a member of ‘simpler::hbg::HbgL1FaultStage’
+```
+
+随后才增加enum、Host字符串映射、marker/hash认证反例和A2/A3 public entry分支。为了保证test
+marker本身不能为坏package开后门，真实KernelArgs读取与binding判断被移动到完整fixed invocation
+解析、且test package完整认证之后。最终逻辑同时计算：
+
+```text
+kernel_args_match = runtime_args != nullptr
+                    && address(runtime_args) == slot.outer_runtime_base
+inject_kernel_args_fault = authenticated stage == KernelArgsRuntime
+```
+
+自然`kernel_args_match=false`始终写prelaunch CANCEL后返回`-1`；即使blob恰好携带test flag也不会
+被吞掉。只有真实binding仍正确且marker完整认证时，stage 13才走同一拒绝/CANCEL闭包并返回受控
+success。这样可以安全验证hidden AICore的control来源和no-reset tail，而不在共享设备上故意写坏
+persistent device pointer。本case**不等价于已经完成真实device内存破坏测试**，后者仍保留为独立
+高风险验收项。
+
+A2/A3 onboard HBG AICPU和common C++ UT重编通过。重新构建GPT worktree自己的editable runtime
+后，device0完整13阶段结果为：
+
+```text
+pytest -q -s tests/st/runtime/l1/test_l1_hbg_fault_injection.py \
+  --platform=a2a3 --device=0
+
+1 passed, 1 deselected in 36.52s
+```
+
+日志严格按stage 1～13出现。每一个stage的外部`synchronize(0)`都返回；除stage 10允许已经
+publish的task改变output外，其他stage保持sentinel；每个stage之后的同context正常调用都得到7。
+13项完成后，同一context继续完成ACLGraph capture，输入11和-3的两次replay分别得到16和2。
+finally仍是external synchronize、graph reset、context close，全程没有reset。
+
+#### 10.52.6 最终A2/A3验证证据与剩余边界
+
+本轮最终只把A2/A3和common路径作为gate：
+
+```text
+A2/A3 onboard HBG AICPU build                                  passed
+common/A2相关C++ UT：launch blob、AICPU invocation、affinity   3/3 passed
+L1 Python wrapper/simpler                                     57/57 passed
+A2/A3 device0 13-stage no-reset + final ACLGraph replay        1 passed
+A2/A3 device0 normal HBG L1 selection                          6 passed, 12 deselected
+clang-format dry-run                                           passed
+ruff check / format                                            passed
+top/runtime git diff --check                                   passed
+A5硬件、A5 simulator、A5专属build                              不在当前范围
+```
+
+正常HBG selection的精确命令与结果为：
+
+```text
+pytest -q \
+  tests/st/runtime/l1/test_l1_aclgraph.py \
+  tests/st/runtime/l1/test_l1_extended_matrix.py \
+  --platform=a2a3 --device=0 -k 'host_build_graph or hbg'
+
+6 passed, 12 deselected in 46.86s
+```
+
+由此可以把A2/A3的restore、真实scheduler init、assign、实际dispatch、shutdown、runtime destroy、
+已认证platform/affinity/KernelArgs prelaunch分支的caller-tail与同context恢复标为完成。仍不能扩大为：
+
+- slot registry NotReady/Publishing/CorruptState/wrong-device的真实device故障矩阵；
+- callable缺失和bad blob/header/identity/placeholder等未认证自然损坏的逐项device注入；
+- 真实篡改persistent device KernelArgs指针；
+- AIC与AIV两种entry分别覆盖的physical-core id/register mapping故障；
+- 完全不进入或不report的硬件core由算子内自行恢复；
+- A5可用或A5与A2/A3行为一致。
+
+这些边界不会阻止当前A2/A3主路径和13项安全可控故障矩阵收口，但在对应功能被纳入产品保证前，
+必须继续保持fail-closed表述，不能用本轮绿色结果代替尚未执行的破坏性实机实验。
