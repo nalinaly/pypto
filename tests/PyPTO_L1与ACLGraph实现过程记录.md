@@ -3651,3 +3651,449 @@ fallback优先级仍保持保守：
 - device 1 ACLGraph、CANN args owner和真实cache/order证据仍未取得。
 
 这意味着第二阶段的架构方向已经清楚：**graph package跟task/captured node走，mutable execution state跟context slot走，二者由每次replay restore连接；任何性能优化都必须留在显式HBG operator边界内，不能重新引入旧PyPTO那种提前启动并跨越单算子边界的hidden行为。**
+
+### 10.43 GPT/Grok隔离、device 1首次TRB L1实测与独立report缓存行
+
+#### 10.43.1 第一阶段当前不能宣称完成
+
+2026-08-18再次向用户汇报时，第一阶段的准确状态是：Host API、Python wrapper、taskQueue adapter、borrowed caller stream、hidden AICore stream、prepare/close生命周期和大量无硬件契约已经落地，但TRB L1 eager在device 1上的首次真实执行仍停在AICPU/AICore startup handshake；因此ACLGraph capture和多次replay还没有通过证据。
+
+不能因为以下事实就把第一阶段写成完成：
+
+- editable build通过；
+- no-hardware UT通过；
+- L2同一套AICore binary和KernelArgs可以运行；
+- ACLGraph ST已经写好并能collect；
+- 源码审查没有发现新的普通路径P0。
+
+阶段完成门槛仍然是device 1上按真实torch/taskQueue调用顺序完成：prepare、eager warmup、外部同步、独立capture stream、图内前后torch算子排序、多次replay数值验证和显式graph/context teardown。当前只完成了到真实eager故障定位这一步。
+
+#### 10.43.2 两个session的五层隔离
+
+Grok和GPT没有在同一个working tree里直接改文件。实测核验结果如下：
+
+| 层次 | GPT session | Grok session |
+|---|---|---|
+| top worktree | `/mnt/workspace/inductor/pto/gpt_pypto` | `/mnt/workspace/inductor/pto/pypto` |
+| top branch | `gpt/pypto-l1-aclgraph` | `main` |
+| nested simpler/runtime | `/mnt/workspace/inductor/pto/gpt_pypto/runtime` | `/mnt/workspace/inductor/pto/pypto/runtime` |
+| nested branch | `gpt/pypto-l1-aclgraph` | `l1-aclgraph` |
+| Python/native owner | GPT runtime自己的 `.venv`、editable `.pth`和 `_task_interface.so` | 不从GPT venv加载 |
+| NPU约定 | 只允许device 1 | 主要使用device 0 |
+
+Git worktree可以共享object database，但working tree、index、当前branch和未提交文件彼此独立。核验时Grok nested runtime为clean；当前几十个L1/HBG runtime修改全部只存在于GPT nested runtime。GPT top repo自己的Python wrapper和测试修改也只存在于`gpt_pypto`。
+
+真正危险的不是Git，而是Python editable安装。用户级文件：
+
+```text
+/home/developer/.local/lib/python3.11/site-packages/_pypto_editable.pth
+```
+
+仍明确指向Grok的：
+
+```text
+/mnt/workspace/inductor/pto/pypto/python
+```
+
+它不能被GPT session删除或改写，否则会反向破坏Grok环境。因此GPT所有构建、pytest和上板命令必须同时满足：
+
+```bash
+PYTHONNOUSERSITE=1
+PYTHONSAFEPATH=1
+PYTHONPATH=/mnt/workspace/inductor/pto/gpt_pypto/python:\
+/mnt/workspace/inductor/pto/gpt_pypto/runtime/python:\
+/mnt/workspace/inductor/pto/gpt_pypto/runtime
+```
+
+解释器必须使用：
+
+```text
+/mnt/workspace/inductor/pto/gpt_pypto/runtime/.venv/bin/python
+```
+
+不再把整个用户级`site-packages`追加到`PYTHONPATH`；即使普通目录方式通常不会处理其中的`.pth`，也没有必要扩大串仓面。第三方依赖由GPT venv和系统site-packages提供。禁止使用裸`python`、裸`pytest`或向用户级site-packages执行editable install。
+
+本次实际import证明为：
+
+```text
+pypto   = /mnt/workspace/inductor/pto/gpt_pypto/python/pypto/__init__.py
+simpler = /mnt/workspace/inductor/pto/gpt_pypto/runtime/python/simpler/__init__.py
+native  = /mnt/workspace/inductor/pto/gpt_pypto/runtime/.venv/lib/python3.11/site-packages/
+          _task_interface.cpython-311-aarch64-linux-gnu.so
+adapter = /mnt/workspace/inductor/pto/gpt_pypto/runtime/.venv/lib/python3.11/site-packages/
+          pypto/_torch_npu_l1.cpython-311-aarch64-linux-gnu.so
+ENABLE_USER_SITE = False
+```
+
+native editable build目录也位于GPT runtime自己的`build/`。2026-08-18再次核验时，两边已stage的A2/A3 TRB AICPU产物具有不同inode、size和SHA-256：GPT为`3816736`字节、`44fef471...`，Grok为`3720400`字节、`69a429da...`，证明不是同一个文件或软链接。
+
+还必须区分GPT runtime内部的两层构建产物：
+
+- `runtime/build/cache/...`是增量编译输出；
+- `runtime/build/lib/...`才是`RuntimeBuilder.get_binaries(build=False)`和上板ST实际打包的staged产物。
+
+只重编`build/cache`而没有将产物stage进本工作树自己的`build/lib`，会让GPT测试加载GPT目录中的旧二进制；这不是串到Grok仓，但会造成“源码已经修改、设备仍运行旧实现”的假象。因此每次runtime改动后必须在GPT目录显式执行本工作树的`RuntimeBuilder(...).get_binaries(..., build=True)`，再核对cache/staged文件的时间戳、size或hash。绝不能复制或引用Grok的`runtime/build/lib`。
+
+PTOAS是双方只读共享的工具，不是Python/native产物；GPT固定使用`PTOAS/build-v0.57-llvm21-cann9.2-clean/tools/ptoas`，并清除可能指向不兼容工具的`PTOAS_ROOT`。
+
+#### 10.43.3 当前没有NPU进程，不能把历史占用归因于Grok
+
+再次查询host进程时，没有发现命令行指向`gpt_pypto`、`pypto`、pytest或正在运行的NPU测试进程。此前`npu-smi`曾显示某device有非零HBM和AICore/AIV利用率，但没有对应PID；这类观测不能证明Grok正在运行，也不能作为抢占或reset设备的依据。
+
+因此本节采用严格表述：
+
+- 当前查询时没有发现任何人正在提交NPU任务；
+- 先前的utilization/HBM读数不能归因于Grok；
+- device 0无论是否显示进程都不由GPT session使用或reset；
+- GPT仅在确认目标为device 1后显式`aclrtSetDevice(1)`/`--device=1`；
+- 每次上板前打印`pypto.__file__`、`simpler.__file__`、`_task_interface.__file__`和目标device，任一不匹配就拒绝执行。
+
+#### 10.43.4 device 1首次TRB L1故障事实与反证
+
+真实A2/A3 L1 ST在device 1进入warmup后，外部sync报507018/AICPU 0x2a。Host侧确认caller stream、hidden stream、Start event和两类kernel task均成功进入提交路径；device日志显示custom AICPU worker进入startup handshake，但并非所有scheduler slice都完成收集。
+
+进一步诊断日志中，全部6个custom AICPU线程都进入affinity gate，其中4个有效角色为3个scheduler和1个orchestrator；三个scheduler均进入handshake，但只有其中一个收齐其21个core，另外两个一直等待本slice的report。这个形态排除了“缺少某个AICPU affinity worker”这一直接解释。
+
+同一分支、同一device 1执行L2反证程序，连续4次dispatch通过。这证明至少以下基础事实成立：
+
+- 当前AICore binary能够在device 1执行；
+- KernelArgs和Runtime的基本H2D地址链在L2成立；
+- physical-core register mapping不是全面失效；
+- 不是简单的编译架构或device选择错误。
+
+随后通过源码、产物和小改动逐项排除了若干L1-only候选：
+
+1. `L1AicpuInvocationArgs`约33KiB导致每worker大栈：入口改成只拷贝小prefix，实产物栈帧从约34KiB降到224B，故障仍存在。
+2. CANN HostArgs存在32KiB硬截断：本机runtime的CPU_EX参数池规格和copy路径可以容纳约33KiB，未发现16-bit SQE length截断。
+3. persistent Runtime或device KernelArgs H2D损坏：prepare后D2H逐字段校验通过。
+4. AICPU和AICore取到不同Runtime地址：所有L1 AICore launch增加host prepare信任的Runtime override后，故障形态未消失。
+5. 仅仅把AICore launch放到AICPU launch之前：提交顺序改变后仍出现部分slice收不到report，说明顺序最多是调度影响，不是完整正确性证明。
+6. AICPU入口对整个Runtime做一次cache invalidate：入口可能早于AICore report，首次读0后仍可缓存；一次invalidate无法建立持续可见性。
+
+507018/0x2a也不能简单写成“AICPU代码发生fault”。仓内既有记录证明STARS watchdog可把纯握手自旋表现为同类错误码；必须结合最后可见phase和per-thread进度判断。
+
+#### 10.43.5 legacy Handshake为什么不能靠循环`dc civac`修复
+
+旧`Handshake`把两种所有权混在同一个64B cache line：
+
+- AICore写`aicore_done/physical_core_id/core_type`；
+- AICPU写`aicpu_ready/task`等控制字段。
+
+L1中custom AICPU可能不在AICore HBM write的自动snoop域，AICPU轮询前确实需要cache maintenance。但当前`cache_invalidate_range`在A2/A3实际使用`dc civac`，语义不只是丢弃本地line，还可能把AICPU本地dirty stale line clean回HBM。若AICore刚把同一line上的report写回，AICPU的CIVAC就可能用旧整行覆盖新report。多个scheduler并行扫描不同slice时，“一个slice全收齐，另两个slice永久缺若干report”与这种mixed-owner whole-line clobber完全吻合。
+
+所以不能继续在旧Handshake上增加更频繁的flush/invalidate；那会把竞态窗口放大。正确性要求把report和control的cache-line所有权物理拆开。
+
+#### 10.43.6 独立`L1AicoreReport`的当前实现
+
+当前实现新增：
+
+```cpp
+struct alignas(64) L1AicoreReport {
+    volatile uint32_t aicore_done;
+    volatile uint32_t physical_core_id;
+    volatile uint32_t core_type;
+    // padding to exactly one 64-byte cache line
+};
+```
+
+核心约束如下：
+
+- 每个launched AICore独占一条64B report line，不能把多个core压到同一line；
+- AICore是唯一writer，AICPU只读并可安全CIVAC；
+- legacy Handshake继续承载AICPU task和pre-window CANCEL，不再被L1依赖为report source；
+- L2/L3 Runtime构造时report pointer显式为`nullptr`，继续走旧协议；
+- L1在prepare阶段按`worker_count * 64`分配并验证64B alignment；
+- report base只存进persistent device Runtime，AICPU和AICore从同一信任根读取，避免新增双源地址；
+- 每次launch/replay由caller stream在Start event前异步clear report span；
+- allocation由现有L1 context allocator持有到显式close，地址在capture/replay期间稳定；
+- scheduler completion不再回读旧Handshake的`core_type`，而使用handshake阶段已经固化的`core_type_compact_`。
+
+没有选择把report base放进resident AICPU SO global，也没有增加第三个AICore kernel pointer参数。前者会引入同device多context覆盖问题，后者会让AICPU和AICore再次出现两个传参源并扩大wire ABI。Runtime pointer方案只在四套Runtime布局尾部追加字段，并将L2/L3默认值固定为null。
+
+截至本次记录，以下验证已经完成：
+
+- GPT runtime editable全量构建通过，A2/A3、A5 × TRB/HBG × onboard/sim相关产物均编译；
+- 四份scheduler独立include和DFX `-Werror=unused-parameter`问题已修；
+- report的64B size/alignment、相邻元素独占cache line和字段边界UT通过；
+- A2 TRB Runtime默认null及setter round-trip UT通过；
+- launch sequence、AICore handshake、TRB Runtime和orchestration requirements四组定向CTest共4/4通过；
+- `git diff --check`通过。
+
+但必须保留最后一句：**独立report尚未完成device 1复测，因此它当前是由日志形态、cache ownership和反证链支持的最强根因修复，不是已经由硬件确认的最终结论。**
+
+#### 10.43.7 上板前仍需闭合的fork提交失败窗口
+
+caller-stream AICPU与hidden-stream AICore需要两次独立runtime enqueue；它们天然不是一个原子事务。当前临时顺序先enqueue hidden AICore，再enqueue caller AICPU。若第二个API同步返回失败，AICore已经在等待AICPU打开register window，却没有AICPU发布task/CANCEL；仅把context poison并返回会留下orphan AICore，与L1 no-reset目标冲突。
+
+反过来恢复AICPU-first也不自动解决：若随后hidden AICore enqueue失败，AICPU同样会等待永远不会出现的report。所以最终协议不能只争论谁先launch，必须满足“第二分支失败时，第一分支有可靠、capture-compatible、无sync的退出路径”。当前正在审查的候选是显式launch commit/cancel control或失败时可enqueue的device cancel closure；在该错误闭包确定并有无硬件反例测试前，不把新的happy-path report实现直接当成可交付状态。
+
+#### 10.43.8 独立report上板后的反证：cache line不是本次507018的直接根因
+
+在把独立`L1AicoreReport`完整编译、stage并送到device 1后，第一次诊断运行仍然在eager warmup的外部同步点报507018/AICPU 0x2a。但这一次探针已经能够证明启动report链本身全部成功：
+
+- 6个AICPU worker全部进入L1 HostArgs prefix，affinity保留3个scheduler和1个orchestrator；
+- persistent Runtime为`0x12c2000cd000`，独立report数组为`0x12c2000cc000`，worker count为60；
+- 三个scheduler都完成各自report Phase 1/Phase 2；
+- `tidx0`汇总的60-bit可见mask为`0x0fffffffffffffff`，即60个AICore全部完成report；
+- 因此“某些AICore report被mixed-owner Handshake cache line覆盖”并不是这一次507018的直接根因。
+
+真正的最后进度停在AICPU第一次打开AICore寄存器窗口：
+
+```text
+physical_core_id = 2
+reg_addr         = 0x3ffbc7ff000
+phase            = platform_init_aicore_regs() / window open begin
+```
+
+没有对应的`window open done`。另外一个scheduler也停在physical core 4的`0x3ffbd7ff000`。这把故障从“report/cache可见性”进一步收敛为“当前L1 AICPU进程不能访问正确的AIC_CTRL MMIO窗口”。
+
+这个反证修正了10.43.5/10.43.6当时的根因判断，但不要求回退独立report：每核一条AICore-only cache line仍然是更清晰、可证明的ownership协议，避免未来AICPU cache maintenance覆盖AICore report；其A2/A3真实硬件路径也已证明能够连续warmup/capture/replay。准确表述应改为：**独立report是正确性hardening和故障排除工具，但不是本次custom scheduler MMIO fault的直接修复。**
+
+#### 10.43.9 与L2同地址逐项对照：custom scheduler缺少MMIO执行能力
+
+随后在同一GPT工作树、同一device 1、同一A2/A3 runtime binary上执行L2 control：
+
+```text
+tests/st/runtime/framework_and_models/test_compiled_program.py::
+TestJitCompiledProgram::test_inplace_add
+```
+
+L2通过。device日志给出了决定性对照：
+
+| 路径 | device进程标签 | physical core | AIC_CTRL地址 | 写窗口结果 |
+|---|---|---:|---:|---|
+| L1旧路径 | `aicpu_custom_scheduler` | 2 | `0x3ffbc7ff000` | begin后fault/卡住 |
+| L2路径 | `aicpu_scheduler` | 2 | `0x3ffbc7ff000` | begin与done均出现 |
+
+相同地址在L2标准scheduler进程可写，在L1 custom scheduler进程不可写，因此可以排除host register table、physical-core映射和地址计算错误。差异来自AICPU binary的加载模式：
+
+- 旧L1调用`aclrtBinaryLoadFromData(cpuKernelMode=2)`，再`aclrtRegisterCpuFunc`；task运行于`aicpu_custom_scheduler`；
+- L2先用KFC dispatcher把SO写进preinstall目录，再用mode0 JSON注册；task运行于标准`aicpu_scheduler`；
+- `platform_init_aicore_regs`要求标准scheduler拥有的AIC_CTRL MMIO映射/权限，custom scheduler不具备该执行环境。
+
+所以不能通过继续调整report轮询、HostArgs大小、Runtime地址或AICore/AICPU launch先后顺序来修复。L1必须改为标准AICPU scheduler，同时仍然遵守caller stream和不内部同步的单算子边界。
+
+#### 10.43.10 为什么mode0注册不需要等待dispatcher写完SO
+
+原设计记录在10.1曾保守认为：dispatcher必须先完成device文件写入，host才能mode0注册，因此bootstrap内的stream sync可能不可避免。核对本机CANN 9.2 runtime源码后，这个假设被更精确地拆开：
+
+1. `BinaryLoader::LoadCpuMode0Program()`只调用`ParseJsonAndRegisterCpuKernel()`；注释明确是“只加载json”。
+2. `aclrtBinaryGetFunction`/`rtsFuncGetByName`会为Kernel保存SO名、函数名，并把这两个literal name复制到device；它不打开或读取JSON里指向的preinstall SO。
+3. mode0下`Program::ProcCpuKernelH2DMem`直接走“不需要处理CPU SO H2D”的分支；只有mode1/mode2才触发SO复制/加载。
+4. 真正按SO名进入标准AICPU scheduler并`dlopen`目标SO发生在后续kernel task执行阶段。
+
+因此host可以在dispatcher task尚未device执行时立即完成mode0 JSON解析和function-handle解析。只要dispatcher task与后续init/register/run task都在同一个caller stream，device FIFO自然建立：
+
+```text
+caller stream:
+  KFC dispatcher bootstrap（写preinstall SO）
+    -> simpler_aicpu_init
+    -> simpler_aicpu_l1_register_callable
+    -> simpler_aicpu_l1_exec / capture node
+```
+
+这条顺序不要求`aclrtSynchronizeStream`，不需要private AICPU stream，也不让orchestrator越过caller-stream predecessor。mode0 host注册期间发生的literal-name device allocation/copy属于capture外prepare-time metadata准备，不读取inner SO，也没有新增stream/device synchronize API。
+
+#### 10.43.11 L1异步bootstrap的ownership事务
+
+`LoadAicpuOp`新增一条与L2/L3明确隔离的路径：
+
+```cpp
+BootstrapDispatcherAsync(..., caller_stream, device_id);
+InitPreinstalledAcl(extra_symbols);
+```
+
+L2/L3继续使用原来的：
+
+```cpp
+BootstrapDispatcher(...);  // 内部同步，随后局部RAII释放bootstrap输入
+Init(...);                 // RTS mode0
+```
+
+异步L1路径的关键不只是删除一行sync，而是重新定义三块device输入的owner：
+
+- dispatcher SO device copy；
+- inner runtime SO device copy；
+- dispatcher `DeviceArgs` device copy。
+
+同步L2路径可在`aclrtSynchronizeStream`之后让局部`DeviceBuf`析构；L1路径在enqueue API返回时device可能尚未读取这些地址，绝不能复用该局部RAII。当前实现把三块指针在launch前转交给`LoadAicpuOp`成员，直到调用方已经外部quiesce graph/stream后显式`ctx.close()`，才由`Finalize()`释放。
+
+失败事务同样保守：
+
+- H2D或launch之前失败，没有device task引用的局部allocation可立即清理；
+- 调用launch API之后，即使API同步返回错误，也保守持有三块地址，避免“部分接收task”语义不清时UAF；
+- mode0 load成功后立即接管ACL binary handle；后续任一function解析失败都不在prepare栈上卸载/释放，而是让poisoned context保留close owner；
+- `aclrtBinaryUnLoad`失败时保留handle和全部bootstrap allocation，允许显式close重试；
+- unload成功后逐个`aclrtFree`，成功的指针清空，失败的精确指针保留供重试；
+- L2的`RtsFile` unload仍保持历史best-effort语义，不把L1可重试teardown反向扩散到owned-device reset流程。
+
+异步路径不读取也不写process级“已完成bootstrap”cache。host在没有同步的情况下不能声称某次enqueue已经完成；L1 v1又已有每device单context约束，所以每个context明确enqueue一次bootstrap并持有自己的输入，比猜测另一个context/device task是否完成更安全。device dispatcher按`fingerprint + device_id`生成目标名，并用temp-file + atomic rename写入，同内容重复执行是幂等的。
+
+JSON临时文件名也从`fingerprint + pid`加强为`fingerprint + device + pid + loader地址`。这是因为同一进程同时注册两个device时，inner SO fingerprint可能相同，但JSON里的device-suffixed `kernelSo`不同；唯一文件名避免一方覆盖或删除另一方尚未读取的descriptor。
+
+#### 10.43.12 fork失败闭包已经落地
+
+10.43.7记录的窗口已经在本次正式上板前闭合，旧段落保留为问题发现的时间线。最终顺序仍采用AICore-first，但增加host可提交的pre-window cancel：
+
+1. caller clear Handshake/report并record Start；
+2. hidden wait Start，enqueue AICore，成功后立即record AICoreDone；
+3. caller enqueue AICPU；
+4. 若AICPU enqueue同步失败，caller对整段legacy Handshake执行`aclrtMemsetAsync(..., 0xFF, ...)`；
+5. AICore pre-window poll把`UINT32_MAX`识别为host cancel，全部退出；
+6. caller wait已经排好的AICoreDone，再record serial tail并返回原始错误/poison。
+
+这里用byte-fill `0xFF`是为了让每个`aicpu_ready`首word精确得到`0xffffffff`，避免`aclrtMemsetD32Async`可能申请临时pinned buffer。正常路径没有额外节点；补偿分支仍只有async enqueue，没有内部sync/reset。若cancel enqueue或join本身也失败，context保持poisoned/Closing并保留资源，不伪装成已安全回收。
+
+反向改成AICPU-first并不更正确：hidden wait、AICore launch或done-event record任一同步失败都会留下等待report的AICPU orphan，而且Host没有同样简单的标准scheduler cancel通道。AICore-first把所有这些风险点放在AICPU入队前，只留下一个已经有Handshake pre-window cancel协议的分支。
+
+#### 10.43.13 device 1正式无探针ACLGraph验收
+
+完成异步mode0路径后，先保留诊断探针运行一次。Host日志显示：
+
+```text
+BootstrapDispatcherAsync: queued ... target=simpler_inner_a48eda407420804c_1.so
+InitPreinstalledAcl: resolved preinstalled ACL handle ...
+```
+
+device日志对应进程标签已经从`aicpu_custom_scheduler`变为`aicpu_scheduler`：
+
+```text
+[simpler-dispatcher] Init: wrote ...simpler_inner_a48eda407420804c_1.so
+AICPU(...,aicpu_scheduler) ... simpler_aicpu_l1_exec
+```
+
+60个report全部可见，所有`platform_init_aicore_regs` window open都有done，首次完整ST通过。随后删除源码中的全部`[L1_PROBE]`，重新编译并stage A2/A3 TRB AICPU SO，确认正式SO中不存在探针字符串；使用正式产物再次执行：
+
+```bash
+env -u PTOAS_ROOT \
+  PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 \
+  PYTHONPATH=/mnt/workspace/inductor/pto/gpt_pypto/python:\
+/mnt/workspace/inductor/pto/gpt_pypto/runtime/python:\
+/mnt/workspace/inductor/pto/gpt_pypto/runtime:\
+/mnt/workspace/inductor/pto/gpt_pypto/tests/st \
+  PATH=/mnt/workspace/inductor/pto/PTOAS/build-v0.57-llvm21-cann9.2-clean/tools/ptoas:\
+/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  timeout 240s runtime/.venv/bin/python -m pytest \
+  tests/st/runtime/l1/test_l1_aclgraph.py \
+  --platform=a2a3 --device=1 --runtime-log-level=debug -q
+```
+
+结果：
+
+```text
+1 passed, 1 deselected, 1 warning in 3.79s
+```
+
+这个单个ST不是只测一个add结果，而是完整覆盖：
+
+1. test-local `@pl.jit` 64x128 FP32 add编译；
+2. `pypto_init(programs=[compiled], device=1)`；
+3. `context.prepare()`与普通stream eager `op.warmup()`；
+4. 调用方外部device synchronize；
+5. warmup raw stream与独立capture stream不同；
+6. graph内`torch.add(out=) -> L1(out=) -> torch.mul(out=)`的上下游顺序；
+7. 三组不同输入连续graph replay并逐次验数；
+8. graph-bound tensor保持强引用；
+9. finally中调用方外部quiescence，随后`graph.reset()`，最后`context.close()`。
+
+PyPTO内部仍没有stream/device synchronize、capture query、`rtStreamAddToModel`、model attach、private AICPU stream或early orchestrator launch。测试中的同步属于用户明确执行的warmup/teardown边界。
+
+同一正式产物随后执行L2 control：
+
+```bash
+runtime/.venv/bin/python -m pytest \
+  tests/st/runtime/framework_and_models/test_compiled_program.py::\
+TestJitCompiledProgram::test_inplace_add \
+  --platform=a2a3 --device=1 --runtime-log-level=debug -q
+```
+
+结果：
+
+```text
+1 passed, 1 warning in 2.91s
+```
+
+这证明新增L1异步bootstrap/ACL mode0分支没有替换或破坏L2原有同步bootstrap/RTS mode0路径。
+
+#### 10.43.14 第一阶段现在可以声明到什么范围
+
+截至本节，A2/A3 TRB L1的核心硬件门槛已经首次闭环：
+
+- caller stream AICPU + hidden AICore fork/join可被ACLGraph自然捕获；
+- warmup与capture使用不同raw stream；
+- capture前外部同步，不把capture外event依赖带入图；
+- 每次WithHostArgs参数由CANN task持有；
+- capture后连续三次replay数值正确；
+- graph/context按外部quiescence契约销毁；
+- AICPU实际运行于具备AIC_CTRL能力的标准scheduler；
+- L2 control继续通过。
+
+但阶段commit前仍要完成：完整no-hardware CTest、Python L1 UT、A2/A3+A5 TRB/HBG所有onboard构建、loader失败/无sync结构性护栏、`git diff --check`和文档状态更新。A5没有当前硬件可做同等上板，因此只能用双架构编译和共享协议审计作为本机证据，不能把A2/A3实测文字泛化成“A5已上板”。HBG capability仍然显式关闭；这次通过只证明第一阶段TRB L1/ACLGraph，不证明第二阶段HBG package/restore已经可用。
+
+#### 10.43.15 第一阶段提交前完整回归结果
+
+在删除全部诊断探针、完成标准AICPU scheduler异步bootstrap和独立AICore report协议后，使用GPT工作树的最新源码重新执行完整无硬件回归：
+
+```bash
+cd /mnt/workspace/inductor/pto/gpt_pypto/runtime
+cmake --build tests/ut/cpp/build -j4
+ctest --test-dir tests/ut/cpp/build --output-on-failure -LE requires_hardware
+```
+
+结果为：
+
+```text
+100% tests passed, 0 tests failed out of 98
+```
+
+Python侧强制关闭user-site，并显式指定GPT的PyPTO、simpler和runtime路径：
+
+```bash
+cd /mnt/workspace/inductor/pto/gpt_pypto
+PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 \
+PYTHONPATH=/mnt/workspace/inductor/pto/gpt_pypto/python:\
+/mnt/workspace/inductor/pto/gpt_pypto/runtime/python:\
+/mnt/workspace/inductor/pto/gpt_pypto/runtime \
+runtime/.venv/bin/python -m pytest -q \
+  tests/ut/runtime/test_l1.py \
+  runtime/tests/ut/py/test_l1_chip_worker.py
+```
+
+结果为：
+
+```text
+55 passed, 1 warning in 0.37s
+```
+
+随后对四个`arch × runtime`组合分别重编host、AICPU、AICore，共12套onboard产物：
+
+| 架构 | runtime | host | AICPU | AICore |
+|---|---|---|---|---|
+| A2/A3 | TRB | PASS | PASS | PASS |
+| A2/A3 | HBG | PASS | PASS | PASS |
+| A5 | TRB | PASS | PASS | PASS |
+| A5 | HBG | PASS | PASS | PASS |
+
+这些结果把10.43.14中列出的三类回归门槛全部关闭。`BootstrapDispatcherAsync`在成功提交后、调用`aclrtSynchronizeStream`之前直接返回；三块dispatcher输入在调用launch API前转交给`LoadAicpuOp`，ACL unload/free失败时保留原handle或原指针供显式close重试。正式device 1 ST又直接覆盖了这条异步分支，因此当前证据由源码结构、双架构全编译、无硬件错误分支UT以及真实ACLGraph执行共同组成，而不是依赖单一字符串检查。
+
+上述runtime收口已经形成独立中文提交：
+
+```text
+3631ea0d Fix: 完成TRB L1标准AICPU调度与ACLGraph闭环
+```
+
+该提交没有包含仍未完成的HBG orchestration requirements emitter；相关validator WIP继续留在工作区，避免把“能fail-closed”误写成“HBG已经可用”。
+
+#### 10.43.16 GPT/Grok隔离复核
+
+阶段提交前重新核对两个并行session，结论如下：
+
+- Grok顶层工作树是`/mnt/workspace/inductor/pto/pypto`，分支`main`；其runtime分支是`l1-aclgraph`；
+- GPT顶层工作树是`/mnt/workspace/inductor/pto/gpt_pypto`，顶层和runtime均为`gpt/pypto-l1-aclgraph`；
+- 两边工作目录、runtime目录、build/cache和虚拟环境均是不同inode；
+- GPT的`_task_interface.so`与`pypto/_torch_npu_l1.so`位于`gpt_pypto/runtime/.venv`；
+- 实际导入路径逐项确认：`pypto`来自`gpt_pypto/python/pypto`，`simpler`来自`gpt_pypto/runtime/python/simpler`，两个native扩展也都来自GPT虚拟环境；
+- 用户级`_pypto_editable.pth`仍指向Grok工作树。不能修改它，否则会反向影响另一个session；GPT所有构建和测试因此必须同时设置`PYTHONNOUSERSITE=1`、`PYTHONSAFEPATH=1`和显式GPT `PYTHONPATH`；
+- NPU硬件没有进程级命名空间隔离。GPT命令只传`--device=1`，不使用device 0；运行前仍需检查设备占用。一次复核中`npu-smi`没有列出host进程，`fuser /dev/davinci15`也为空，但两颗device仍显示AICore 100%和残留HBM；这只能表明存在设备侧残留状态，不能归因于Grok正在使用NPU。
+
+因此“代码、Python包、native产物、build cache”已经物理隔离；“device 0/device 1”是明确的session约定和运行前门禁，而不是硬件级namespace。

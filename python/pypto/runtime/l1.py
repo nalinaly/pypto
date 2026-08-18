@@ -239,10 +239,20 @@ def _validate_final_callable_signature(chip_callable: Any, param_infos: Sequence
         if expected is None:
             raise ValueError(f"unsupported L1 parameter direction {info.direction!r} for {info.name!r}")
         actual = chip_callable.sig(index)
-        if actual != expected:
+        # The public program signature owns the API-level mutability contract,
+        # while the assembled signature owns the runtime dependency/access
+        # contract.  Outlining a store into an already-existing output buffer
+        # deliberately represents the child slot as INOUT even when generated
+        # AICore code never reads the old bytes.  That conservative read bit is
+        # harmless for L1's direct-device binder, but changing a read-only
+        # public input into any writer (or losing writability) is not.
+        expected_writable = expected in (ArgDirection.OUT, ArgDirection.INOUT)
+        actual_writable = actual in (ArgDirection.OUT, ArgDirection.INOUT)
+        if expected_writable != actual_writable:
             raise ValueError(
-                f"assembled L1 tensor direction mismatch for {info.name!r}: "
-                f"callable={actual!r}, metadata={expected!r}"
+                f"assembled L1 tensor writability mismatch for {info.name!r}: "
+                f"callable={actual!r}, metadata={expected!r}; final lowering must preserve "
+                "the public read-only versus writable contract"
             )
 
 

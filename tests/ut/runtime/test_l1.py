@@ -562,6 +562,40 @@ def test_final_callable_signature_mismatch_precedes_native_init(tmp_path: Path, 
     assert worker.init_calls == []
 
 
+def test_final_callable_allows_conservative_inout_for_public_out(tmp_path: Path, l1_fakes) -> None:
+    _, worker, _ = l1_fakes
+    program = _compiled(tmp_path, "conservative_output_direction")
+    program._chip_callable._signature[-1] = l1_mod.ArgDirection.INOUT
+
+    ctx = l1_mod.pypto_init(programs=[program], device=1)
+
+    assert len(worker.init_calls) == 1
+    ctx.close()
+
+
+@pytest.mark.parametrize(
+    ("tensor_index", "final_direction"),
+    [
+        (0, l1_mod.ArgDirection.OUT),
+        (0, l1_mod.ArgDirection.INOUT),
+        (1, l1_mod.ArgDirection.IN),
+    ],
+)
+def test_final_callable_rejects_tensor_writability_change_before_native_init(
+    tmp_path: Path,
+    l1_fakes,
+    tensor_index: int,
+    final_direction: Any,
+) -> None:
+    _, worker, _ = l1_fakes
+    program = _compiled(tmp_path, f"writability_mismatch_{tensor_index}_{final_direction}")
+    program._chip_callable._signature[tensor_index] = final_direction
+
+    with pytest.raises(ValueError, match="assembled L1 tensor writability mismatch"):
+        l1_mod.pypto_init(programs=[program], device=1)
+    assert worker.init_calls == []
+
+
 def test_inference_only_rejects_requires_grad_before_prepare(tmp_path: Path, l1_fakes) -> None:
     _, worker, adapter = l1_fakes
     program = _compiled(tmp_path, "autograd")
