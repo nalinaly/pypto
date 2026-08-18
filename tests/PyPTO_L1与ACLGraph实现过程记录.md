@@ -6381,3 +6381,100 @@ adapter     = built against 2.7.1+cpu / 2.7.1.post4
 FP16和不同capture stream的两张graph。因此本轮“有则改之”的具体产物是四个更强的A2/A3设备
 回归case，不是生产实现修补；对比和上板均没有发现一个Grok已正确解决而GPT HEAD仍缺失的A2/A3
 P0/P1代码问题。
+
+### 10.63 GPT实现转正为本地main并隔离保留Grok实现
+
+#### 10.63.1 转正前冻结点
+
+用户确认以GPT工作树作为后续正式实现，并要求把原Grok实现保留到独立分支和独立目录。操作前先确认
+四个仓库均不存在未提交的tracked source变更，冻结点如下：
+
+| 实现 | 仓库 | 转正前分支 | 冻结提交 |
+| --- | --- | --- | --- |
+| GPT | PyPTO顶层 | `gpt/pypto-l1-aclgraph` | `4426b1a7955caf28f04b93728459cefe0b038596` |
+| GPT | `runtime`/simpler | `gpt/pypto-l1-aclgraph` | `f48d7c290e0979f572fa6e55a21f652f04833886` |
+| Grok | PyPTO顶层 | 原本地`main` | `2adf71b1eded56e2d200fdb7b715845130fd97df` |
+| Grok | `runtime`/simpler | 原`l1-aclgraph` | `35a811def1a8da944d69bbdee7207b158550fe6c` |
+
+Grok顶层唯一额外状态是其既有的未跟踪`build.pre-main-upgrade/`，没有把它删除、提交或移动到GPT树。
+本轮没有push任何远端，也没有重写、squash或丢弃任一实现的提交历史。
+
+#### 10.63.2 分支和可见路径的最终关系
+
+先在原Grok顶层和runtime各自建立并checkout `grok/pypto-l1-aclgraph`，再把两个本地`main`引用分别
+fast-forward到GPT冻结提交。随后在同一文件系统内只用目录rename完成可见路径交换，最终关系为：
+
+```text
+/mnt/workspace/inductor/pto/pypto
+  top branch:     main
+  top base HEAD:  4426b1a7955caf28f04b93728459cefe0b038596
+  runtime branch: main
+  runtime HEAD:   f48d7c290e0979f572fa6e55a21f652f04833886
+
+/mnt/workspace/inductor/pto/grok_pypto
+  top branch:     grok/pypto-l1-aclgraph
+  top HEAD:       2adf71b1eded56e2d200fdb7b715845130fd97df
+  runtime branch: grok/pypto-l1-aclgraph
+  runtime HEAD:   35a811def1a8da944d69bbdee7207b158550fe6c
+```
+
+因为当前Git 2.25不提供新版本的完整`worktree repair`能力，而且GPT linked worktree内初始化了
+`runtime`、`libbacktrace`和`msgpack-c`三个子仓，rename后逐一修复了下列管理关系，而不是重新clone或
+复制二进制：
+
+1. GPT顶层`.git`指向移到`grok_pypto/.git/worktrees/gpt_pypto`的共享管理目录；
+2. 共享管理目录的反向`gitdir`指向新的`pypto/.git`；
+3. GPT runtime的`.git`和其admin `core.worktree`都改为新的`pypto/runtime`；
+4. GPT的`libbacktrace`、`msgpack-c`做同样的双向修复；
+5. Grok主worktree随整个目录移动，runtime和`libbacktrace`的相对指针天然仍成立；其`msgpack-c`
+   原来使用绝对路径，改成与另一子仓一致的相对指针。
+
+验证`git worktree list --porcelain`后，Git把`grok_pypto`识别为
+`grok/pypto-l1-aclgraph`，把`pypto`识别为`main`；两边`git submodule status`都精确匹配各自顶层
+gitlink。共享Git admin目录物理上仍位于最初的primary worktree `grok_pypto/.git`，这是linked-worktree
+的管理实现细节，不会改变`/pto/pypto`作为正式main工作目录的分支、源码或构建归属。
+
+#### 10.63.3 构建与Python editable隔离
+
+目录rename后，旧CMake cache仍记录各自原绝对源码路径；如果继续原地使用，Grok cache甚至会把新的
+`/pto/pypto`误当成自己的source。为避免两套实现串产物，没有修改或删除旧cache，而是将默认cache和
+旧GPT虚拟环境移到仓库外的可恢复目录`/mnt/workspace/inductor/pto/worktree_build_backups/`：
+
+```text
+grok-2adf71b1-top-build
+grok-35a811de-runtime-build
+pypto-main-4426b1a7-top-build
+pypto-main-f48d7c29-runtime-build
+pypto-main-f48d7c29-runtime-cpp-ut-build
+pypto-main-f48d7c29-venv
+```
+
+随后在正式`/pto/pypto`下新建Python 3.11 virtualenv，并从当前source分别执行simpler和PyPTO的
+`--no-build-isolation -e`安装。构建过程遵守`.claude/skills/testing/load-env.sh`给出的保守
+`PYPTO_BUILD_JOBS=2`限制；`nanobind`固定为旧环境已经使用的`2.13.0`。新生成的CMake cache根分别是
+`/pto/pypto`和`/pto/pypto/runtime`，editable `.pth`也只包含这两个新路径。实际import来源为：
+
+```text
+pypto          /mnt/workspace/inductor/pto/pypto/python/pypto/__init__.py
+simpler        /mnt/workspace/inductor/pto/pypto/runtime/python/simpler/__init__.py
+pypto_core     /mnt/workspace/inductor/pto/pypto/runtime/.venv/.../pypto_core*.so
+_task_interface /mnt/workspace/inductor/pto/pypto/runtime/.venv/.../_task_interface*.so
+```
+
+没有从旧GPT/Grok build目录复制任何`.so`。Grok树当前也不再有名为`build/`的默认cache；需要复核Grok
+历史实现时必须在`grok_pypto`内部重新配置，因而不会无意链接正式main的source或产物。
+
+#### 10.63.4 转正后的快速回归
+
+在新路径、新virtualenv及显式`PYTHONNOUSERSITE=1`下运行：
+
+```text
+tests/ut/runtime/test_l1.py
+runtime/tests/ut/py/test_l1_chip_worker.py
+
+57 passed, 1 environment warning in 0.27s
+```
+
+warning仍是系统`torch_npu`安装目录中`libop_plugin_atb.so`的owner不匹配提示，与路径交换和本次源码
+无关。至此正式main、Grok保留分支、两个可见目录、嵌套runtime仓、submodule、editable安装和默认build
+目录均完成隔离；后续实现与A2/A3上板默认只在`/mnt/workspace/inductor/pto/pypto`进行。
