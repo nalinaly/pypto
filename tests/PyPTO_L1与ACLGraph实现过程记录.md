@@ -5711,3 +5711,75 @@ clang-format dry-run                               passed
 其中完全不report的core仍属于外部CANN op-timeout、driver fault containment或context/device
 recovery边界。L1单算子既不能内部stream/device sync，也不能reset用户设备；文档继续明确这一点，
 不把无法观察的硬件失联伪装成可由算子内协议修复。
+
+### 10.54 A2/A3越界physical-id predicate的安全等价上板验证
+
+#### 10.54.1 与zero-mapping stage的区别
+
+10.53把实际有效report对应的effective register address置为0，证明了`reg_addr == 0`分支和
+per-core CANCEL，但它没有真正让production predicate计算`physical_core_id >= max`。这两个条件
+虽然最终都不能打开window，代码访问顺序却不同：越界id必须在索引`regs[physical_core_id]`以前被
+拦截，否则测试可能以“成功取消”掩盖一次越界Host/AICPU内存读取。
+
+本轮新增独立`PhysicalCoreId = 15`，不修改实际report内存，而是在读取并确认report原本有效后，
+为本次局部校验构造：
+
+```text
+effective_core_id = platform_get_physical_cores_count()
+effective_reg_addr = 0             // 不执行regs[effective_core_id]
+```
+
+随后调用原本的`aicore_register_mapping_invalid(effective_core_id, max, effective_reg_addr)`。因为
+effective id恰好等于count，真实`physical_core_id < count`上界predicate返回false并进入现有
+CANCEL分支。这个值比任意超大伪值更严格：它直接覆盖off-by-one边界，同时代码的条件表达式保证
+越界时不会求值register-array索引。
+
+#### 10.54.2 仍然要求AIC/AIV双entry与自然错误优先
+
+stage 15复用10.53的AIC/AIV原子type bitmask，但两个stage各自属于独立launch，pre-handshake init
+每代都先清零bitmask。每个stage只对每种core type的首个原本有效report注入；同类型其他core正常
+开window。controlled success仍要求：
+
+- task-local marker和完整blob hash认证通过；
+- AIC bit与AIV bit均置位；
+- leader确实观察到`handshake_failed_`；
+- 没有任何真实report/mapping同时触发`handshake_unexpected_failure_`；
+- 返回值精确等于`-1715`。
+
+因此测试不会因为第一个logical worker属于某一种core而漏掉另一种entry；也不会在真实异常与注入
+同时发生时把自然错误转换成0。两个注入core只收到旧Handshake control line上的GM CANCEL；其余
+已经打开window的core由leader统一`emergency_shutdown()`。
+
+同样采用test-first顺序：先在marker/blob UT、AICPU invocation认证UT和device ST中引用
+`PhysicalCoreId`，首次target build按预期失败：
+
+```text
+error: ‘PhysicalCoreId’ is not a member of ‘simpler::hbg::HbgL1FaultStage’
+```
+
+补齐enum、Host parser、A2/A3 handshake路径和leader精确识别后，定向UT与A2/A3 onboard HBG
+AICPU均构建通过。
+
+#### 10.54.3 device0结果与当前边界
+
+重新构建GPT worktree editable runtime、确认NPU process table为空后，device0完整15阶段矩阵为：
+
+```text
+pytest -q -s tests/st/runtime/l1/test_l1_hbg_fault_injection.py \
+  --platform=a2a3 --device=0
+
+1 passed, 1 deselected in 40.70s
+```
+
+stage 15的caller tail到达，output保持sentinel，紧邻同context正常generation验数为7；全部15项后
+同一context继续完成ACLGraph capture和两次replay，全程无reset。fault变量未设置时再次运行正常
+A2/A3 HBG L1 selection：
+
+```text
+6 passed, 12 deselected in 46.65s
+```
+
+本轮可以把“A2/A3 production physical-id上界predicate、AIC/AIV两entry per-core CANCEL、hidden
+kernel退出、caller tail和下一代恢复”标为已由安全等价注入上板。仍未声称真实硬件/report内存
+损坏的诊断日志或driver行为已经覆盖；完全不report的core也继续属于外部fault containment边界。
+没有修改、构建或运行A5专属路径。
