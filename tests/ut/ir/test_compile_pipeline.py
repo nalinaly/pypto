@@ -9,12 +9,15 @@
 
 """Tests for the shared IR pass pipeline."""
 
+import importlib
 import json
+from pathlib import Path
 
 import pytest
 from pypto import DataType, ir
 from pypto.compile_profiling import CompileProfiler
 from pypto.ir.compile import _run_pass_pipeline
+from pypto.ir.distributed_compiled_program import DistributedConfig
 from pypto.pypto_core import passes
 
 
@@ -69,6 +72,135 @@ def test_compile_validates_platform_before_creating_output(tmp_path):
             _scalar_program(),
             output_dir=str(output_dir),
             platform="invalid",
+            dump_passes=False,
+            skip_ptoas=True,
+        )
+    assert not output_dir.exists()
+
+
+def test_compile_validates_runtime_before_creating_output(tmp_path):
+    output_dir = tmp_path / "must_not_exist"
+    with pytest.raises(ValueError, match="runtime"):
+        ir.compile(
+            _scalar_program(),
+            output_dir=str(output_dir),
+            runtime="unknown",
+            dump_passes=False,
+            skip_ptoas=True,
+        )
+    assert not output_dir.exists()
+
+
+def test_compile_default_output_dirs_are_atomically_unique(tmp_path, monkeypatch):
+    """Two same-second compiles must never share one lazy artifact directory."""
+    compile_mod = importlib.import_module("pypto.ir.compile")
+    real_datetime = compile_mod.datetime
+
+    class FixedDateTime:
+        @staticmethod
+        def now():
+            return real_datetime(2026, 8, 18, 12, 34, 56)
+
+    monkeypatch.setattr(compile_mod, "datetime", FixedDateTime)
+    monkeypatch.setenv("PYPTO_PROG_BUILD_DIR", str(tmp_path))
+    monkeypatch.setattr(compile_mod, "generate", lambda *_args, **_kwargs: {})
+
+    first = ir.compile(_scalar_program(), dump_passes=False, skip_ptoas=True)
+    second = ir.compile(_scalar_program(), dump_passes=False, skip_ptoas=True)
+
+    assert first.output_dir != second.output_dir
+    assert first.output_dir.parent == Path(tmp_path)
+    assert second.output_dir.parent == Path(tmp_path)
+    assert first.output_dir.name == "lower_test_20260818_123456_000000"
+    assert second.output_dir.name == "lower_test_20260818_123456_000000_1"
+
+
+def test_compile_explicit_output_dir_is_runtime_owned(tmp_path, monkeypatch):
+    """Direct compiles cannot mutate one lazy artifact from TRB into HBG."""
+    compile_mod = importlib.import_module("pypto.ir.compile")
+    generate_calls: list[str] = []
+
+    def fake_generate(_program, _output_dir, **kwargs):
+        generate_calls.append(kwargs["runtime"])
+        return {}
+
+    monkeypatch.setattr(compile_mod, "generate", fake_generate)
+    output_dir = tmp_path / "shared"
+    ir.compile(
+        _scalar_program(),
+        output_dir=str(output_dir),
+        runtime="tensormap_and_ringbuffer",
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+
+    with pytest.raises(ValueError, match="owned by runtime.*host_build_graph"):
+        ir.compile(
+            _scalar_program(),
+            output_dir=str(output_dir),
+            runtime="host_build_graph",
+            dump_passes=False,
+            skip_ptoas=True,
+        )
+
+    # Same-runtime explicit rebuilds retain their historical overwrite policy.
+    ir.compile(
+        _scalar_program(),
+        output_dir=str(output_dir),
+        runtime="tensormap_and_ringbuffer",
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+    assert generate_calls == ["tensormap_and_ringbuffer", "tensormap_and_ringbuffer"]
+    assert (output_dir / ".pypto_runtime_owner").read_text() == "tensormap_and_ringbuffer\n"
+
+
+def test_compile_forwards_hbg_runtime_to_codegen(tmp_path, monkeypatch):
+    compile_mod = importlib.import_module("pypto.ir.compile")
+    captured: dict[str, str] = {}
+
+    def fake_generate(_program, _output_dir, **kwargs):
+        captured["runtime"] = kwargs["runtime"]
+        return {}
+
+    monkeypatch.setattr(compile_mod, "generate", fake_generate)
+    ir.compile(
+        _scalar_program(),
+        output_dir=str(tmp_path / "hbg"),
+        runtime="host_build_graph",
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+    assert captured == {"runtime": "host_build_graph"}
+
+
+def test_compile_inherits_distributed_runtime_for_codegen(tmp_path, monkeypatch):
+    compile_mod = importlib.import_module("pypto.ir.compile")
+    captured: dict[str, str] = {}
+
+    def fake_generate(_program, _output_dir, **kwargs):
+        captured["runtime"] = kwargs["runtime"]
+        return {}
+
+    monkeypatch.setattr(compile_mod, "generate", fake_generate)
+    ir.compile(
+        _scalar_program(),
+        output_dir=str(tmp_path / "distributed_hbg"),
+        distributed_config=DistributedConfig(runtime="host_build_graph"),
+        dump_passes=False,
+        skip_ptoas=True,
+    )
+    assert captured == {"runtime": "host_build_graph"}
+
+
+def test_compile_rejects_conflicting_distributed_runtime_before_output(tmp_path):
+    output_dir = tmp_path / "must_not_exist"
+    with pytest.raises(ValueError, match="conflicts with distributed_config.runtime"):
+        ir.compile(
+            _scalar_program(),
+            output_dir=str(output_dir),
+            runtime="tensormap_and_ringbuffer",
+            distributed_config=DistributedConfig(runtime="host_build_graph"),
             dump_passes=False,
             skip_ptoas=True,
         )

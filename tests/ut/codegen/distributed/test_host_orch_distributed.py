@@ -854,7 +854,12 @@ def test_backend_materializes_builtin_next_level_files(tmp_path):
     program = passes.lower_host_tensor_collectives()(program)
     program = passes.materialize_dist_tensor_ctx()(program)
     program = _finalize_chip_program_for_generate(program)
-    files = pto_backend.generate(program, str(tmp_path), skip_ptoas=True)
+    files = pto_backend.generate(
+        program,
+        str(tmp_path),
+        skip_ptoas=True,
+        runtime="host_build_graph",
+    )
 
     base = "next_levels/builtin.tensor.allreduce__sum__fp32"
     assert f"{base}/kernel_config.py" in files
@@ -870,6 +875,7 @@ def test_backend_materializes_builtin_next_level_files(tmp_path):
     assert ".expected_arg_count = 5" in entry_cpp
 
     kernel_config = files[f"{base}/kernel_config.py"]
+    assert '"runtime": "host_build_graph"' in kernel_config
     assert '"aicpu_thread_num": 0' in kernel_config
     assert '"function_name": "aicpu_orchestration_entry"' in kernel_config
     assert '"signature": [_D.INOUT, _D.INOUT]' in kernel_config
@@ -1377,7 +1383,9 @@ def test_host_collective_builtin_template_package_exists(package_name, variant):
     assert templates.is_dir(), f"missing templates/ for {package_name}"
     for name in ("entry.cpp.in", "kernel.cpp.in", "kernel_config.py.in"):
         assert (templates / name).is_file(), f"missing {name} in {package_name}"
-    assert '"aicpu_thread_num": 0' in (templates / "kernel_config.py.in").read_text()
+    config_template = (templates / "kernel_config.py.in").read_text()
+    assert '"runtime": "{{runtime}}"' in config_template
+    assert '"aicpu_thread_num": 0' in config_template
     assert (root / "__init__.py").is_file(), f"missing __init__.py in {package_name}"
     assert variant.startswith("builtin.tensor."), variant
 

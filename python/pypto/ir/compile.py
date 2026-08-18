@@ -15,6 +15,7 @@ from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from pypto._runtime_names import resolve_runtime_name
 from pypto.backend import BackendType
 from pypto.backend.pto_backend import PartialCodegenError, generate
 from pypto.compile_profiling import CompileProfiler, get_active_profiler
@@ -25,6 +26,7 @@ from pypto.pypto_core import passes as _passes
 from .pass_manager import OptimizationStrategy, PassDumpLevel, PassManager
 
 logger = logging.getLogger(__name__)
+_OUTPUT_RUNTIME_OWNER = ".pypto_runtime_owner"
 
 if TYPE_CHECKING:
     from .compiled_program import CompiledProgram
@@ -40,6 +42,41 @@ def _write_files(files: dict[str, str], output_dir: str) -> None:
             os.makedirs(file_dir, exist_ok=True)
         with open(full_path, "w") as f:
             f.write(content)
+
+
+def _claim_output_runtime(output_dir: str, runtime: str) -> None:
+    """Atomically bind one artifact directory to a Simpler runtime.
+
+    ``CompiledProgram`` loads runtime artifacts lazily. Reusing its directory
+    for a different runtime would therefore mutate the meaning of an already
+    returned object. The persistent owner file closes that hole across direct
+    ``ir.compile`` calls, distinct ``@pl.jit`` objects, and host processes.
+    Same-runtime recompilation remains permitted for backward compatibility.
+    """
+    owner_path = os.path.join(output_dir, _OUTPUT_RUNTIME_OWNER)
+    payload = f"{runtime}\n".encode()
+    try:
+        fd = os.open(owner_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    except FileExistsError:
+        try:
+            with open(owner_path, encoding="utf-8") as owner_file:
+                existing = owner_file.read().strip()
+        except OSError as exc:
+            raise RuntimeError(f"cannot read PyPTO runtime owner {owner_path!r}: {exc}") from exc
+        if existing != runtime:
+            detail = existing if existing else "<incomplete concurrent claim>"
+            raise ValueError(
+                f"output_dir {output_dir!r} is owned by runtime {detail!r}, "
+                f"not requested runtime {runtime!r}; use a distinct output directory"
+            )
+        return
+
+    try:
+        written = os.write(fd, payload)
+        if written != len(payload):
+            raise OSError(f"short write while claiming {owner_path!r}: {written}/{len(payload)} bytes")
+    finally:
+        os.close(fd)
 
 
 def _backend_type_for_platform(platform: str | None, fallback: BackendType) -> BackendType:
@@ -197,6 +234,7 @@ def compile(  # noqa: PLR0913
     distributed_config: Any = None,
     analyze_auto_scopes_for_deps: bool = False,
     emit_source_loc: bool | None = None,
+    runtime: str | None = None,
 ) -> "CompiledProgram | DistributedCompiledProgram":
     """Compile a Program through passes and codegen.
 
@@ -263,6 +301,12 @@ def compile(  # noqa: PLR0913
             distributed programs.  When ``None`` (default), auto-detected
             from the program: if L3+ functions are found, a default
             ``DistributedConfig()`` is used.
+        runtime: Simpler runtime to bake into generated artifacts. Supported
+            values are ``"tensormap_and_ringbuffer"`` and
+            ``"host_build_graph"``. ``None`` inherits
+            ``distributed_config.runtime`` when present, otherwise keeps the
+            historical ``tensormap_and_ringbuffer`` default. An explicit value
+            must match ``distributed_config.runtime``.
         analyze_auto_scopes_for_deps: If True, let
             ``AutoDeriveTaskDependencies`` analyze AUTO runtime scopes. The
             default is False to preserve the existing TensorMap-fallback
@@ -283,15 +327,34 @@ def compile(  # noqa: PLR0913
         >>> c = compiled(a, b)          # return style
         >>> compiled(a, b, c, config=RunConfig(device_id=1))  # specify device
     """
+    effective_runtime = resolve_runtime_name(
+        runtime,
+        inherited_runtime=getattr(distributed_config, "runtime", None),
+    )
     _select_backend(backend_type=backend_type, platform=platform)
 
     if output_dir is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         # ``or`` (not get's default arg) so an empty-but-set env var
         # (``export PYPTO_PROG_BUILD_DIR=``) still falls back to build_output
         # rather than writing artifacts into the current working directory.
         base = os.environ.get("PYPTO_PROG_BUILD_DIR") or "build_output"
-        output_dir = os.path.join(base, f"{program.name}_{timestamp}")
+        os.makedirs(base, exist_ok=True)
+        # A JIT function may compile several cache keys (including TRB and HBG)
+        # in the same second.  Each CompiledProgram lazily reads artifacts from
+        # its output directory, so a shared timestamp path would let a later
+        # compile overwrite the earlier object's runtime identity.  Atomically
+        # claim one path so even processes sampling the same clock tick cannot
+        # alias; os.mkdir also preserves the historical umask-based mode.
+        stem = os.path.join(base, f"{program.name}_{timestamp}")
+        collision_index = 0
+        while True:
+            output_dir = stem if collision_index == 0 else f"{stem}_{collision_index}"
+            try:
+                os.mkdir(output_dir)
+                break
+            except FileExistsError:
+                collision_index += 1
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -301,6 +364,7 @@ def compile(  # noqa: PLR0913
         diagnostic_phase=diagnostic_phase,
         memory_planner=memory_planner,
     )
+    _claim_output_runtime(output_dir, effective_runtime)
 
     # --- Compile profiling ---------------------------------------------------
     prof = get_active_profiler()
@@ -350,6 +414,7 @@ def compile(  # noqa: PLR0913
                     skip_ptoas=skip_ptoas,
                     memory_planner=mplan,
                     emit_source_loc=emit_source_loc,
+                    runtime=effective_runtime,
                 )
         except PartialCodegenError as exc:
             _write_files(exc.files, output_dir)
@@ -377,7 +442,7 @@ def compile(  # noqa: PLR0913
         )
 
         if distributed_config is None:
-            distributed_config = DistributedConfig()
+            distributed_config = DistributedConfig(runtime=effective_runtime)
         return DistributedCompiledProgram(
             transformed_program,
             output_dir,

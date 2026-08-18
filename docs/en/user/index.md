@@ -57,6 +57,7 @@ cross-rank overlap.
 | [Compiling a Program](01-language_guide.md) | `ir.compile()` and `JITFunction.compile()`, and inspecting the result |
 | [Running on Device](00-getting_started.md) | Resident device tensors, explicit dispatch, benchmarking, distributed execution |
 | [Torch Codegen Debug Guide](03-torch_codegen_debug.md) | Generating a PyTorch reference implementation from the IR to isolate accuracy problems |
+| [L1 Operators and ACLGraph](04-l1-aclgraph.md) | Borrowed-device single-operator execution, TRB/HBG selection, capture/replay, and lifetime contracts |
 | [Distributed Programming](distributed/index.md) | Symmetric-memory model, collectives, primitives, execution, and debugging for cross-rank programs |
 
 ## What PyPTO gives you
@@ -70,6 +71,7 @@ cross-rank overlap.
 | The full `@pl.jit` family (`.incore`, `.inline`, `.opaque`, `.host`) | [Quickstart](02-quickstart.md), [Functions and Programs](language/01-functions.md) |
 | Hand-written C++ kernel integration | [External Kernels](../dev/language/01-external-kernels.md) |
 | Device-resident tensors, explicit dispatch, benchmarking | [Running on Device](00-getting_started.md) |
+| PyTorch L1 operators and ACLGraph capture/replay | [L1 Operators and ACLGraph](04-l1-aclgraph.md) |
 | Distributed (multi-card) programs and collectives | [Distributed Programming](distributed/index.md) |
 | Accuracy debugging against a PyTorch reference | [Torch Codegen Debug Guide](03-torch_codegen_debug.md) |
 | Compile-time diagnostics and performance hints | [Diagnostics](../dev/passes/92-diagnostics.md) |

@@ -45,6 +45,7 @@ from typing import Any
 
 import torch
 
+from pypto._runtime_names import validate_runtime_name
 from pypto.ir.compiled_program import CompiledProgram, _coerce_args, _to_torch_dtype
 from pypto.pypto_core.ir import CommCtxType, DistributedTensorType, ParamDirection
 
@@ -60,7 +61,6 @@ from .task_interface import (
     torch_dtype_to_datatype,  # pyright: ignore[reportAttributeAccessIssue]
 )
 
-_RUNTIME_NAME = "tensormap_and_ringbuffer"
 _MISSING = object()
 _UINT32_MAX = 2**32 - 1
 _QUEUE_CALL_ABI_VERSION = 1
@@ -102,10 +102,12 @@ class L1InitializationError(RuntimeError):
 class L1Config:
     """Context-wide configuration for the first L1 implementation.
 
-    DFX, SDMA, simulator, distributed execution, HBG and concurrent invocation
-    are intentionally absent.  Ring sizing and the AICPU thread count are
-    provisioned once because the context shares persistent Runtime/workspace
-    state across all declared operators.
+    DFX, SDMA, simulator, distributed execution and concurrent invocation are
+    intentionally absent. The runtime is selected when each program is
+    compiled; one context accepts either TRB or HBG programs, but never mixes
+    the two. Ring sizing and the AICPU thread count are provisioned once because
+    the context shares persistent Runtime/workspace state across all declared
+    operators.
 
     ``use_task_queue=False`` is a low-level bring-up/debug escape hatch.  The
     default taskQueue adapter is required for the supported PyTorch/ACLGraph
@@ -197,9 +199,9 @@ def _current_stream(torch_npu: Any, device: int):
     return torch_npu.npu.current_stream(device)
 
 
-def _build_runtime_binaries(platform: str):
+def _build_runtime_binaries(platform: str, runtime: str):
     runtime_builder = importlib.import_module("simpler_setup.runtime_builder")
-    return runtime_builder.RuntimeBuilder(platform).get_binaries(_RUNTIME_NAME)
+    return runtime_builder.RuntimeBuilder(platform).get_binaries(runtime)
 
 
 def _make_native_worker():
@@ -335,7 +337,7 @@ def _normalize_outputs(out: object, count: int) -> list[torch.Tensor]:
 
 
 class L1Context:
-    """One explicitly owned, non-concurrent L1 context on a borrowed device."""
+    """One explicitly owned, non-concurrent L1 context bound to one runtime."""
 
     # Construction is one validation/ownership transaction; keeping its
     # branches together makes the pre-init versus retained-owner boundary auditable.
@@ -399,6 +401,11 @@ class L1Context:
         platform = unique_programs[0].platform
         if platform not in ("a2a3", "a5"):
             raise ValueError(f"PyPTO L1 requires onboard platform 'a2a3' or 'a5', got {platform!r}")
+        runtime = validate_runtime_name(
+            unique_programs[0].runtime_name,
+            parameter="program runtime",
+        )
+        self._runtime = runtime
 
         baked_aicpu_counts: set[int] = set()
         for callable_id, program in enumerate(unique_programs):
@@ -408,16 +415,19 @@ class L1Context:
                 )
             if _contains_distributed_types(program):
                 raise ValueError("PyPTO L1 v1 does not support CommCtx/DistributedTensor programs")
+            program_runtime = validate_runtime_name(
+                program.runtime_name,
+                parameter=f"program {program.output_dir} runtime",
+            )
+            if program_runtime != runtime:
+                raise ValueError(
+                    f"all L1 programs must use the same runtime; got {runtime!r} and {program_runtime!r}"
+                )
 
             # Loading is host-only compile/assembly work.  Do it for every
             # program before initializing the borrowed native context so a bad
             # artifact cannot leave a partially initialized device owner.
             chip_callable = program.chip_callable
-            if program.runtime_name != _RUNTIME_NAME:
-                raise ValueError(
-                    f"PyPTO L1 v1 requires runtime {_RUNTIME_NAME!r}; "
-                    f"program {program.output_dir} uses {program.runtime_name!r}"
-                )
             if bool(program.runtime_config.get("enable_sdma", False)):
                 raise ValueError("PyPTO L1 v1 does not support SDMA workspace programs")
 
@@ -496,12 +506,13 @@ class L1Context:
             ring_task_window=self._config.ring_task_window,
             ring_heap=self._config.ring_heap,
             ring_dep_pool=self._config.ring_dep_pool,
+            runtime=runtime,
         )
         call_config = unique_programs[0].build_call_config(
             run_config,
             aicpu_thread_num=resolved_aicpu_count,
         )
-        bins = _build_runtime_binaries(platform)
+        bins = _build_runtime_binaries(platform, runtime)
         worker = _make_native_worker()
         self._worker = worker
         try:
@@ -522,6 +533,11 @@ class L1Context:
     @property
     def device(self) -> int:
         return self._device
+
+    @property
+    def runtime(self) -> str:
+        """Runtime implementation shared by every declared operator."""
+        return self._runtime
 
     @property
     def prepared(self) -> bool:
@@ -818,6 +834,10 @@ def pypto_init(
 
     ``device`` is mandatory and must already be the torch_npu current device;
     PyPTO never switches devices on behalf of the caller.
+
+    Every program must target the same onboard platform and the same Simpler
+    runtime. Compile them with ``RunConfig(runtime=...)`` or
+    ``ir.compile(..., runtime=...)`` before constructing the context.
     """
     return L1Context(programs, device=device, config=config)
 

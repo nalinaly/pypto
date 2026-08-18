@@ -663,7 +663,7 @@ output_dir/
 
 | 键 | 何时写入 | 备注 |
 | -- | -------- | ---- |
-| `runtime` | 总是 | 目前为 `"tensormap_and_ringbuffer"`。 |
+| `runtime` | 总是 | `"tensormap_and_ringbuffer"`（默认）或 `"host_build_graph"`；由 `ir.compile(runtime=...)` / `RunConfig.runtime` 选择。 |
 | `aicpu_thread_num` | 总是 (`0`) | `0` 选择 runtime 的架构默认值（a2a3：4；a5：5），调用方也可显式覆盖。 |
 
 ### 参数解包

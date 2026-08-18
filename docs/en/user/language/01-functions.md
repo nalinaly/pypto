@@ -242,8 +242,9 @@ specialization key returns the identical instance.
 `lower(*sample_args)` stops one stage earlier: it runs the passes and returns the
 post-pass `ir.Program`, with no code generation, no `ptoas`, no artifacts, and no cache
 write. Use it to read lowered IR; use `compile()` when codegen itself is what you want to
-check. Both accept `config=RunConfig(...)`, but `lower()` ignores the runtime and artifact
-fields. Details of the compile options and the runtime surface belong to the execution
+check. Both accept `config=RunConfig(...)`, but `lower()` ignores `runtime` and other
+artifact fields. `compile()` treats `runtime` as part of the artifact and JIT cache key.
+Details of the compile options and the runtime surface belong to the execution
 chapter, which is not written yet — for now see
 [Compiling a Program](../01-language_guide.md).
 

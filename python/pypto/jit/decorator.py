@@ -62,6 +62,7 @@ from collections.abc import Callable, Sequence
 from typing import Any, NamedTuple
 
 from pypto._external_source import external_source_digest
+from pypto._runtime_names import DEFAULT_RUNTIME
 from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir
@@ -1456,6 +1457,7 @@ def _run_config_compile_kwargs(run_config: Any) -> dict[str, Any]:
         "diagnostic_phase": run_config.diagnostic_phase,
         "disabled_diagnostics": run_config.disabled_diagnostics,
         "analyze_auto_scopes_for_deps": run_config.analyze_auto_scopes_for_deps,
+        "runtime": run_config.runtime,
     }
     if run_config.save_kernels_dir is not None:
         kwargs["output_dir"] = run_config.save_kernels_dir
@@ -1546,6 +1548,9 @@ class JITFunction:
             call_args_cache)``.  ``None`` until first ``_get_dep_graph()``
             call.  See that method for the tuple's structure.
         _cache: L1 in-memory cache: CacheKey → CompiledProgram (post-pass ir.Program wrapped).
+        _explicit_output_keys: Explicit output directory → CacheKey.  This
+            prevents a later specialization/runtime from overwriting artifacts
+            that an earlier lazy CompiledProgram still owns.
         _source_hash: Lazily-computed hash of func source + all dep sources.
     """
 
@@ -1582,6 +1587,7 @@ class JITFunction:
             | None
         ) = None
         self._cache: dict[CacheKey, Any] = {}  # CacheKey → CompiledProgram
+        self._explicit_output_keys: dict[str, CacheKey] = {}
         self._source_hash: str | None = None
         self._dep_layouts: tuple[tuple[str, str, str], ...] | None = None
 
@@ -2062,6 +2068,7 @@ class JITFunction:
 
         platform = run_config.platform if run_config is not None else None
         strategy = run_config.strategy if run_config is not None else OptimizationStrategy.Default
+        runtime = run_config.runtime if run_config is not None else DEFAULT_RUNTIME
         # distributed_config is baked into the DistributedCompiledProgram and
         # drives per-rank dispatch, so it must split the cache: two @pl.jit.host
         # calls with different device_ids compile to distinct artifacts.
@@ -2086,15 +2093,27 @@ class JITFunction:
             scalar_values=specialization.scalar_values,
             platform=platform,
             strategy=strategy,
+            runtime=runtime,
             distributed_config=distributed_config,
             analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
             memory_planner=memory_planner,
             enable_pypto_l0c_double_buffer=_resolve_enable_pypto_l0c_double_buffer(),
         )
 
+        explicit_output_dir: str | None = None
+        if "output_dir" in compile_kwargs:
+            explicit_output_dir = os.path.realpath(os.path.abspath(os.fspath(compile_kwargs["output_dir"])))
+            previous_key = self._explicit_output_keys.get(explicit_output_dir)
+            if previous_key is not None and previous_key != key:
+                raise ValueError(
+                    f"@pl.jit function {self.__name__!r} cannot compile different cache keys into the same "
+                    f"save_kernels_dir {explicit_output_dir!r}; use distinct directories for different "
+                    "shapes, compile options, or runtimes"
+                )
+
         # L1 cache lookup
         if key not in self._cache:
-            self._cache[key] = self._compile(
+            compiled = self._compile(
                 specialization.tensor_meta,
                 specialization.scalar_values,
                 specialization.scalar_dtypes,
@@ -2103,6 +2122,13 @@ class JITFunction:
                 platform=platform,
                 **compile_kwargs,
             )
+            self._cache[key] = compiled
+            if explicit_output_dir is not None:
+                # Publish ownership only after a successful compile. A failed
+                # compile may leave diagnostics/partial files, but it has not
+                # produced a cached CompiledProgram whose lazy artifacts must
+                # be protected from a later retry.
+                self._explicit_output_keys[explicit_output_dir] = key
 
         # Use bound.arguments (in signature order) so keyword-style calls
         # like kernel(a=x, b=y) are routed correctly regardless of how the

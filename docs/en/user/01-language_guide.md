@@ -20,6 +20,7 @@ output_dir = ir.compile(
     strategy=ir.OptimizationStrategy.Default,  # the only optimization strategy
     dump_passes=True,                          # dump IR snapshots under output_dir/passes_dump/
     backend_type=BackendType.Ascend910B,
+    runtime="tensormap_and_ringbuffer",       # or "host_build_graph"
 )
 ```
 
@@ -32,6 +33,7 @@ output_dir = ir.compile(
 | `skip_ptoas` | `True` / `False` | Skip the ptoas step; emit raw `.pto` (MLIR) instead of compiled C++ wrappers (default `False`) |
 | `output_dir` | path or `None` | If `None`, uses `<base>/<program_name>_<timestamp>`, where `<base>` is `PYPTO_PROG_BUILD_DIR` or `build_output`; created as needed |
 | `verification_level` | `None`, `ir.VerificationLevel.NONE`, `BASIC` | `None` = use the default (`BASIC`, or `PYPTO_VERIFY_LEVEL`) |
+| `runtime` | `None`, `"tensormap_and_ringbuffer"`, `"host_build_graph"` | Runtime baked into generated artifacts. `None` inherits `distributed_config.runtime`, else defaults to TRB; explicit sources must agree |
 
 `ir.compile()` takes more parameters than the ones above — diagnostics, memory planner
 selection, profiling, platform, and distributed configuration among them. The full table
@@ -62,8 +64,11 @@ worker.close()
 ```
 
 - `compile()` honours `config=RunConfig(...)` the same way `__call__` does: compile-side
-  knobs (`strategy`, `dump_passes`, diagnostics, …) are forwarded to `ir.compile()`.
+  knobs (`strategy`, `runtime`, `dump_passes`, diagnostics, …) are forwarded to `ir.compile()`.
   Runtime-side fields (`device_id`, DFX flags) affect dispatch, not the artifact.
+- `runtime` is a compile-side artifact choice despite its name. TRB and HBG generate
+  different `kernel_config.py` files, select different runtime binaries, and occupy
+  different JIT cache entries. `lower()` ignores this field because it emits no artifact.
 - The returned `CompiledProgram` is the object the JIT cache holds, so a later call with
   the same specialization key returns the identical instance.
 - It exposes the full extraction surface — `chip_callable`, `runtime_name`,
@@ -92,3 +97,4 @@ find the pass that changed something you did not expect.
 - [Functions and Programs](language/01-functions.md) — the decorators being compiled.
 - [Pass Manager](../dev/passes/00-pass_manager.md) — the pipeline `strategy` selects.
 - [Torch Codegen Debug Guide](03-torch_codegen_debug.md) — comparing the result against PyTorch.
+- [L1 Operators and ACLGraph](04-l1-aclgraph.md) — using TRB/HBG artifacts as borrowed-device operators.

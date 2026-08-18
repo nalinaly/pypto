@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from pypto.backend import BackendType
+from pypto.ir.distributed_compiled_program import DistributedConfig
 from pypto.pypto_core.passes import MemoryPlanner
 from pypto.runtime.runner import RunConfig, _DfxOpts, compile_program, execute_compiled, run
 
@@ -48,6 +49,32 @@ class TestRunConfigPlatformResolution:
         cfg = RunConfig(platform="a5")
 
         assert cfg.analyze_auto_scopes_for_deps is False
+
+
+class TestRunConfigRuntimeResolution:
+    """Compile runtime selection has one normalized source of truth."""
+
+    def test_default_runtime_remains_trb(self):
+        assert RunConfig().runtime == "tensormap_and_ringbuffer"
+
+    def test_explicit_hbg_runtime_is_accepted(self):
+        assert RunConfig(runtime="host_build_graph").runtime == "host_build_graph"
+
+    def test_distributed_runtime_is_inherited_when_not_explicit(self):
+        cfg = RunConfig(distributed_config=DistributedConfig(runtime="host_build_graph"))
+        assert cfg.runtime == "host_build_graph"
+
+    def test_explicit_runtime_must_match_distributed_runtime(self):
+        with pytest.raises(ValueError, match="conflicts with distributed_config.runtime"):
+            RunConfig(
+                runtime="tensormap_and_ringbuffer",
+                distributed_config=DistributedConfig(runtime="host_build_graph"),
+            )
+
+    @pytest.mark.parametrize("runtime", ["", "unknown", 1])
+    def test_invalid_runtime_is_rejected(self, runtime):
+        with pytest.raises((TypeError, ValueError), match="runtime"):
+            RunConfig(runtime=runtime)
 
 
 class TestRunConfigDfxFlags:
@@ -559,6 +586,22 @@ class TestRunConfigCompileForwarding:
 
         assert captured["memory_planner"] == MemoryPlanner.DSA_RP
 
+    def test_run_forwards_runtime(self, monkeypatch):
+        captured: dict = {}
+
+        class FakeCompiled:
+            pass
+
+        def fake_compile(_program, **kwargs):
+            captured.update(kwargs)
+            return FakeCompiled()
+
+        import pypto.ir as ir_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(ir_mod, "compile", fake_compile)
+        run(object(), config=RunConfig(platform="a2a3sim", runtime="host_build_graph"))
+        assert captured["runtime"] == "host_build_graph"
+
     def test_execute_compiled_accepts_auto_scope_deps_switch(self, tmp_path, monkeypatch):
         captured: dict = {}
 
@@ -665,6 +708,28 @@ class TestRunConfigCompileForwarding:
         )
 
         assert captured["analyze_auto_scopes_for_deps"] is True
+
+    def test_compile_program_forwards_runtime(self, tmp_path, monkeypatch):
+        captured: dict = {}
+
+        def fake_compile(_program, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+        import pypto.ir as ir_mod  # noqa: PLC0415
+        import pypto.runtime.runner as runner_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(ir_mod, "compile", fake_compile)
+        monkeypatch.setattr(runner_mod, "_patch_orchestration_headers", lambda _work_dir: None)
+
+        compile_program(
+            object(),
+            tmp_path,
+            strategy=RunConfig().strategy,
+            backend_type=BackendType.Ascend910B,
+            runtime="host_build_graph",
+        )
+        assert captured["runtime"] == "host_build_graph"
 
 
 # ``execute_on_device`` lives in ``device_runner`` which eagerly imports the

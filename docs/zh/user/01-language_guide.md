@@ -16,6 +16,7 @@ output_dir = ir.compile(
     strategy=ir.OptimizationStrategy.Default,  # 唯一的优化策略
     dump_passes=True,                          # 将 IR 快照写入 output_dir/passes_dump/
     backend_type=BackendType.Ascend910B,
+    runtime="tensormap_and_ringbuffer",       # 或 "host_build_graph"
 )
 ```
 
@@ -28,6 +29,7 @@ output_dir = ir.compile(
 | `skip_ptoas` | `True` / `False` | 跳过 ptoas 步骤；输出裸 `.pto`（MLIR）而非编译好的 C++ 包装（默认 `False`） |
 | `output_dir` | 路径或 `None` | 为 `None` 时使用 `<base>/<program_name>_<timestamp>`，其中 `<base>` 取自 `PYPTO_PROG_BUILD_DIR`，未设则为 `build_output`；目录按需创建 |
 | `verification_level` | `None`、`ir.VerificationLevel.NONE`、`BASIC` | `None` = 使用默认值（`BASIC`，或由 `PYPTO_VERIFY_LEVEL` 覆盖） |
+| `runtime` | `None`、`"tensormap_and_ringbuffer"`、`"host_build_graph"` | 写入生成产物的 runtime。`None` 继承 `distributed_config.runtime`，否则默认 TRB；多个显式来源必须一致 |
 
 `ir.compile()` 的参数不止上面这些 —— 还包括诊断、内存规划器选择、profiling、平台以及分布式配置等。完整的表属于尚未编写的执行章节；在此之前请阅读 `python/pypto/ir/compile.py` 里的签名。
 
@@ -53,7 +55,8 @@ worker.free_tensor(w_dev)
 worker.close()
 ```
 
-- `compile()` 与 `__call__` 一样接受 `config=RunConfig(...)`：编译侧开关（`strategy`、`dump_passes`、诊断……）会转发给 `ir.compile()`。运行时侧字段（`device_id`、DFX 标志）影响的是派发，不影响产物。
+- `compile()` 与 `__call__` 一样接受 `config=RunConfig(...)`：编译侧开关（`strategy`、`runtime`、`dump_passes`、诊断……）会转发给 `ir.compile()`。运行时侧字段（`device_id`、DFX 标志）影响的是派发，不影响产物。
+- `runtime` 虽然名字如此，却是编译产物选择：TRB 与 HBG 生成不同的 `kernel_config.py`、选择不同 runtime binary，并占用不同 JIT cache entry。`lower()` 不生成产物，所以忽略该字段。
 - 返回的 `CompiledProgram` 就是 JIT 缓存持有的那个对象，因此之后用同一特化 key 调用会拿到完全相同的实例。
 - 它暴露完整的提取接口 —— `chip_callable`、`runtime_name`、`runtime_config`、`build_orch_args`、`build_call_config`、`output_dir`、`platform`、`output_indices` —— 因此直接驱动运行时的测试框架无需再写一个 `@pl.program` 包装。
 
@@ -72,3 +75,4 @@ worker.close()
 - [函数与程序](language/01-functions.md) —— 正在被编译的那些装饰器。
 - [Pass Manager](../dev/passes/00-pass_manager.md) —— `strategy` 所选择的流水线。
 - [Torch Codegen 调试指南](03-torch_codegen_debug.md) —— 把结果与 PyTorch 对拍。
+- [L1 算子与 ACLGraph](04-l1-aclgraph.md) —— 把 TRB/HBG 产物作为借用设备的单算子调用。

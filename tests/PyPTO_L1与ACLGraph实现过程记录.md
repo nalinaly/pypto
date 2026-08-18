@@ -2615,6 +2615,8 @@ context registration可以且应该只有一份；task package绝不能因为当
 
 #### 10.34.2 为什么registry跟随AICPU binary lifetime，而不提供reset
 
+> **2026-08-18 后续上板纠正：**本节记录的是当时的设计假设，不是最终事实。后续在同一Host进程中顺序创建第二个HBG L1 context时，`aclrtBinaryUnLoad`已经成功，但标准AICPU scheduler内部加载的runtime DSO及其static registry仍然resident，第二个context的execution-slot registration因而返回`Conflict(status=7)`。最终协议改为“context内immutable，新context在上一context已外部quiesce并close的前提下，用新generation有序reset resident registry”，详见10.45。下文保留用于说明为什么原假设在没有真实上板证据时看似合理，以及为什么后来必须修正。
+
 registration内包含多个device地址。AICPU restore未来会在每次replay前读取它，因此device侧必须存在一个跨task稳定、不可被普通run修改的owner。
 
 本阶段选择把它放在HBG AICPU runtime DSO的静态存储中：
@@ -4244,3 +4246,311 @@ requirements门禁只解决“Host graph build是否会解引用借用tensor数�
 - graph/context/package的销毁顺序满足“外部quiescence后才释放”。
 
 因此当前HBG的`l1_runtime_supported_impl()`仍必须保持0，Python也必须继续拒绝HBG L1。下一步将以这些未证明项为门禁，逐项审计已有`HbgGraphPlan`/launch blob/execution slot/restore链，然后才在device 1上开启能力并执行eager与ACLGraph replay验收。
+
+> **后续状态：**10.44完成requirements producer/consumer闭环后，10.45按上述门禁开启了HBG L1 capability并进行首轮device 1验证。本段“仍必须保持0”是10.44当时的阶段结论，不代表后续工作树的当前开关状态。
+
+### 10.45 HBG L1首轮device 1闭环：ELF namespace隔离与resident registry代际
+
+#### 10.45.1 本轮开启capability的前提与验收拓扑
+
+10.44已经让PyPTO codegen在最终Host orchestration SO中导出`pypto_orchestration_requirements_v1`，且HBG loader只允许“元数据存在、ABI可识别、无Host tensor content read/write”的program进入L1 graph build。在这个fail-closed前提下，本轮才将A2/A3与A5 HBG runtime的`l1_runtime_supported_impl()`开启，并让Python公共路径可以通过`RunConfig(runtime="host_build_graph")`显式选择HBG。默认runtime与旧L2/L3路径不因此改变。
+
+`tests/st/runtime/l1/test_l1_aclgraph.py`的上板验收扩展为两层：
+
+1. 同一用例分别选择TRB与HBG，执行`context.prepare()`、普通eager warmup、外部device synchronize、独立ccapture stream上的`torch.add -> PyPTO L1 -> torch.mul`、三组输入的连续ACLGraph replay；
+2. HBG专项在同一context注册`add`/`mul`两个`@pl.jit` program。两个callable的incore `func_id`都从0开始，但必须保持各自的function-binding snapshot和immutable graph package；两个HBG node在一张ACLGraph中串联，连续replay不得被后一package覆盖。
+
+销毁顺序仍严格保持：先由调用方外部quiesce device，再`graph.reset()`，最后`context.close()`。PyPTO本身不在launch/capture内增加stream/device synchronize。
+
+#### 10.45.2 第一个真实根因：TRB与HBG在标准AICPU scheduler的全局ELF namespace中抢占符号
+
+第一次在同一pytest进程中按“TRB用例在前、HBG用例在后”执行时，HBG AICPU日志报告affinity thread index超出`[0, 1)`。HBG的Host config和invocation bytes本身并没有把worker count设为1，所以不能继续把现象简化成HostArgs copy或cache visibility问题。
+
+对A2/A3 TRB与HBG的实际`libaicpu_kernel.so`执行dynamic-symbol差集后发现，两个SO对外暴露了225个同名C++符号，其中包括：
+
+```text
+AicpuExecutor::init(Runtime *)
+AicpuExecutor::deinit(Runtime *)
+Runtime::Runtime()
+Runtime与scheduler的大量普通C++ helper
+```
+
+HBG SO内对`AicpuExecutor::init/deinit`的调用还保留`R_AARCH64_JUMP_SLOT`重定位和PLT间接调用。CANN标准AICPU scheduler把这些inner runtime SO放进同一个global dynamic-link namespace；TRB先加载后，HBG中本应绑定自己runtime layout的调用被TRB的同名definition抢占。结果是TRB `Runtime`布局去解释HBG runtime bytes，恰好读出了默认1的affinity配置。
+
+这个根因也解释了为什么单独启动HBG进程时可能不复现：问题不在HBG graph image内容，而在同一AICPU scheduler动态链接namespace中的先加载顺序。
+
+#### 10.45.3 产物级隔离：HBG只导出五个CANN entry
+
+修复没有通过改名225个C++ symbol来堆叠维护成本，而是明确缩小HBG AICPU DSO的动态符号边界：
+
+- `RuntimeBuilder`对每个runtime target显式传入`SIMPLER_RUNTIME_NAME`，避免CMake层不知道当前是TRB还是HBG；
+- A2/A3与A5 onboard AICPU CMake只对`host_build_graph`加入version script；
+- `hbg_aicpu_exports.map`只保留CANN真正按名字launch的五个entry：
+
+```text
+simpler_aicpu_exec
+simpler_aicpu_init
+simpler_aicpu_l1_hbg_register_execution_slot
+simpler_aicpu_l1_hbg_register_callable
+simpler_aicpu_l1_hbg_exec
+```
+
+- `simpler_aicpu_execute_l1_hbg_platform`、`aicpu_execute_l1_hbg`、`simpler_aicpu_begin_l1_context`和所有runtime C++ implementation都必须是DSO-local；
+- TRB不使用该version script，因为TRB的device orchestration SO仍需要解析历史runtime API；sim路径也保持原有`RTLD_LOCAL`机制。
+
+重建A2/A3和A5 HBG AICPU产物后，`readelf --dyn-syms`对每个SO都只列出上述5个GLOBAL/DEFAULT function；三个HBG helper均为`LOCAL`，且不再存在`AicpuExecutor::init/deinit`或`Runtime::Runtime` PLT relocation。这是产物级证据，不是仅对CMake文本做字符串断言。
+
+#### 10.45.4 ELF隔离后的上板结果与第二个真实根因
+
+将新HBG runtime通过GPT工作树自己的`RuntimeBuilder` stage到自己的`runtime/build/lib`后，重新在device 1执行整个ST文件。本次结果为：
+
+```text
+2 passed, 1 failed, 3 deselected
+```
+
+这个结果非常关键：同一Host进程中先运行TRB，再运行第一个HBG eager/capture/replay已经全部通过，说明ELF symbol preemption已被实际关闭。失败发生在同一pytest进程继续创建第二个HBG L1 context时，且真正报错的device task是prepare阶段的：
+
+```text
+simpler_aicpu_l1_hbg_register_execution_slot: rejected status=7
+```
+
+`status=7`对应`HbgExecutionSlotRegistryStatus::Conflict`。两次context使用了同一HBG AICPU binary fingerprint，第一context已经按要求外部sync、reset graph并close，但第二context仍然看到第一context的static execution-slot registration。这直接推翻了10.34.2的原假设：
+
+```text
+ACL binary handle unload成功
+≠
+标准AICPU scheduler内部runtime DSO与static registry已经卸载
+```
+
+#### 10.45.5 resident registry的context-generation/reset协议
+
+新协议不允许普通per-run launch reset registry，也不允许后一次dynamic build覆盖前一captured node的package。reset只能发生在明确的新L1 context边界：
+
+1. `ChipWorker` 为每个borrowed-L1 context生成非零generation。这一generation使用主机`CLOCK_MONOTONIC`纳秒值，再用进程内atomic保证同一纳秒创建也严格递增；严格不复用保证只覆盖当前支持的单Host进程顺序context。相较每个进程都从1开始，单调时钟会降低resident DSO跨Host进程保留时的代际别名概率，但这只是best-effort，不是v1跨进程保证；
+2. `InitArgs`在尾部新增`l1_context_generation`。L2/L3与所有legacy路径保持0，不进入新协议；
+3. platform `simpler_aicpu_init`用weak hook调用`begin_l1_context(generation)`。TRB没有该hook，且HBG prelaunch control为0，因此保持原行为；HBG必须提供DSO-local strong hook，缺失时fail-closed；
+4. generation与当前resident generation相同时幂等返回，因为同一context可能因DMA workspace配置再次发布`InitArgs`，这种re-latch不得清空已注册callable；
+5. 更大的新generation只在上一context已外部quiesce、graph已reset、context已close的v1契约下接受；它先将execution-slot与所有callable entry设为`Publishing`作为fail-closed中间态，清空registration bytes，再release-publish`Empty`；
+6. 新context的execution-slot/callable registration task与init task在同一caller stream上有序入队，只能在reset之后发布新trust root。
+
+该协议不是跨进程硬件互斥锁。v1仍然要求同一device同时只有一个live L1 context，并且正式唯一性只覆盖一个Host进程内的顺序context；跨进程并发和跨进程顺序重开都不属于v1保证。如果多个Host进程违反这一契约并发init，新generation可能破坏另一context的resident registry。这一点不得被描述成“PyPTO已支持跨进程并发或可靠跨进程接管”。
+
+#### 10.45.6 无硬件与双架构产物验证
+
+当前generation/reset实现已完成以下无设备验证：
+
+- `test_hbg_execution_slot_registry`新增“reset后acquire为NotReady，新generation registration可发布”反例；
+- `test_hbg_callable_registry`新增“reset后相同callable id可属于新context并使用新hash”反例；
+- generation判定被提取到common `hbg_context_generation.h`，新反例额外覆盖首次begin、同generation幂等re-latch、stale generation不清状态、新generation清空两个registry、null/zero失败不改owner；
+- runtime C++ target全量重建通过；
+- `ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure -j4`结果为`98/98 passed`；
+- A2/A3与A5的TRB/HBG host、AICPU、AICore共12组onboard产物全部重建通过；
+- A2/A3与A5 HBG AICPU SO都只导出5个正式entry，generation hook与HBG runtime implementation均是LOCAL；
+- `test_host_runtime_abi.py::test_hbg_onboard_aicpu_exports_only_cann_entries`把五entry精确集合固化为ELF回归，`--platform=a2a3`与`--platform=a5`各`1 passed`；该测试只读staged SO，不访问设备；
+- `git diff --check`通过。
+
+`ChipWorker` generation从进程内计数器改为主机单调时钟后，又只在GPT工作树的`runtime/.venv`中重建p editable native扩展，编译成功。随后使用显式GPT `PYTHONPATH`执行两组Python反例：
+
+```text
+runtime/tests/ut/py/test_runtime_builder.py
+runtime/tests/ut/py/test_l1_chip_worker.py
+=> 52 passed
+
+tests/ut/runtime/test_l1.py
+tests/ut/runtime/test_run_config.py
+tests/ut/ir/test_compile_pipeline.py
+tests/ut/jit/test_cache.py
+tests/ut/jit/test_decorator.py
+tests/ut/backend/test_kernel_config_signature.py
+tests/ut/codegen/distributed/test_host_orch_distributed.py
+=> 373 passed, 2 skipped
+```
+
+第一组包含RuntimeBuilder的runtime-name CMake透传、L1 init/close所有权与fresh-worker反例；第二组覆盖Python L1便利API、TRB/HBG runtime选择、compile/JIT/cache key透传、distributed codegen与kernel-config signature。两组均未访问NPU。
+
+双语L1用户页加入`mkdocs.yml`后，`tests/lint/check_docs_nav.py`结果为`137 nav entries cover all 137 pages`。当前GPT虚拟环境没有安装`mkdocs`，因此`mkdocs build --strict`未执行；这是工具缺失，不写成页面build已通过。
+
+这些证据证明新尾字段、weak/strong hook、registry reset和version script在A2/A3、A5的编译与Host状态机上自洽，但最后的“同进程顺序创建两个HBG context”仍需再次device 1验证才能关闭。
+
+#### 10.45.7 当前device状态、归因边界与暂停上板
+
+2026-08-18再次只读检查时，`npu-smi info`同时显示：
+
+```text
+device 0 / Phy-ID 14: AICore 100%, HBM 3246 MiB
+device 1 / Phy-ID 15: AICore 100%, HBM 2874 MiB
+NPU process table: No running processes found
+```
+
+Host进程表也没有发现pytest、PyPTO或ACL测试进程；当前shell没有`fuser`命令，因此不伪造device-fd结论。“AICore 100%但没有Host PID”只能说明存在device侧残留、驱动/监控状态或不可见任务，不能证明Grok的另一session正在使用NPU。
+
+device 1曾经运行过本GPT工作树修复前失败的HBG ST，当时AICPU registration早退、hidden AICore已入队的错误闭包尚未完整；因此device 1的当前残留也有可能来自本session自己，不能将其归因给Grok。device 0的来源同样无法凭该读数确定。
+
+遵守“不reset任一设备、device 0不属于GPT session”的边界，本轮在此状态下暂停新的NPU task，只继续Host编译、UT、文档和产物审计。在device 1恢复可验证状态前，不把HBG第二context问题宣称为已上板闭环。
+
+#### 10.45.8 最终Host侧回归、基线失败与并行测试边界
+
+context-generation/reset与ELF隔离完成后，重新从GPT worktree自己的构建目录执行最终无硬件回归。仓库资源限制loader在本机Git 2.25.1上不识别`git rev-parse --path-format=absolute`，会先打印`dirname: unrecognized option '--path-format=absolute ...'`，随后按脚本的unclassified安全默认值给出`PYPTO_BUILD_JOBS=2`和`PYPTO_TEST_JOBS=2`。所有最终CMake构建都显式使用`--parallel 2`；没有根据CPU数量自行放大并发。
+
+runtime C++ UT先重建当前diff，再执行：
+
+```text
+ctest --test-dir tests/ut/cpp/build \
+  -LE requires_hardware --output-on-failure --parallel 2
+=> 98/98 passed
+```
+
+随后在同一GPT runtime worktree中依次重建：
+
+```text
+a2a3 / onboard / tensormap_and_ringbuffer / host,aicpu,aicore
+a2a3 / onboard / host_build_graph          / host,aicpu,aicore
+a5    / onboard / tensormap_and_ringbuffer / host,aicpu,aicore
+a5    / onboard / host_build_graph          / host,aicpu,aicore
+=> 12/12 build passed
+```
+
+输出中的`rtStreamCreate`、`rtKernelLaunchWithHandleV2`、`rtsBinaryUnload`等deprecated warning来自仓库既有CANN API调用；本次generation、version script与registry reset没有新增编译error。两架构HBG AICPU的dynamic symbol集合继续精确等于5个CANN entry，内部generation hook不对外导出。
+
+runtime Python UT的正式结果采用串行执行：
+
+```text
+runtime/.venv/bin/python -m pytest -q runtime/tests/ut
+=> 1096 passed, 15 skipped, 1 warning
+```
+
+曾按机器`PYPTO_TEST_JOBS=2`尝试`xdist -n 2`，结果为`1092 passed, 15 skipped, 4 failed`。四个失败都位于`test_l3_l2_orch_comm.py`的sim hierarchical worker用例，child在`_bootstrap_runtime_globals`中因signal 11退出：
+
+```text
+test_sim_worker_counter_wait_timeout_does_not_poison_region_and_free_is_idempotent[a2a3sim]
+test_sim_worker_counter_wait_timeout_does_not_poison_region_and_free_is_idempotent[a5sim]
+test_sim_worker_region_payload_roundtrip[a2a3sim]
+test_sim_worker_region_payload_roundtrip[a5sim]
+```
+
+这四项脱离xdist后立即`4 passed`，串行全量也全部通过。它们自行fork并加载sim runtime，不能把与xdist worker叠加后的native bootstrap崩溃写成本次L1/HBG回归；最终通过数字只引用上面的串行全量结果。
+
+顶层PyPTO的L1/HBG定向集合在显式GPT `PYTHONPATH`和`xdist -n 2`下结果为：
+
+```text
+tests/ut/runtime/test_l1.py
+tests/ut/runtime/test_run_config.py
+tests/ut/ir/test_compile_pipeline.py
+tests/ut/jit/test_cache.py
+tests/ut/jit/test_decorator.py
+tests/ut/backend/test_kernel_config_signature.py
+tests/ut/codegen/distributed/test_host_orch_distributed.py
+=> 373 passed, 2 skipped
+```
+
+此前还执行过顶层完整`tests/ut -m 'not requires_hardware'`，结果为`9724 passed, 7 skipped, 6 failed`。六项脱离完整suite后仍能稳定复现；对相关实现和测试文件执行`git diff $(git merge-base main HEAD)..HEAD`为空，`git blame`也表明它们来自本分支fork之前的基线提交，而不是L1/HBG diff：
+
+1. `TestLoopCarryRoundtrip::test_signature_memref_base_prints_as_a_string`：当前基线IR打印结果没有以`seed`开头的参数行，测试在`next(...)`处`StopIteration`；
+2. `TestAsyncDispatchHandle::test_interrupted_native_handle_publication_keeps_frame_until_close`；
+3. `TestPreparedSwimlaneTwoPass::test_onboard_reuses_worker_for_graph_then_clean_timing`；
+4. `TestPerCallValidation::test_accepts_device_tensor`；
+5. `TestPerCallValidation::test_scalar_param_forwarded_as_is`；
+6. `TestMultiProgram::test_shared_device_tensor_across_programs`。
+
+后五项的共同原因是基线`DistributedWorker`已经以keyword传递`domain_provider=None`，但旧测试的mock side-effect只接受位置参数，均报`unexpected keyword argument 'domain_provider'`。本次任务不修改`distributed_runner.py`或这些测试，不能为制造“全量绿”而顺手改变无关基线行为；交付时必须同时给出完整suite数字与变更相关定向suite数字。
+
+静态检查结果：
+
+- 顶层18个本次变更Python文件以Ruff 0.15.14的isolated等价配置执行lint与format check，全部通过；
+- runtime 3个变更Python文件lint通过；本机Ruff 0.15.14会重排`test_runtime_builder.py`中多处基线lambda括号，而仓库钉的是0.14.8，因此没有接受这份无关整文件format churn；
+- runtime 15个本次变更C++/header文件全部通过`clang-format --dry-run --Werror`；
+- `tests/lint/check_docs_nav.py`结果为`137 nav entries cover all 137 pages`；
+- `git diff --check`在top与nested runtime均通过；
+- 新增英文L1页147行、中文页134行，均低于500行文档上限；用户明确要求的过程记录属于本任务特例，继续保留完整上下文，不按普通用户文档压缩。
+
+最后再次只读核对设备时，`npu-smi`仍显示physical id 14与15的AICore均为100%，HBM分别约3245 MiB与2874 MiB，但NPU process table为空。遍历所有可见`/proc/<pid>/fd`也没有进程持有`/dev/davinci14`、`/dev/davinci15`、`/dev/davinci_manager`或`/dev/devmm_svm`。Host上存在长期`grok`会话进程，但没有PyPTO/pytest子进程或device fd；因此只能确认“没有可见Host使用者”，不能把device侧残留归因给Grok。当前仍不reset device 0或device 1，也不在AICore 100%的残留状态上提交新的上板任务。
+
+#### 10.45.9 TRB/HBG产物目录的第二层隔离与最新回归
+
+在准备最终提交时，独立集成审查发现了一条与“runtime已经进入JIT cache key”不同的文件系统别名链。原实现的内存cache确实会把TRB和HBG分成两个`CacheKey`，但cache miss默认交给`ir.compile()`创建的目录名只精确到秒：
+
+```text
+build_output/<program_name>_<YYYYmmdd_HHMMSS>
+```
+
+同一个JIT specialization在一秒内先编译TRB、再编译HBG时，两个`CompiledProgram`可能仍指向同一路径。显式复用`RunConfig.save_kernels_dir`时则必然同路径。`CompiledProgram`只保存输出目录，`chip_callable/runtime_name/runtime_config`在首次访问时才延迟执行`compile_and_assemble`；所以第二次编译覆盖`kernel_config.py`和二进制后，先返回的TRB对象也可能被加载成HBG。这不是“cache key少了runtime”，而是两个正确的cache entry共享了错误的artifact owner。
+
+最终采用三层边界，避免改变单次显式保存目录的历史布局：
+
+1. `ir.compile(output_dir=None)`把时间戳扩展到微秒，并通过`os.mkdir`原子重试领取目录；即使多个Host进程采样到相同clock tick，也只有一个能取得无后缀路径，其余使用递增collision suffix。没有采用`tempfile.mkdtemp`，因为它会把目录固定成0700，改变原有umask与同组读取行为；
+2. 每个输出目录在pass/codegen写入前用`O_CREAT|O_EXCL`原子创建`.pypto_runtime_owner`，内容是规范runtime名。任何`@pl.jit`对象、直接`ir.compile`或其他Host进程，只要请求另一runtime，就会在改写artifact前fail-fast。同runtime显式重编译继续保持历史caller-owned覆盖语义；
+3. 单个`JITFunction`额外保存“显式绝对输出路径→CacheKey”的成功编译映射。同一JIT函数即使runtime相同，只要shape、compile option或其他key维度不同，也不能覆盖仍被cache中`CompiledProgram`延迟拥有的目录。失败的compile不会发布这一内存owner，允许同一key修复后重试。
+
+对应新增反例覆盖：固定同一时间戳的两次默认compile得到两个不同目录；直接TRB compile后以相同显式目录请求HBG在第二次`generate`前失败，而同runtime重编译仍允许；同一`JITFunction`用一个显式目录先产生TRB key、再产生HBG key时只发生第一次compile。三项定向结果为`3 passed`。
+
+加入这一隔离后重新执行当前变更相关集合：
+
+```text
+test_compile_pipeline.py
+test_compiled_program.py
+test_jit_compile_extraction.py
+test_cache.py
+test_decorator.py
+test_run_config.py
+test_l1.py
+=> 420 passed
+```
+
+随后重新执行完整顶层无硬件集合：
+
+```text
+runtime/.venv/bin/python -m pytest -q -n 2 \
+  -m 'not requires_hardware' tests/ut
+=> 9731 passed, 3 skipped, 6 failed
+```
+
+六个失败与10.45.8逐项列出的基线失败完全相同：一个IR printer
+`StopIteration`和五个旧`DistributedWorker` mock不接受
+`domain_provider=None`关键字参数；本轮新增的runtime owner、JIT cache、L1和HBG
+用例全部通过。与10.45.8较早的`9724 passed, 7 skipped`相比，通过数增加来自本轮
+新增回归，skip数变化来自当前`-m 'not requires_hardware'`收集结果；不能把完整suite
+写成全绿，也没有为了消除无关红项去修改基线测试。
+
+runtime Python串行全量重新执行为：
+
+```text
+runtime/tests/ut
+=> 1103 passed, 8 skipped, 14 warnings
+```
+
+runtime C++当前树全量无硬件结果仍为`98/98 passed`；其中L1/HBG定向19项全部通过。A2/A3与A5的HBG staged AICPU SO再次用`readelf --dyn-syms`核对，GLOBAL/DEFAULT定义精确等于五个CANN entry，内部`AicpuExecutor`、`Runtime`、generation hook和HBG trampoline没有动态重定位泄漏。十二套CMake cache的`CMAKE_HOME_DIRECTORY`全部指向`pto/gpt_pypto/runtime`，且`SIMPLER_RUNTIME_NAME`分别精确为TRB或HBG；这同时证明当前产物没有从Grok工作树取源码。
+
+本节也收紧generation的事实边界：进程内atomic是v1支持范围内的严格唯一性来源；`CLOCK_MONOTONIC`只让同一Host上跨进程顺序重开时的generation更不容易与resident DSO旧值别名，不构成跨进程lease。v1不保证跨进程并发，也不保证可靠跨进程顺序接管。
+
+最后一次只读设备检查仍显示device 0/physical 14与device 1/physical 15的AICore均为100%，HBM约3246 MiB与2874 MiB，NPU process table为空；Host仅有长期Grok会话本体，没有PyPTO/pytest子进程。因而第二个HBG context与双callable replay的generation修复仍没有最终device 1复验，本节不能把HBG第二阶段状态升级为“全部完成”。
+
+#### 10.45.10 GPT工作树隔离与runtime阶段提交
+
+本轮所有实现、构建和测试都在独立工作树
+`/mnt/workspace/inductor/pto/gpt_pypto`中完成；Grok会话使用的是
+`/mnt/workspace/inductor/pto/pypto`。两套工作树拥有各自的Git index、顶层分支、
+nested runtime分支、虚拟环境editable指向和CMake cache。GPT验证进程实际导入的是：
+
+```text
+/mnt/workspace/inductor/pto/gpt_pypto/python/pypto/__init__.py
+/mnt/workspace/inductor/pto/gpt_pypto/runtime/python/simpler/__init__.py
+```
+
+十二套runtime CMake cache的`CMAKE_HOME_DIRECTORY`也全部指向GPT工作树；因此
+PyPTO、simpler源码和构建产物不会因为Grok在另一会话修改同名文件而串用。两边仍共享
+Git object database、系统CANN安装和物理NPU，这也是设备使用必须单独协调、但文件修改
+不需要互相抢锁的边界。
+
+runtime/simpler的本阶段改动已经形成独立提交：
+
+```text
+f8b9056a Fix: 收口HBG L1运行时代际与ELF隔离
+```
+
+该提交包含HBG AICPU五入口version script、单Host进程内非零递增context
+generation、resident execution-slot/callable registry的新代reset、A2/A3与A5
+capability启用及对应C++/Python/产物ABI反例。提交前验证范围为runtime Python
+`1103 passed, 8 skipped`、C++非硬件`98/98 passed`，以及两架构两runtime三类
+host/AICPU/AICore共十二套构建。提交信息同样明确说明：这些结果不等价于device 1
+上的第二个HBG context已经复验；该项与双callable capture/replay仍是下一次上板的
+硬门槛。

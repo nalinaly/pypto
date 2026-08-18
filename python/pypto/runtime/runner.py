@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from pypto._runtime_names import resolve_runtime_name
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassDumpLevel
 from pypto.pypto_core import backend as _backend_core
@@ -104,7 +105,11 @@ class RunConfig:
             When ``False`` (default), a temporary directory is used and cleaned up.
         save_kernels_dir: Directory to save generated artefacts when *save_kernels*
             is ``True``.  If ``None``, a timestamped directory is created under
-            ``build_output/<program_name>_<timestamp>``.
+            ``build_output/<program_name>_<timestamp>`` and claimed atomically.
+            One ``@pl.jit`` function may not reuse the same explicit directory
+            for different specialization/cache keys (including different
+            runtimes); choose distinct directories instead of overwriting an
+            earlier lazy ``CompiledProgram`` artifact.
         codegen_only: If ``True``, stop after code generation without executing
             on device.  Useful for validating compilation output.
         enable_l2_swimlane: Capture per-task L2 perf records into
@@ -199,6 +204,12 @@ class RunConfig:
             ``0`` list-entry leaves that ring at its default). ``None`` defers
             to the runtime's
             ``PTO2_RING_DEP_POOL`` env var or compile-time default.
+        runtime: Runtime implementation baked into compiled artifacts.
+            ``None`` inherits ``distributed_config.runtime`` when present and
+            otherwise selects ``"tensormap_and_ringbuffer"``. Supported
+            explicit values are ``"tensormap_and_ringbuffer"`` and
+            ``"host_build_graph"``. The value is normalized to a concrete
+            string during initialization.
         distributed_config: Optional L3 distributed-execution config, consumed
             only on the ``@pl.jit`` path. When set, it is forwarded to
             ``ir.compile()`` (via :func:`~pypto.jit.decorator._run_config_compile_kwargs`)
@@ -262,8 +273,13 @@ class RunConfig:
     # Compile ignores this field. Typical value is
     # pypto.runtime.shmem_gloo.make_shmem_domain_provider(...).
     domain_provider: Callable[..., Any] | None = None
+    runtime: str | None = None
 
     def __post_init__(self) -> None:
+        self.runtime = resolve_runtime_name(
+            self.runtime,
+            inherited_runtime=getattr(self.distributed_config, "runtime", None),
+        )
         if self.platform not in ("a2a3sim", "a2a3", "a5sim", "a5"):
             raise ValueError(
                 f"Invalid platform {self.platform!r}. Expected 'a2a3sim', 'a2a3', 'a5sim', or 'a5'."
@@ -419,6 +435,7 @@ def compile_program(  # noqa: PLR0913
     analyze_auto_scopes_for_deps: bool = False,
     memory_planner: MemoryPlanner | None = None,
     enable_pypto_l0c_double_buffer: bool | None = None,
+    runtime: str | None = None,
 ) -> None:
     """Compile *program* to *work_dir* and patch orchestration headers.
 
@@ -437,6 +454,8 @@ def compile_program(  # noqa: PLR0913
         profiling: If ``True``, enable compile profiling.
         analyze_auto_scopes_for_deps: If ``True``, enable compiler-derived task
             dependency analysis for AUTO runtime scopes.
+        runtime: Simpler runtime to bake into the generated artifact. ``None``
+            keeps the historical TRB default.
     """
     from pypto import ir  # noqa: PLC0415
 
@@ -452,6 +471,7 @@ def compile_program(  # noqa: PLR0913
         analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
         memory_planner=memory_planner,
         enable_pypto_l0c_double_buffer=enable_pypto_l0c_double_buffer,
+        runtime=runtime,
     )
     _patch_orchestration_headers(work_dir)
 
@@ -504,6 +524,7 @@ def run(
         profiling=config.compile_profiling,
         analyze_auto_scopes_for_deps=config.analyze_auto_scopes_for_deps,
         memory_planner=config.memory_planner,
+        runtime=config.runtime,
     )
 
     if tensors and not config.codegen_only:

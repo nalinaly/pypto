@@ -2312,6 +2312,7 @@ class TestCompileKwargForwarding:
             compile_profiling=True,
             save_kernels_dir=str(artifacts_dir),
             analyze_auto_scopes_for_deps=True,
+            runtime="host_build_graph",
         )
         kwargs = _run_config_compile_kwargs(cfg)
         assert kwargs["strategy"] == OptimizationStrategy.Default
@@ -2319,6 +2320,7 @@ class TestCompileKwargForwarding:
         assert kwargs["profiling"] is True  # mapped from RunConfig.compile_profiling
         assert kwargs["output_dir"] == str(artifacts_dir)  # from RunConfig.save_kernels_dir
         assert kwargs["analyze_auto_scopes_for_deps"] is True
+        assert kwargs["runtime"] == "host_build_graph"
         assert "diagnostic_phase" in kwargs
         assert "disabled_diagnostics" in kwargs
         # backend_type is derived from `platform` by ir.compile(); not forwarded.
@@ -2393,6 +2395,76 @@ class TestCompileKwargForwarding:
             )
 
         assert key_for(False) != key_for(True)
+
+    def test_resolve_compiled_splits_cache_on_runtime(self, monkeypatch):
+        """The same JIT specialization must compile independently for TRB and HBG."""
+        torch = pytest.importorskip("torch")
+
+        @jit
+        def runtime_kernel(
+            a: pl.Tensor[[128, 128], pl.FP32],
+            c: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+        ):
+            c = a
+            return c
+
+        compile_calls: list[str] = []
+
+        def fake_compile(*_args, **kwargs):
+            compile_calls.append(kwargs["runtime"])
+            return f"compiled-{len(compile_calls)}"
+
+        monkeypatch.setattr(runtime_kernel, "_compile", fake_compile)
+        a = torch.randn(128, 128)
+        c = torch.empty(128, 128)
+
+        def resolve(runtime: str):
+            cfg = RunConfig(runtime=runtime)
+            return runtime_kernel._resolve_compiled((a, c), {"config": cfg})[0]
+
+        first = resolve("tensormap_and_ringbuffer")
+        second = resolve("host_build_graph")
+        third = resolve("tensormap_and_ringbuffer")
+
+        assert compile_calls == ["tensormap_and_ringbuffer", "host_build_graph"]
+        assert len(runtime_kernel._cache) == 2
+        assert first != second
+        assert third == first
+
+    def test_resolve_compiled_rejects_cross_runtime_explicit_output_alias(self, monkeypatch, tmp_path):
+        """Lazy TRB/HBG artifacts may not overwrite one explicit directory."""
+        torch = pytest.importorskip("torch")
+
+        @jit
+        def runtime_kernel(
+            a: pl.Tensor[[128, 128], pl.FP32],
+            c: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+        ):
+            c = a
+            return c
+
+        compile_calls: list[str] = []
+
+        def fake_compile(*_args, **kwargs):
+            compile_calls.append(kwargs["runtime"])
+            return f"compiled-{len(compile_calls)}"
+
+        monkeypatch.setattr(runtime_kernel, "_compile", fake_compile)
+        a = torch.randn(128, 128)
+        c = torch.empty(128, 128)
+        output_dir = str(tmp_path / "shared")
+
+        runtime_kernel._resolve_compiled(
+            (a, c),
+            {"config": RunConfig(runtime="tensormap_and_ringbuffer", save_kernels_dir=output_dir)},
+        )
+        with pytest.raises(ValueError, match="different cache keys.*save_kernels_dir"):
+            runtime_kernel._resolve_compiled(
+                (a, c),
+                {"config": RunConfig(runtime="host_build_graph", save_kernels_dir=output_dir)},
+            )
+
+        assert compile_calls == ["tensormap_and_ringbuffer"]
 
     def test_resolve_compiled_splits_cache_on_distributed_config(self, monkeypatch):
         """Two calls differing only in distributed_config compile distinct artifacts.

@@ -60,6 +60,7 @@ class TestMakeCacheKey:
         scalar_values=None,
         platform=None,
         strategy=None,
+        runtime="tensormap_and_ringbuffer",
         distributed_config=None,
         analyze_auto_scopes_for_deps=False,
         memory_planner=None,
@@ -76,6 +77,7 @@ class TestMakeCacheKey:
             scalar_values=scalar_values or {},
             platform=platform,
             strategy=strategy,
+            runtime=runtime,
             distributed_config=distributed_config,
             analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
             memory_planner=memory_planner,
@@ -100,6 +102,7 @@ class TestMakeCacheKey:
         assert isinstance(scalar_part, tuple)
         assert dist_part is None  # single-chip default
         assert compile_opts == (
+            ("runtime", "tensormap_and_ringbuffer"),
             ("analyze_auto_scopes_for_deps", False),
             ("memory_planner", None),
             ("enable_pypto_l0c_double_buffer", False),
@@ -269,6 +272,18 @@ class TestMakeCacheKey:
             platform="a2a3sim",
         )
         assert k1 == k2
+
+    def test_different_runtimes_cause_miss(self):
+        """TRB and HBG generate different manifests and must never share an artifact."""
+        common = {
+            "param_names": ["a"],
+            "tensor_shapes": {"a": (8, 8)},
+            "tensor_dtypes": {"a": DataType.FP32},
+            "platform": "a2a3",
+        }
+        trb = self._make_key(**common, runtime="tensormap_and_ringbuffer")
+        hbg = self._make_key(**common, runtime="host_build_graph")
+        assert trb != hbg
 
     def test_distributed_config_in_key(self):
         """distributed_config is baked into the artifact, so it must split the key.

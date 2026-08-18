@@ -51,6 +51,7 @@
 | [编译程序](01-language_guide.md) | `ir.compile()` 与 `JITFunction.compile()`，以及检视结果 |
 | [在设备上运行](00-getting_started.md) | 常驻设备张量、显式派发、性能基准、分布式执行 |
 | [Torch Codegen 调试指南](03-torch_codegen_debug.md) | 从 IR 生成 PyTorch 参考实现，用于定位精度问题 |
+| [L1 算子与 ACLGraph](04-l1-aclgraph.md) | 借用设备的单算子执行、TRB/HBG 选择、capture/replay 与生命周期契约 |
 | [分布式编程](distributed/index.md) | 跨 rank 程序的对称内存模型、集合通信、底层原语、执行与调试 |
 
 ## PyPTO 提供了什么
@@ -64,6 +65,7 @@
 | `@pl.jit` 全家族（`.incore`、`.inline`、`.opaque`、`.host`） | [快速上手](02-quickstart.md)、[函数与程序](language/01-functions.md) |
 | 手写 C++ kernel 接入 | [外部 Kernel](../dev/language/01-external-kernels.md) |
 | 设备常驻张量、显式派发、性能基准 | [在设备上运行](00-getting_started.md) |
+| PyTorch L1 算子与 ACLGraph capture/replay | [L1 算子与 ACLGraph](04-l1-aclgraph.md) |
 | 分布式（多卡）程序与集合通信 | [分布式编程](distributed/index.md) |
 | 对照 PyTorch 参考实现做精度定位 | [Torch Codegen 调试指南](03-torch_codegen_debug.md) |
 | 编译期诊断与性能提示 | [诊断](../dev/passes/92-diagnostics.md) |

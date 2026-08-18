@@ -98,6 +98,26 @@ class TestKernelConfigSignature:
         assert _is_valid_python(text)
 
 
+class TestRuntimeConfigSelection:
+    """The selected runtime is baked into every generated artifact manifest."""
+
+    def test_default_runtime_remains_tensormap_and_ringbuffer(self) -> None:
+        text = _generate_config_file(**_base_inputs())
+        assert '"runtime": "tensormap_and_ringbuffer"' in text
+        assert "Runtime configuration for tensormap_and_ringbuffer" in text
+
+    def test_host_build_graph_runtime_is_emitted(self) -> None:
+        text = _generate_config_file(**_base_inputs(), runtime="host_build_graph")
+        assert '"runtime": "host_build_graph"' in text
+        assert "Runtime configuration for host_build_graph" in text
+        assert _is_valid_python(text)
+
+    @pytest.mark.parametrize("runtime", ["", "unknown", 1, None])
+    def test_invalid_runtime_is_rejected(self, runtime) -> None:
+        with pytest.raises((TypeError, ValueError), match="runtime"):
+            _generate_config_file(**_base_inputs(), runtime=runtime)
+
+
 class TestOrchestrationConfigSignature:
     """Regression tests for the ``ORCHESTRATION`` ``signature`` emission.
 

@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover - fallback for older interpreters
 from typing import Any
 
 from pypto._external_source import EXTERNAL_INCLUDE_DIRS_ATTR, decode_external_include_dirs
+from pypto._runtime_names import DEFAULT_RUNTIME, validate_runtime_name
 from pypto.backend._ptoas_locate import PTOAS_RELATIVE_PATHS as _PTOAS_RELATIVE_PATHS
 from pypto.backend._ptoas_locate import find_ptoas_binary as _find_ptoas_binary
 from pypto.backend._ptoas_preprocess import preprocess_ptoas_output as _preprocess_ptoas_output
@@ -839,6 +840,7 @@ def _generate_config_file(
     func_name_to_external_source: dict[str, str] | None = None,
     func_name_to_external_include_dirs: dict[str, tuple[str, ...]] | None = None,
     enable_sdma: bool = False,
+    runtime: str = DEFAULT_RUNTIME,
 ) -> str:
     """Generate kernel_config.py content.
 
@@ -868,6 +870,7 @@ def _generate_config_file(
     ``enable_sdma`` records that at least one emitted kernel consumes the
     runtime-owned SDMA workspace.
     """
+    runtime = validate_runtime_name(runtime)
     func_name_to_signature = func_name_to_signature or {}
     func_name_to_external_source = func_name_to_external_source or {}
     func_name_to_external_include_dirs = func_name_to_external_include_dirs or {}
@@ -878,7 +881,7 @@ def _generate_config_file(
 
     runtime_lines = [
         "RUNTIME_CONFIG = {",
-        '\t"runtime": "tensormap_and_ringbuffer",',
+        f'\t"runtime": "{runtime}",',
         '\t"aicpu_thread_num": 0,',
     ]
     if enable_sdma:
@@ -897,8 +900,8 @@ def _generate_config_file(
 
     lines = [
         *header,
-        "# Runtime configuration for tensormap_and_ringbuffer.",
-        "# AICPU thread count 0 selects the runtime's architecture default (a2a3: 4; a5: 5).",
+        f"# Runtime configuration for {runtime}.",
+        "# AICPU thread count 0 selects the selected runtime's architecture default (a2a3: 4; a5: 5).",
         *runtime_lines,
         "ORCHESTRATION = {",
         f'\t"source": str(_ROOT_DIR / "orchestration" / "{orch_func_name}.cpp"),',
@@ -1292,6 +1295,7 @@ def generate(
     *,
     memory_planner: _passes.MemoryPlanner | None = None,
     emit_source_loc: bool | None = None,
+    runtime: str = DEFAULT_RUNTIME,
 ) -> dict[str, str]:
     """Generate all PTO backend output files (kernels + orchestration + config).
 
@@ -1314,10 +1318,14 @@ def generate(
             MLIR ``loc("file":line:col)`` from the IR Span so ptoas diagnostics
             name the user's source. None reads the ``PYPTO_EMIT_PTO_LOC``
             environment default (on).
+        runtime: Simpler runtime written into each generated
+            ``kernel_config.py``. Supported values are
+            ``"tensormap_and_ringbuffer"`` and ``"host_build_graph"``.
 
     Returns:
         Dict mapping relative file paths to their content.
     """
+    runtime = validate_runtime_name(runtime)
     if memory_planner is None:
         memory_planner = _passes.MemoryPlanner.PYPTO
     if emit_source_loc is None:
@@ -1336,6 +1344,7 @@ def generate(
             skip_ptoas,
             memory_planner=memory_planner,
             emit_source_loc=emit_source_loc,
+            runtime=runtime,
         )
 
     # L2-only program with multiple Orchestrations: emit each as a
@@ -1354,6 +1363,7 @@ def generate(
             skip_ptoas,
             memory_planner=memory_planner,
             emit_source_loc=emit_source_loc,
+            runtime=runtime,
         )
 
     return _generate_single_chip(
@@ -1362,6 +1372,7 @@ def generate(
         skip_ptoas,
         memory_planner=memory_planner,
         emit_source_loc=emit_source_loc,
+        runtime=runtime,
     )
 
 
@@ -1372,6 +1383,7 @@ def _generate_with_distributed(
     *,
     memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
     emit_source_loc: bool = True,
+    runtime: str = DEFAULT_RUNTIME,
 ) -> dict[str, str]:
     """Generate artifacts for a distributed (L3+) program.
 
@@ -1390,7 +1402,7 @@ def _generate_with_distributed(
     cg = _codegen_core.DistributedCodegen()
     orch_code = cg.generate(transformed_program)
     result_files["orchestration/host_orch.py"] = orch_code
-    result_files.update(_materialize_builtin_next_levels(cg.get_builtin_next_level_specs()))
+    result_files.update(_materialize_builtin_next_levels(cg.get_builtin_next_level_specs(), runtime=runtime))
 
     # 2. Each chip-level Orchestration → next_levels/{name}/...
     for func in transformed_program.functions.values():
@@ -1404,6 +1416,7 @@ def _generate_with_distributed(
                 skip_ptoas,
                 memory_planner=memory_planner,
                 emit_source_loc=emit_source_loc,
+                runtime=runtime,
             )
             for path, content in chip_files.items():
                 result_files[f"next_levels/{func.name}/{path}"] = content
@@ -1462,8 +1475,13 @@ def _builtin_template_output_path(template_name: str, variables: dict[str, str])
     return template_name
 
 
-def _materialize_builtin_next_levels(specs: list[Any]) -> dict[str, str]:
+def _materialize_builtin_next_levels(
+    specs: list[Any],
+    *,
+    runtime: str = DEFAULT_RUNTIME,
+) -> dict[str, str]:
     """Render builtin chip-callable templates into the distributed ``next_levels`` layout."""
+    runtime = validate_runtime_name(runtime)
     result_files: dict[str, str] = {}
     for spec in specs:
         template_root = _resolve_builtin_template_dir(spec.template_dir)
@@ -1476,6 +1494,7 @@ def _materialize_builtin_next_levels(specs: list[Any]) -> dict[str, str]:
             "entry": spec.entry_symbol,
             "kernel_name": spec.entry_symbol + "_kernel",
             "template_package": spec.template_dir[1:],
+            "runtime": runtime,
         }
         variables.update(spec.template_vars)
         for template in sorted(templates_dir.iterdir(), key=lambda item: item.name):
@@ -1596,6 +1615,7 @@ def _generate_multi_chip(
     *,
     memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
     emit_source_loc: bool = True,
+    runtime: str = DEFAULT_RUNTIME,
 ) -> dict[str, str]:
     """Generate artifacts for an L2-only program with multiple Orchestrations.
 
@@ -1619,6 +1639,7 @@ def _generate_multi_chip(
             skip_ptoas,
             memory_planner=memory_planner,
             emit_source_loc=emit_source_loc,
+            runtime=runtime,
         )
         for path, content in chip_files.items():
             result_files[f"next_levels/{func.name}/{path}"] = content
@@ -1632,6 +1653,7 @@ def _generate_single_chip(
     *,
     memory_planner: _passes.MemoryPlanner = _passes.MemoryPlanner.PYPTO,
     emit_source_loc: bool = True,
+    runtime: str = DEFAULT_RUNTIME,
 ) -> dict[str, str]:
     """Generate artifacts for a single-chip (L0-L2) program.
 
@@ -1772,6 +1794,7 @@ def _generate_single_chip(
                     func_name_to_external_source,
                     func_name_to_external_include_dirs,
                     enable_sdma=any(_uses_sdma_workspace(func) for func in emitted_incore_funcs),
+                    runtime=runtime,
                 )
         except Exception as e:
             logger.error("Failed to generate orchestration '%s': %s", orch_func.name, e)

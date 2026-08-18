@@ -45,6 +45,8 @@ import contextvars
 import weakref
 from typing import TYPE_CHECKING, Any
 
+from pypto._runtime_names import DEFAULT_RUNTIME
+
 from .runner import RunConfig
 from .runtime_base import Worker
 
@@ -96,7 +98,7 @@ _ACTIVE_WORKERS: contextvars.ContextVar[tuple[ChipWorker, ...]] = contextvars.Co
 # lookup in ``device_runner.execute_on_device`` searches for, so a
 # default-constructed ``with ChipWorker():`` bind-matches a freshly compiled
 # program instead of silently falling through to a one-shot worker.
-_DEFAULT_RUNTIME = "tensormap_and_ringbuffer"
+_DEFAULT_RUNTIME = DEFAULT_RUNTIME
 
 
 class ChipWorker(Worker):

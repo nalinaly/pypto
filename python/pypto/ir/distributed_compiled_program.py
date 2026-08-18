@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from pypto._runtime_names import DEFAULT_RUNTIME
 from pypto.backend import BackendType
 from pypto.pypto_core.ir import ParamDirection, Program, Role, level_to_linqu_level
 from pypto.runtime.device_tensor import DeviceTensor, StackedDeviceTensor
@@ -69,8 +70,10 @@ class DistributedConfig:
             functions. Set this explicitly only when requesting more
             sub-workers than are declared, e.g. for multi-slice or internal
             pipelining scenarios.
-        runtime: Simpler runtime flavour. ``"tensormap_and_ringbuffer"`` (default)
-            enables the tensor-map helpers and the ring-buffer DMA driver.
+        runtime: Simpler runtime baked into every generated chip-level
+            artifact. Supported values are ``"tensormap_and_ringbuffer"``
+            (default) and ``"host_build_graph"``. When this configuration is
+            also supplied through ``RunConfig``, both runtime values must agree.
         aicpu_thread_num: Number of AICPU threads allocated to the simpler
             runtime. ``0`` (default) selects the architecture default (a2a3: 4;
             a5: 5). Explicit normal-run values must be at least 2 and are
@@ -79,7 +82,7 @@ class DistributedConfig:
 
     device_ids: list[int] = field(default_factory=lambda: [0])
     num_sub_workers: int = 0
-    runtime: str = "tensormap_and_ringbuffer"
+    runtime: str = DEFAULT_RUNTIME
     aicpu_thread_num: int = 0
 
 

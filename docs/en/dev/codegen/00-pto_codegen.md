@@ -688,7 +688,7 @@ The orchestration codegen generates identical orchestration C++ code using the P
 
 | Key | When emitted | Notes |
 | --- | ------------ | ----- |
-| `runtime` | Always | Currently `"tensormap_and_ringbuffer"`. |
+| `runtime` | Always | `"tensormap_and_ringbuffer"` (default) or `"host_build_graph"`; selected by `ir.compile(runtime=...)` / `RunConfig.runtime`. |
 | `aicpu_thread_num` | Always (`0`) | `0` selects the runtime's architecture default (a2a3: 4; a5: 5); callers may explicitly override it. |
 
 ### Argument Unpacking

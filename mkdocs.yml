@@ -197,6 +197,7 @@ nav:
       - en/user/01-language_guide.md
       - en/user/00-getting_started.md
       - en/user/03-torch_codegen_debug.md
+      - en/user/04-l1-aclgraph.md
       - Distributed:
           - en/user/distributed/index.md
           - en/user/distributed/00-model.md

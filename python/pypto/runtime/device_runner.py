@@ -47,6 +47,7 @@ from typing import Any
 import torch
 
 from pypto._external_source import kernel_binary_cache_path
+from pypto._runtime_names import DEFAULT_RUNTIME
 
 from ._binary_cache import (
     BinaryCacheContext,
@@ -759,7 +760,7 @@ def _compile_and_assemble_locked(
     runtime_config = getattr(kernel_config, "RUNTIME_CONFIG", {})
     # Default to the runtime that ``pto_backend`` bakes into every generated
     # ``kernel_config.py``; only legacy / hand-written configs omit the key.
-    runtime_name = runtime_config.get("runtime", "tensormap_and_ringbuffer")
+    runtime_name = runtime_config.get("runtime", DEFAULT_RUNTIME)
 
     # Ensure PTO-ISA root
     pto_isa_root = ensure_pto_isa_root(clone_protocol="https")

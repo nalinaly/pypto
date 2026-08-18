@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from pypto._runtime_names import DEFAULT_RUNTIME, validate_runtime_name
 from pypto.pypto_core import DataType
 
 if TYPE_CHECKING:
@@ -146,6 +147,7 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
     enable_pypto_l0c_double_buffer: bool = False,
     tensor_layouts: dict[str, "TensorLayout | None"] | None = None,
     dep_layouts: tuple[tuple[str, str, str], ...] = (),
+    runtime: str = DEFAULT_RUNTIME,
 ) -> CacheKey:
     """Build a cache key for a JIT call site.
 
@@ -177,6 +179,9 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
             Included in the key because the strategy changes the compiled
             artifact; without it, artifacts compiled under different strategy
             values would share one cache entry.
+        runtime: Runtime implementation baked into ``kernel_config.py``.
+            Included because TRB and HBG artifacts select different runtime
+            binaries and must never share an in-memory or on-disk cache slot.
         distributed_config: Optional ``DistributedConfig`` forwarded to
             ``ir.compile()`` on the ``@pl.jit.host`` path. Included in the key
             because it is baked into the resulting
@@ -204,6 +209,7 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
     Returns:
         Hashable CacheKey tuple.
     """
+    runtime = validate_runtime_name(runtime)
     tensor_infos = []
     for name in param_names:
         if name not in tensor_shapes:
@@ -229,6 +235,7 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
 
     dist_key = _freeze(distributed_config) if distributed_config is not None else None
     compile_opts = (
+        ("runtime", runtime),
         ("analyze_auto_scopes_for_deps", analyze_auto_scopes_for_deps),
         ("memory_planner", None if memory_planner is None else str(memory_planner)),
         ("enable_pypto_l0c_double_buffer", enable_pypto_l0c_double_buffer),

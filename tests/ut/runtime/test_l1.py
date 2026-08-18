@@ -146,7 +146,7 @@ def l1_fakes(monkeypatch: pytest.MonkeyPatch):
     worker = _FakeWorker()
     adapter = _FakeAdapter()
     monkeypatch.setattr(l1_mod, "_load_torch_npu", lambda: SimpleNamespace(npu=npu_api))
-    monkeypatch.setattr(l1_mod, "_build_runtime_binaries", lambda _platform: object())
+    monkeypatch.setattr(l1_mod, "_build_runtime_binaries", lambda _platform, _runtime: object())
     monkeypatch.setattr(l1_mod, "_make_native_worker", lambda: worker)
     monkeypatch.setattr(l1_mod, "_load_task_queue_adapter", lambda: adapter)
     # Real CPU tensors give us truthful shapes/strides/data_ptr without NPU
@@ -173,6 +173,37 @@ def test_context_prepares_all_declared_programs_once(tmp_path: Path, l1_fakes) -
     assert npu_api.current_stream_calls == 0
     assert ctx.prepared and first_op.prepared
     ctx.close()
+
+
+def test_context_selects_hbg_runtime_and_binaries(
+    tmp_path: Path,
+    l1_fakes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    build_calls: list[tuple[str, str]] = []
+
+    def fake_build(platform: str, runtime: str):
+        build_calls.append((platform, runtime))
+        return object()
+
+    monkeypatch.setattr(l1_mod, "_build_runtime_binaries", fake_build)
+    program = _compiled(tmp_path, "hbg", runtime_name="host_build_graph")
+    ctx = l1_mod.pypto_init(programs=[program], device=1)
+
+    assert ctx.runtime == "host_build_graph"
+    assert build_calls == [("a2a3", "host_build_graph")]
+    ctx.close()
+
+
+def test_context_rejects_mixed_runtimes_before_native_init(tmp_path: Path, l1_fakes) -> None:
+    _, worker, _ = l1_fakes
+    trb = _compiled(tmp_path, "trb")
+    hbg = _compiled(tmp_path, "hbg", runtime_name="host_build_graph")
+
+    with pytest.raises(ValueError, match="same runtime"):
+        l1_mod.pypto_init(programs=[trb, hbg], device=1)
+
+    assert worker.init_calls == []
 
 
 def test_context_rejects_callable_capacity_before_native_init(tmp_path: Path, l1_fakes) -> None:
@@ -351,7 +382,7 @@ def test_wrong_current_device_fails_before_native_worker_creation(
     ("kwargs", "message"),
     [
         ({"platform": "a2a3sim"}, "requires onboard platform"),
-        ({"runtime_name": "host_build_graph"}, "requires runtime"),
+        ({"runtime_name": "unknown"}, "runtime"),
         ({"runtime_config": {"enable_sdma": True}}, "does not support SDMA"),
         (
             {
