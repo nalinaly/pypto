@@ -5084,3 +5084,124 @@ immutability、四个成功size的full checksum/tail、512/2048压力、双graph
 本轮所有正式HBG与probe均显式使用device1，没有调用`aclrtResetDevice`/`aclrtResetDeviceForce`
 或任何device reset。结束后`npu-smi`仍显示两个physical die的历史AICore 100%与固定HBM、
 process table为空；与运行前观测一致，不能据此归因给Grok，也不能把该计数当作本轮资源泄漏。
+
+### 10.49 HBG L1 task-local no-reset故障矩阵与device0结果
+
+#### 10.49.1 为什么故障请求必须属于单个task package
+
+HBG AICPU binary是resident DSO。若用一个process-global `next_fault`变量控制测试，后一个Host调用、
+另一张captured graph或下一context都可能继承前一次状态，这与本阶段要证明的“每个graph node持有
+自己的tiling-like package”相冲突。runtime提交`eceb3779`因此没有增加新的default-visible
+AICPU导出符号，也没有把fault状态留在registry；它复用第一份`HbgLaunchRegion::reserved`并增加
+私有flag，把marker直接放进每次fresh HostArgs snapshot：
+
+```text
+header.flags                     HBG_LAUNCH_TEST_FAULT_INJECTION
+regions[0].reserved high 32      fixed magic
+regions[0].reserved low 32       versioned HbgL1FaultStage
+plan_hash                        重新覆盖identity + 全descriptor + payload
+其他region.reserved              必须仍为0
+```
+
+环境变量`SIMPLER_INTERNAL_HBG_L1_TEST_FAULT`只由Host在构造本次launch blob时读取；未设置时生成
+的ABI bytes与正常路径完全一致。未知字符串在任何device enqueue前稳定拒绝。validator只有在
+flag与首region合法marker同时存在时才接受非零reserved；marker缺失、magic/stage非法、放在第
+二region、只有marker没有flag都会返回`InvalidRegion`。对应Host UT还证明canonical GraphPlan
+不被修改，只有fresh task snapshot被标记。
+
+#### 10.49.2 多AICPU一致性审查暴露并修正的竞态
+
+第一版实现曾让每个AICPU thread在`run()`入口自行解释marker，而完整blob invalidate/hash验证由
+唯一boot leader稍后完成。这个顺序存在真实风险：若CANN复用task-args地址而不同AICPU cache看到
+不同代际，部分线程可能直接走受控epilogue，其他线程仍等待`classify_ready_`；伪造marker也可能
+在full hash validation之前触发soft-fault返回。
+
+最终实现改成两层可见性协议：
+
+1. public AICPU entry先invalidate并aligned-copy固定header与首region，固定身份解析不做未对齐
+   typed dereference；
+2. 只有boot leader invalidate完整blob、调用`restore_hbg_launch_blob`完成binding、identity、
+   descriptor、bounds、overlap和hash校验；
+3. leader把解析后的stage写入`hbg_fault_stage_`，再用既有`classify_ready_.store(release)`发布；
+4. 其他participant在`classify_ready_.load(acquire)`之后读取同一stage；自然validation error不会
+   设置`hbg_fault_injected_`，因此绝不被测试soft-return吞掉。
+
+该修正由独立只读审查发现，随后重新通过A2/A3与A5 onboard AICPU交叉编译。它不是为了让测试
+“更容易通过”，而是保证故障测试本身不引入一条production中不存在的多线程死锁。
+
+#### 10.49.3 七个实际清理阶段及返回契约
+
+当前task-local hook覆盖：
+
+| stage | 注入位置 | 必须经过的真实收尾 |
+| --- | --- | --- |
+| `restore_copy` | SM已完整copy/publish后，在runtime-arena copy前失败 | peer统一跳过classify/dispatch、逐线程shutdown、completion gate、deinit |
+| `restore_publish` | runtime-arena已copy，在该region cache publish前失败 | 同上；working slot允许部分改写但不发布commit |
+| `after_scheduler_init` | AICore handshake/assignment完成、blob完整restore后，attach/wire前中止 | 所有已分配core由正常shutdown关闭 |
+| `before_classify` | runtime attach/wire和task-count latch完成后 | 不seed ready/wake，仍destroy本轮runtime |
+| `before_dispatch` | 所有peer完成classify barrier后 | 不进入scheduler dispatch，关闭core并销毁runtime |
+| `shutdown` | restore/classify完成但测试刻意不dispatch；真实shutdown成功后注入 | completion gate及runtime destroy继续执行 |
+| `runtime_destroy` | restore/classify完成但测试刻意不dispatch；真实runtime destroy完成后注入 | 所有线程snapshot后last-depart才deinit |
+
+专属错误值为`-1700 - stage`。AICPU只在`hbg_fault_injected_==true`且最终共享错误精确等于本次
+stage错误时，把device task结果转成0；这是为了让同一stream/context继续执行下一代的测试契约。
+任何自然restore/scheduler/runtime错误、错误marker、不同共享error或runtime status仍原样失败，
+不会被环境变量笼统吞掉。`shutdown`/`runtime_destroy`两个case也刻意跳过dispatch，使output
+sentinel能够从Host侧证明该marker确实被device消费，而不是一次未生效的正常成功调用。
+
+审查还发现first-wins `run_error_`可能先被合成stage错误占用，从而遮住另一participant真实的
+`shutdown()`失败。最终代码增加独立`hbg_unexpected_teardown_error_`：每个participant无论当前
+已有何种合成错误，都把首个真实shutdown错误汇合到该槽；所有线程完成finalize后，返回决策先
+检查runtime status和unexpected teardown，再考虑controlled success。于是只有**全部真实shutdown
+成功**时测试钩子才可能返回0。
+
+#### 10.49.4 无硬件与device0实证
+
+无硬件阶段结果：
+
+```text
+test_hbg_launch_blob + test_hbg_aicpu_invocation   2/2 passed
+runtime C++ ctest -LE requires_hardware            99/99 passed
+A2/A3 onboard HBG AICPU + Host                     build passed
+A5 onboard HBG AICPU + Host                        build passed
+A2/A3 sim HBG AICPU + Host                         build passed
+A5 sim HBG AICPU + Host                            build passed
+git diff --check                                    passed
+```
+
+用户随后明确device0不再需要为Grok预留。本轮使用隔离的GPT Python/runtime、Torch 2.7.1、
+Torch-NPU 2.7.1.post4和PTOAS 0.57，在device0执行：
+
+```text
+pytest -q -s tests/st/runtime/l1/test_l1_hbg_fault_injection.py \
+  --platform=a2a3 --device=0
+
+1 passed, 1 deselected in 19.67s
+```
+
+设备日志依次出现stage 1～7的Host注入记录。测试先完成正常warmup；每个stage都先把output填为
+`-777`，enqueue受控HBG L1调用并执行外部`torch_npu.npu.synchronize(0)`。七次同步全部返回，
+output均保持sentinel；随后立即取消环境变量，在**同一个L1Context**再次调用，七次都恢复完整
+working slot并得到`2 + 5 = 7`。全部fault case结束后，仍在同一context创建ACLGraph，使用输入
+11与-3各replay一次，输出分别为16与2。finally严格执行external synchronize、graph reset、
+context close；整个测试及实现没有调用device reset。
+
+随后保持fault环境变量未设置，在device0重跑正常HBG选择集：普通warmup/capture/replay、两个
+callable task package、异步tensor/scalar snapshot、多output/multi-child/internal workspace、
+双graph独立package和同进程第二context generation共`6 passed, 12 deselected in 46.78s`。这证明
+私有flag/validator和新增AICPU状态在默认路径下没有改变既有HBG数值、capture或代际行为。
+
+#### 10.49.5 本轮证据边界
+
+本轮可以把N.10.4的“restore失败统一verdict、不classify/dispatch、hidden AICore完成”标为通过，
+也可以单独记录上述七个stage的caller-tail与same-context恢复通过。但还不能把N.10.8整组标完：
+
+- slot registry NotReady/Publishing/Corrupt/wrong-device、callable缺失和bad fixed header尚未用device
+  hook逐项触发；
+- affinity非法组合、坏`KernelArgs::runtime_args`、AIC/AIV双entry及physical-core mapping故障尚未上板；
+- 当前`after_scheduler_init`是在真实handshake/assign完成后受控中止，没有把assign函数内部每个失败点
+  分别注入；`before_dispatch`也不是scheduler内部执行到一半的任意故障；
+- A5只有交叉编译证据，没有同等级真实hardware结果；完全不report的core仍属于外部
+  op-timeout/driver fault-containment边界。
+
+因此实现加速了关键generation内部闭环，但没有用一个绿色ST替代剩余故障矩阵。

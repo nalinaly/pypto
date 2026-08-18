@@ -2576,6 +2576,17 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 > multi-output、multi-child/internal workspace、双graph和同进程第二context重新从
 > `callable_id=0`注册。以下仅勾选这些证据直接证明的项目；A5、真实HBG最大image、显式
 > mutable-state poison、cache可见性和no-reset fault hook仍未完成。
+>
+> **2026-08-18 device0 no-reset阶段证据：** runtime `eceb3779`增加由每份runtime-owned
+> HostArgs携带、受`plan_hash`保护的task-local fault marker；只有boot leader在刷新并完整
+> 校验blob后才通过已有release/acquire屏障发布统一stage，避免resident全局状态和多AICPU
+> 线程分叉。A2/A3 device0已经连续执行`restore_copy`、`restore_publish`、
+> `after_scheduler_init`、`before_classify`、`before_dispatch`、`shutdown`、
+> `runtime_destroy`七个受控中止点；每次外部device synchronize均返回，pre-dispatch output
+> 保持sentinel，随后同一context的正常generation恢复完整working slot并验数，最后同一context
+> 又完成ACLGraph capture和两次replay。该ST没有调用device reset。它直接闭合restore失败和
+> 这七个stage的tail/reuse证据，但不替代slot/callable/affinity/KernelArgs/physical-core、
+> assign内部或真实scheduler-dispatch内部故障，因此N.10.8对应的大集合checkbox仍按边界保留。
 
 #### N.10.1 placeholder、snapshot与canonical immutability
 
@@ -2608,7 +2619,7 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 - [ ] 第一次执行后用test hook poison ready queue、wake list、completion flags、task state、runtime pointer、mailbox等known mutable spans。
 - [ ] 第二次replay必须从该node的immutable source恢复，不是依赖某些field碰巧未变。
 - [ ] 验证GM heap中所有有语义initializer span每次恢复，而不必要的workspace bytes不强制清零。
-- [ ] restore失败时所有AICPU peer读取统一verdict，不classify/dispatch，hidden AICore安全退出。
+- [x] restore失败时所有AICPU peer读取统一verdict，不classify/dispatch，hidden AICore安全退出。
 
 #### N.10.5 address binding、capacity和cache/order
 
@@ -2632,6 +2643,12 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 - [x] 两个graph顺序replay通过；并发replay不在v1 supported matrix中，文档和test均不声称支持。
 
 #### N.10.8 no-reset故障注入与hidden AICore完成性
+
+- [x] task-local hook在A2/A3 device0覆盖restore copy/publish、scheduler init完成后、classify前、
+  dispatch前、shutdown后和runtime destroy后七个stage；受控错误只有在内部实际命中且共享
+  error等于该stage专属值时才转成测试成功，不吞掉自然错误。
+- [x] 上述七个case逐一证明caller tail可达、无dispatch阶段output保持sentinel、下一次同context
+  合法eager恢复并验数；全部case后同一context继续完成ACLGraph capture与两次replay，全程无reset。
 
 - [ ] slot registry分别处于NotReady、Publishing、CorruptState和wrong-device时，init-latched control仍收到CANCEL，hidden AICore完成，下一次合法调用无需reset。
 - [ ] callable缺失、bad blob/header/identity/placeholder、platform bridge拒绝时，generation建立前CANCEL在A2/A3和A5都可见。
