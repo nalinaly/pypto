@@ -10,6 +10,8 @@
 >
 > 后续完成度审计又把可直接上板的矩阵扩展到runtime scalar与tensor地址异步快照、多输出、多child与内部workspace、两个HBG graph交替replay，以及两个不同HBG context顺序eager/capture/replay。A2/A3、A5在TRB/HBG组合下的lowering和PTOAS完整Host codegen均通过，但这些新增case尚未在device 1执行；large HostArgs边界、runtime args allocator压力、cache多线可见性、memory accounting和N.10.8故障注入仍必须使用专用probe，不能由普通数值ST替代。
 >
+> runtime提交`3575f60b`已增加独立的`tests/st/l1/host_args_probe`：它不调用PyPTO serializer/parser，而由最小AICPU kernel从真实task-args基址核对三个placeholder、完整payload checksum和首/中/尾字节；Host侧可扫描64 KiB～64 MiB、在launch返回后立即poison/free/reuse scratch、捕获两个不同graph并交替replay、制造其他WithHostArgs任务压力并记录HBM。探针强制显式`--device`且不调用device reset；AICPU/Host交叉编译和一字节错位args基址的无设备自检已通过。由于当前device 1仍处于无可见进程但AICore 100%的残留态，探针尚未执行，N.10的device checkbox保持未勾选。
+>
 > 首期范围：onboard、`tensormap_and_ringbuffer`（TRB）、`@pl.program`、静态 shape、PyTorch 直接调用验证。
 >
 > 本文中的接口名是实现建议；编码时可以做小幅命名调整，但不得改变本文确定的所有权、生命周期和流语义。
@@ -2555,6 +2557,8 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 ### N.10 device 1 P0/ST矩阵
 
 本矩阵是第二阶段开工门槛，不并入当前TRB Phase 0的已实现声明。优先使用device 1，device 0留给并行会话。
+
+> **2026-08-18探针快照：** runtime `3575f60b`已经把N.10.1～N.10.3中属于通用CANN WithHostArgs owner的部分做成独立可执行探针，路径为`tests/st/l1/host_args_probe`。默认eager size为64 KiB、1 MiB、16 MiB、64 MiB，默认双graph size为1 MiB/16 MiB、各100次交替replay，并可配置pressure count/size；另有纯Host self-test验证三指针解析、错误placeholder诊断和非对齐typed-access规避。该提交只证明探针本身可构建和Host解析逻辑正确，尚未产生任何device行为证据；以下checkbox只有真实device 1日志、数值结果、错误码、时延与memory accounting齐备后才能更新。
 
 #### N.10.1 placeholder、snapshot与canonical immutability
 

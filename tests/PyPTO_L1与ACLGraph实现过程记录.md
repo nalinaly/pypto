@@ -4642,3 +4642,211 @@ copy与失败边界、capture后args allocator压力/环绕、placeholder实际d
 plan不被原地patch、restore首中尾cache-line可见性、graph destroy前后memory accounting，
 以及N.10.8列出的slot/callable/blob/affinity/KernelArgs/physical-core/scheduler阶段故障注入。
 这些case需要runtime测试入口、trace或fault hook；不能因为普通eager/replay数值正确就勾选。
+
+### 10.47 N.10专用WithHostArgs/placeholder探针
+
+#### 10.47.1 为什么继续增加独立探针，而不是扩大普通PyTorch ST
+
+10.46新增的正式ST可以从最终数值反推“某个captured node大概率保留了自己的地址、
+scalar和HBG package”，但它仍然无法回答CANN参数层的几个关键事实：
+
+1. `aclrtPlaceHolderInfo`修补后的pointer是否真的等于本次runtime-owned task-args基址加
+   `dataOffset`，还是恰好指向了另一份仍存活的Host/device buffer；
+2. `aclrtLaunchKernelWithHostArgs`返回时是否已经完成Host bytes snapshot，还是到
+   `CaptureEnd`、graph instantiate或第一次replay才延迟读取调用方scratch；
+3. variable args经过regular allocator和large/max allocator时是否完整复制到tail，还是
+   只复制了header后仍能让简单数值case看起来正确；
+4. captured graph持有的args allocation是否会被后续大量WithHostArgs task环绕复用；
+5. graph A/B同时存活时，runtime-owned source是否分别保留，而不是二者都指向最后一次
+   Host scratch；
+6. capture、args allocator压力、replay和graph destroy前后的HBM变化是什么，是否存在
+   随replay单调增长的明显泄漏。
+
+这些问题如果直接让production HBG parser回答，会形成“实现用自己的validator证明自己
+正确”的循环证据。因此runtime提交`3575f60b`新增
+`tests/st/l1/host_args_probe`，探针的Host blob、AICPU parser和result ABI都独立于
+`HbgGraphPlan/HbgLaunchBlob/restore_hbg_launch_blob`；它只复用CANN真实
+`aclrtLaunchKernelWithHostArgs`和AICPU动态加载通道。
+
+并行Grok工作树已有的Phase-0 probe被作为只读参考：它已经证明一套custom AICPU inner
+SO bootstrap方式可用，并覆盖caller/hidden双stream event fork/join，但只传固定小参数、
+零placeholder，且退出时调用`aclrtResetDevice`。GPT没有修改或构建该目录，也没有直接复制
+其“reset-owning standalone程序”作为本阶段答案；新的probe只保留必要的dispatcher bootstrap
+事实，专门改成variable HostArgs owner验证，强制显式device并彻底省略reset。
+
+#### 10.47.2 冻结的probe ABI与三份payload
+
+`common/host_args_probe_abi.h`定义两份固定ABI：
+
+```text
+HostArgsProbeHeader = 128 bytes, align 8
+HostArgsProbeResult = 152 bytes, align 8
+payload_count       = 3
+```
+
+header包含magic、major/minor、`header_size/total_size`、invocation id、外部result地址、
+三个待patch的`payload_addr`、三个offset/size、每个payload的expected checksum以及首/中/尾
+expected byte。`payload_addr[0]`固定从offset 40开始，三个8-byte pointer field连续排列；
+Host为每一项分别构造一个`aclrtPlaceHolderInfo`，而不是只用production HBG当前的单pointer
+布局。三个payload覆盖header后的整个args image，最后一个payload的tail精确落在
+`argsSize - 1`，所以device若只复制头部或截断尾部，不能只靠header数值蒙混通过。
+
+payload按invocation id、region id和byte index生成确定性pattern；Host把每一区域完整FNV-1a
+checksum和首/中/尾样本写进header。AICPU不重新推导Host pattern，而是通过patched pointer
+完整遍历实际device bytes，独立产生observed checksum与样本。这种分工同时发现pointer
+patch错误、source串包和tail截断。
+
+AICPU入口不把CANN传入的`void *args`直接cast为`HostArgsProbeHeader *`。它先用byte-copy将
+固定128-byte prefix复制到`alignas(16)`局部对象，再进行typed access；payload仍以
+`uint8_t *`逐字节读取。第一次真实交叉编译曾把局部对象写成`alignas(64)`，HCC明确报
+“requested alignment 64 is larger than 16”；这反向证明probe不能擅自要求AICPU栈支持64
+字节对齐。最终16字节局部对齐高于ABI所需8字节，同时不对CANN task-args base作任何
+64字节假设。
+
+result记录实际`args_base`及`args_base % 64`、三个observed/expected address、checksum和
+样本，并用bit map区分header、region、placeholder、checksum与sample错误。AICPU在成功
+取得result地址后始终返回0，把精确诊断留在device result中；否则泛化为一个AICPU非零
+返回会丢掉“究竟哪个placeholder或tail失败”的原始证据。
+
+#### 10.47.3 Host侧snapshot时点与canonical隔离
+
+每个invocation由两层Host owner组成：
+
+```text
+Invocation::canonical  -- 生成后只读，保存完整hash
+       |
+       +-- deep copy --> writable scratch -- 唯一传给CANN的pointer
+```
+
+eager和capture都只把scratch交给CANN。API返回后立即执行以下顺序：
+
+1. 读取scratch中三个pointer slot，记录CANN是否对Host memory做了可见的原地patch；
+2. 将scratch全部覆盖成`0xa5`；
+3. 释放其allocation；
+4. 立即申请同尺寸Host vector并填`0x5a`，主动制造地址复用机会；
+5. 重新hash canonical，任何被误传给CANN的第1层修改都直接失败。
+
+capture路径有意把第2～4步放在`aclrtLaunchKernelWithHostArgs`返回之后、
+`aclmdlRICaptureEnd`之前。如果CANN只是保存Host pointer并推迟到CaptureEnd读取，graph从
+一开始就会得到poison或reuse bytes；probe不会因为把scratch多保留到CaptureEnd而给错误
+实现额外生命周期。
+
+result buffer在capture前使用同步memset完成，确保capture stream没有一条“外部clear task”
+悬在图边界前。replay时则在同一stream上按`clear result -> execute graph -> synchronize`
+排序，既不改变captured graph，又能验证每次replay真的重新执行AICPU node。
+
+#### 10.47.4 可配置的device矩阵
+
+Host executable没有device默认值，只有显式`--device=<id>`才会调用`aclInit/setDevice`。
+默认参数为：
+
+```text
+eager sizes      = 64 KiB, 1 MiB, 16 MiB, 64 MiB
+graph A/B sizes  = 1 MiB, 16 MiB
+replays          = graph A和B各100次，A/B交替
+pressure         = 512次、每次64 KiB的额外WithHostArgs launch
+```
+
+每个eager size都在launch返回后销毁scratch、外部stream sync后读取result，并记录launch
+返回时延、task完成总时延、Host pointer slot和实际device args base alignment。graph A/B
+使用不同invocation id、不同runtime-owned args allocation与不同external result buffer；捕获
+完成后先插入pressure tasks，随后按A/B/A/B顺序各replay 100次。pressure循环同样每次都
+构造不同payload、立即poison/free source，并在失败时报告“实际成功launch数+ACL error”，
+不把2048或任何内部常量固化成产品规格。
+
+probe在以下阶段调用`aclrtGetMemInfo(ACL_HBM_MEM)`并只记录、不做脆弱的精确delta断言：
+
+- context建立后；
+- capture前；
+- 两个graph capture后；
+- args allocator压力后；
+- 交替replay后；
+- graph destroy并外部quiescence后；
+- 两个external result buffer释放后。
+
+这组数据将用于区分runtime-owned captured args、外部result和binary/context常驻成本；CANN
+allocator可能缓存内存，所以“free bytes必须精确回到某个值”不是预设判据，必须结合重复
+run和增长趋势解释。
+
+CLI允许覆盖所有size/count。README另列出64 MiB captured graph与2048次pressure的独立
+命令，但明确写明2048只是一处测量点，不是CANN/PyPTO规格。真实HBG regular/max image仍
+要由production HBG ST给出实际size后分别代入；generic 64 MiB通过不能替代“真实最大图”
+case。
+
+#### 10.47.5 安全与清理边界
+
+这个程序虽然是standalone ACL probe，仍遵守本项目的设备约束：
+
+- `Options.device_id`初始为-1，缺少`--device`直接打印usage并退出，不存在隐式device0；
+- README明确本分支只在调度且空闲的device1运行，device0留给并行会话；
+- 源码没有`aclrtResetDevice`、stream/device内部reset或capture query；
+- 所有graph replay完成并synchronize后才destroy graph；
+- model、result、AICPU binary、stream、context按反向owner顺序释放；
+- `aclFinalize`只结束该standalone进程自己的ACL全局状态，不被解释成device reset。
+
+probe本身允许显式stream synchronize，因为它是验证工具，需要读取result与划分memory
+accounting阶段；这不改变production L1“launch内部禁止sync”的验收。正式trace仍要单独
+证明PyPTO op body没有sync。
+
+#### 10.47.6 无设备构建和反例自检
+
+提交前使用GPT runtime工作树并先加载测试环境，执行：
+
+```text
+source ../.claude/skills/testing/load-env.sh
+tests/st/l1/host_args_probe/build.sh /tmp/gpt_host_args_probe_build
+```
+
+构建脚本以HCC AArch64 cross compiler生成
+`libhost_args_probe_aicpu.so`，再生成ACL Host executable。两边都使用C++17、
+`-Wall -Wextra -Werror`。`readelf -Ws`确认SO精确导出
+`simpler_host_args_probe_init/run`两个GLOBAL/DEFAULT entry。
+
+同一build还把AICPU parser直接链接进`host_args_probe_self_test`。自检分配4097 bytes，
+有意用`storage.data() + 1`作为args base，手工模拟三个runtime-patched pointer并调用同一
+`simpler_host_args_probe_run`：
+
+1. 完整三region image得到status 0，result中的args地址保持奇数；
+2. 第二个pointer加1后不访问错误地址，而是得到
+   `HOST_ARGS_PROBE_BAD_PLACEHOLDER_1`。
+
+最终输出：
+
+```text
+HOST_ARGS_PROBE_SELF_TEST PASS unaligned_prefix_and_placeholder_diagnostic
+built /tmp/gpt_host_args_probe_build/host_args_probe
+```
+
+编译过程还实际发现并修正两项ABI问题：最初把result误算为160 bytes，编译器证明真实冻结
+布局为152 bytes；最初局部prefix要求64-byte栈对齐，HCC只支持到16并在`-Werror`下拒绝。
+这些失败没有被绕过，而是按真实ABI修正static assertion与parser。
+
+提交前hooks结果：header/license、English-only、large-file、EOF/whitespace、clang-format、
+clang-tidy、cpplint和Markdown lint全部通过；`clang-format --dry-run --Werror`、`bash -n`
+与`git diff --check`也通过。本机没有安装独立`shellcheck`命令，因此没有把“shellcheck未
+执行”写成通过；仓库pre-commit对该脚本的已有检查均已成功。
+
+runtime阶段提交为：
+
+```text
+3575f60b Test: 增加L1 HostArgs与placeholder上板探针
+```
+
+#### 10.47.7 当前证据边界与下一次device1动作
+
+本节只把“缺少工具”推进成“工具已编译、自检并可在显式device上执行”，没有产生任何
+CANN device行为结论。最后检查device1时仍为AICore 100%、HBM 2874 MiB，NPU process
+table为空；无法证明quiescent，所以没有运行probe，也没有运行10.46扩展ST，更没有reset。
+
+因此N.10.1～N.10.3的device checkbox保持原样未勾选。device1恢复空闲后，执行顺序应为：
+
+1. 先运行默认probe矩阵，保存每个size的ACL error、args base alignment、checksum、
+   capture/replay时延和全部memory sample；
+2. 再单独运行64 MiB captured graph与更高pressure count，不能依赖固定2048；
+3. 使用实际HBG regular/max package size重复对应probe point；
+4. 运行10.46的TRB/HBG正式扩展ST，特别是第二context generation与双callable；
+5. 最后进入N.10.4～N.10.8的restore poison、cache多线与no-reset fault hook矩阵。
+
+当前probe不验证HBG leader restore、working slot、scheduler completion gate或hidden AICore
+CANCEL；这些仍必须由production HBG路径和专用fault injection证明，不能因为通用
+WithHostArgs probe未来全绿就省略。
