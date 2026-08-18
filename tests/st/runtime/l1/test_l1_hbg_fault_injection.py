@@ -38,6 +38,7 @@ _FAULT_STAGES = (
     "kernel_args_runtime",
     "physical_core_mapping",
     "physical_core_id",
+    "slot_fallback_control",
 )
 
 

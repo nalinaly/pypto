@@ -2591,15 +2591,17 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 > `post_handshake_init()`成功、AICore window已分配后让`init_rc`失败，并修正该分支原先未逐线程
 > `shutdown()`便进入completion gate的缺口。后续A2/A3专属扩展继续加入`scheduler_assign`、
 > `scheduler_dispatch`、`platform_bridge`、`affinity_inputs`、`kernel_args_runtime`和
-> `physical_core_mapping`和`physical_core_id`，把矩阵扩为15个
+> `physical_core_mapping`、`physical_core_id`和`slot_fallback_control`，把矩阵扩为16个
 > task-local、完整hash认证的stage：assign在core discovery后、assignment前触发；dispatch只有在
 > `dispatch_ready_tasks()`真实publish过任务后触发；后三项分别走generation建立前的平台桥、
 > affinity validator、persistent KernelArgs/Runtime binding拒绝闭包，以及已report core的
 > per-core pre-window CANCEL。两个physical-core stage分别选择一个实际有效的AIC和AIV report，
 > 将effective register mapping视为0，或将effective physical id置为恰好等于平台core count来
 > 驱动真实上界predicate；只有两类entry都实际命中CANCEL且没有并发自然mapping错误时才
-> 允许controlled success。A2/A3 device0现已连续执行
-> 全部15个中止点；每次外部device synchronize均返回，除允许已经publish部分工作量的真实dispatch
+> 允许controlled success。slot fallback stage在完整package与正常KernelArgs均已认证后，刻意绕过
+> per-invocation slot control resolver，只通过`simpler_aicpu_init`提前锁存的context control地址发布
+> CANCEL，以验证registry本身不可用时的独立trust root。A2/A3 device0现已连续执行
+> 全部16个中止点；每次外部device synchronize均返回，除允许已经publish部分工作量的真实dispatch
 > stage外，其余output保持sentinel，随后同一context的正常generation恢复完整working slot并验数，
 > 最后同一context又完成ACLGraph capture和两次replay。该ST没有调用device reset。它不替代
 > slot/callable/bad-blob的未认证自然损坏、真实device KernelArgs篡改、physical-core故障或完全失联
@@ -2676,10 +2678,10 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 - [x] task-local hook在A2/A3 device0覆盖restore copy/publish、真实scheduler init失败、
   scheduler init完成后、classify前、dispatch前、shutdown后、runtime destroy后、assign内部、
   真实scheduler dispatch内部、platform bridge、affinity inputs、KernelArgs/Runtime binding和
-  physical-core mapping和physical-core id共15个stage；
+  physical-core mapping、physical-core id和slot fallback control共16个stage；
   受控错误只有在内部实际命中且共享
   error等于该stage专属值时才转成测试成功，不吞掉自然错误。
-- [x] 上述15个case逐一证明caller tail可达；除真实dispatch内部故障允许已经publish部分工作量外，
+- [x] 上述16个case逐一证明caller tail可达；除真实dispatch内部故障允许已经publish部分工作量外，
   其余case的output保持sentinel；每个case后下一次同context
   合法eager恢复并验数；全部case后同一context继续完成ACLGraph capture与两次replay，全程无reset。
 - [x] `SchedulerAssign`在core discovery完成但尚未调用`assign_cores_to_threads()`时执行
@@ -2691,6 +2693,7 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
   CANCEL并让hidden AICore退出；自然platform/affinity/KernelArgs错误仍返回失败，不能被test flag吞掉。
 
 - [ ] slot registry分别处于NotReady、Publishing、CorruptState和wrong-device时，init-latched control仍收到CANCEL，hidden AICore完成，下一次合法调用无需reset。
+- [x] A2/A3 device0已用独立认证stage绕过正常slot control resolver，只从prepare-time init锁存的fallback地址发布CANCEL；hidden AICore退出、caller tail、同context恢复和最终ACLGraph replay均通过。该证据验证fallback trust root本身，不冒充上一个checkbox四种registry状态都已在device制造。
 - [ ] callable缺失、bad blob/header/identity/placeholder等**未通过完整package认证**的自然错误，generation建立前CANCEL在A2/A3可见；不能把这些损坏伪装成受控success来做测试。
 - [ ] `allowed_count/launch_count`为0、超过 `MAX_GATE_THREADS`或allowed多于launched时，也在真实device路径证明任何线程进入affinity barrier前失败；当前A2/A3 device只注入代表性负数，完整输入矩阵已有no-hardware validator反例。
 - [ ] 真实篡改device `KernelArgs::runtime_args`时，AICPU向registered Runtime写CANCEL，AICore通过第二个trusted Runtime launch参数读取同一control并退出；当前stage只在绑定实际正确时认证并演练同一拒绝闭包，不声称已经安全篡改device内存；AIC/AIV entry仍需分别取证。
@@ -2698,7 +2701,7 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 - [x] A2/A3 device0使用独立stage从真实有效AIC与AIV report出发，把effective physical id置为`platform_get_physical_cores_count()`；production上界predicate在任何register-array索引前拒绝，并通过对应per-core CANCEL退出，两类entry、caller tail、同context恢复和最终replay均通过。
 - [ ] 真实硬件/report内存自身产生越界physical id的故障源测试尚未执行；当前安全等价注入证明bounds/CANCEL执行链，不声称验证内存损坏传播或driver日志。A5相关项已移出当前验收范围。
 - [x] restore、scheduler-init、assign、dispatch、shutdown和runtime-destroy各阶段注入错误，所有有效AICPU participant均完成arrive/finalize/snapshot/depart，只有last-depart清代际状态；A2/A3 device0已经逐点覆盖assign与实际dispatch内部故障。
-- [x] 当前15个受控故障case后caller-stream tail event均可达，context不依赖device reset，随后同context合法eager成功；全部case后同context capture/replay成功。
+- [x] 当前16个受控故障case后caller-stream tail event均可达，context不依赖device reset，随后同context合法eager成功；全部case后同context capture/replay成功。
 - [ ] 完全不进入或不report的硬件core按外部op-timeout/driver恢复边界记录，不伪装成PyPTO算子内可恢复case。
 
 ### N.11 独立硬阻塞：host orchestration的tensor-data依赖

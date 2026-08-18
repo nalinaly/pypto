@@ -5853,3 +5853,67 @@ gate”。仍然保留三项未勾选：
 无法由公共launch sequence表达，且全仓搜索与静态审计未发现正式L1调用这些API；但计划要求的是
 “自动trace/counter”和“延迟扰动”，普通源码审计与正常数值ST不能替代，因此三项继续为空。这个
 校准不会把尚缺证据改写成完成，也不会重新引入A5 gate。
+
+### 10.57 A2/A3 execution-slot fallback control的实机证明
+
+#### 10.57.1 为什么slot内control还不够
+
+正常HBG L1 public AICPU entry先从resident registry取得immutable
+`HbgExecutionSlotRegistration`，再由`outer_runtime_base + prelaunch_control_offset`解析control。
+这足以处理callable/blob/platform等generation前错误，但如果失败对象就是slot registry本身，代码
+不能再信任从该registry读出的base/offset。为此prepare阶段的`simpler_aicpu_init`会在任何slot
+registration/run task之前，把host-owned immutable slot中的control地址锁存到resident AICPU SO；
+`reject_hbg_l1_without_slot()`只能使用这个独立fallback trust root。
+
+此前源码和registry UT证明了地址选择算法，却没有让真实hidden AICore通过fallback地址收到CANCEL。
+新增`SlotFallbackControl = 16`用于补这一条device证据。
+
+#### 10.57.2 不伪造registry损坏，也不吞自然错误
+
+stage 16仍由本次runtime-owned HostArgs携带，先通过完整blob hash/region/placeholder/identity认证。
+代码随后仍读取并验证真实persistent `KernelArgs::runtime_args`；如果自然KernelArgs错误存在，先按
+原逻辑返回失败，绝不进入test success。只有package、callable、slot和KernelArgs全部真实有效，且
+marker精确为stage 16时，代码才刻意：
+
+```text
+不调用 hbg_l1_launch_control(valid_slot)
+  -> 读取 simpler_aicpu_init 锁存的 resident fallback address
+  -> 写 HBG_L1_PRELAUNCH_CANCEL
+  -> cache flush 独立64-byte control line
+  -> 返回controlled task success
+```
+
+这样测试的是**fallback地址来源和device可见性**，不是把registry validator改成接受坏状态。真实
+`NotReady/Publishing/CorruptState/wrong-device`仍由production acquire拒绝并返回自然错误；test
+flag不能绕过这些validator。
+
+同样先增加enum引用、marker UT、完整AICPU invocation认证UT和device ST，第一次build按预期因
+`SlotFallbackControl`尚不存在而失败；补齐common enum/Host parser和A2/A3 helper拆分后，两项
+定向UT、clang-format及A2/A3 onboard HBG AICPU build均通过。
+
+#### 10.57.3 device0结果
+
+重新构建GPT worktree editable runtime、确认NPU process table为空后，A2/A3完整16阶段矩阵：
+
+```text
+pytest -q -s tests/st/runtime/l1/test_l1_hbg_fault_injection.py \
+  --platform=a2a3 --device=0
+
+1 passed, 1 deselected in 42.52s
+```
+
+stage 16若fallback地址为0、错误或未被AICore读取，hidden kernel不会完成，caller stream的done wait
+也不会返回；因此绿色结果直接证明prepare-time latch→resident fallback→control flush→hidden
+AICore exit这条链。output保持sentinel，紧邻同context正常generation得到7，全部16项后同一
+context继续完成ACLGraph capture/replay，全程无reset。
+
+fault环境变量未设置时再次运行A2/A3正常HBG L1 selection：
+
+```text
+6 passed, 12 deselected in 46.66s
+```
+
+计划N.10.8因此新增一条已完成的fallback trust-root证据，但仍没有把
+NotReady/Publishing/CorruptState/wrong-device四种真实registry状态整体勾选。要覆盖它们，必须
+保持validator自然拒绝语义，同时另行决定如何观察CANN task非零返回后的context/device状态；不能
+为了让ST继续执行而把未认证registry错误改成0。本轮继续没有修改、构建或运行A5专属路径。
