@@ -5783,3 +5783,73 @@ A2/A3 HBG L1 selection：
 kernel退出、caller tail和下一代恢复”标为已由安全等价注入上板。仍未声称真实硬件/report内存
 损坏的诊断日志或driver行为已经覆盖；完全不report的core也继续属于外部fault containment边界。
 没有修改、构建或运行A5专属路径。
+
+### 10.55 stage 15提交后的source guard与跨runtime兼容性复验
+
+runtime与顶层分别提交stage 15后，runtime源码HEAD从editable extension内记录的`2c594f97`推进到
+`8f238f74`。第一次启动TRB L1 ST时，测试体和NPU launch都尚未发生，
+`simpler.task_interface._assert_bindings_match_source_tree()`就在conftest import阶段拒绝加载：
+
+```text
+ImportError: _task_interface was built from 2c594f979cc8,
+but this source tree is at 8f238f743205.
+Rebuild: pip install --no-build-isolation -e .
+```
+
+这是预期的ABI/source guard生效，不是TRB功能失败。继续只在
+`/mnt/workspace/inductor/pto/gpt_pypto/runtime/.venv`执行editable rebuild，未安装到系统或Grok
+工作树；重建后用显式GPT `PYTHONPATH`重跑A2/A3 TRB L1/ACLGraph选择集：
+
+```text
+3 passed, 15 deselected in 10.46s
+```
+
+随后复验共享本轮HBG scheduler代码的L2 vector scene。第一次从top仓误用了
+`tests/st/a2a3/...`路径；真实scene位于runtime子仓，因目录不存在而没有加载runtime ST conftest，
+pytest只报告`--platform/--device/--runtime/--level`参数未知，同样没有发NPU task。改为从
+`/mnt/workspace/inductor/pto/gpt_pypto/runtime`执行正确命令：
+
+```text
+.venv/bin/python -m pytest -q \
+  tests/st/a2a3/host_build_graph/vector_example \
+  --platform a2a3 --device 0 --runtime host_build_graph --level 2
+
+1 passed in 9.68s
+```
+
+因此stage 14/15对A2/A3 HBG handshake的test-only扩展没有改变TRB L1 capture/replay，也没有改变
+fault marker为空时的HBG L2 scheduler行为。两次前置失败都发生在pytest collection/CLI解析阶段，
+不能计作device失败或reset恢复；正式复验全程仍未调用device reset。
+
+### 10.56 将附录L从编码前模板校准为当前A2/A3实施状态
+
+设计计划附录L最初用于实现前评审，长期保留了大量空checkbox。随着第一阶段和HBG第二阶段已经
+落地，继续保留所有空框会产生两种相反误导：一是把已由源码与上板证明的ABI/所有权/stream语义
+误读为尚未实现；二是让真正缺少自动trace或延迟扰动的项目淹没在模板噪声中。
+
+本轮没有根据“看起来应该完成”批量勾选，而是重新对照当前权威证据：
+
+- native C ABI、mandatory caller stream和borrowed mode：`pto_runtime_c_api.h`、
+  `c_api_shared.cpp`及mode/ABI/failure UT；
+- resource ownership和retry close：`L1ExecutionState::Closing`、L1-only allocator/KernelArgs/
+  runtime state、explicit close fault UT；
+- task snapshot：AICPU WithHostArgs、persistent AICore args、连续四次异步tensor/scalar address/value
+  device0 ST；
+- 固定单算子fork/join：`L1LaunchSequenceOps`的可表达操作集合及exact-order/failure-close UT；
+- capture语义：A2/A3 TRB/HBG独立capture stream、图内PyTorch→L1→PyTorch和连续replay；
+- Python/taskQueue：独立adapter、`.stream(false)`、queue lease、default allocator `recordStream`、
+  explicit `out=`/forward-only/close反例和中英文用户文档；
+- 兼容性：A2/A3 device0的TRB/HBG L1、HBG/TRB L2与单卡L3定向路径。
+
+据此，附录L.1～L.5和L.6已有直接证据的项目已改为`[x]`，并在清单顶部明确“当前只以A2/A3为
+gate”。仍然保留三项未勾选：
+
+1. 对launch禁止项提供自动化runtime trace/counter；
+2. trace/counter明确证明capture query、model attach、private AICPU launch与early mode均为0；
+3. eager/ACLGraph专门加入延迟predecessor和延迟AICore tail的entry/exit扰动，而不只依赖正常
+   PyTorch pre-op/L1/post-op数值顺序。
+
+当前源码的allocation-free operation table让sync、allocation、capture inspection和model attach
+无法由公共launch sequence表达，且全仓搜索与静态审计未发现正式L1调用这些API；但计划要求的是
+“自动trace/counter”和“延迟扰动”，普通源码审计与正常数值ST不能替代，因此三项继续为空。这个
+校准不会把尚缺证据改写成完成，也不会重新引入A5 gate。

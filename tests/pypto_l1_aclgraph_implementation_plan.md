@@ -2111,84 +2111,89 @@ v1 契约仍禁止并发 replay，但需观察两个图共享 context events时 
 
 ## 附录 L：实现和评审检查清单
 
+> **2026-08-18 A2/A3-only实施审计：** 本清单最初是编码前模板，早期一直保留空框，因此不能再
+> 用“未勾选”推断源码未实现。以下勾选只依据当前源码、no-hardware反例和A2/A3 device0/device1
+> 证据；A5已按用户要求移出当前验收范围。仍缺自动trace或专项扰动证据的项目继续保持未勾选，
+> 不用普通数值正确性代替。
+
 ### L.1 Native API
 
-- [ ] L1 symbol在所有 variant可解析，unsupported返回明确。
-- [ ] L1/L2 mode互斥，旧 ABI没有签名变化。
-- [ ] caller stream是 mandatory native入参。
-- [ ] L1 launch没有 `RuntimeHandle`、poll、wait、finalize-run概念。
-- [ ] 所有 pre-enqueue validation在第一个 runtime task之前完成。
-- [ ] partial enqueue后 sticky poison。
+- [x] L1 symbol在A2/A3相关variant可解析，unsupported返回明确；A5不在当前gate。
+- [x] L1/L2 mode互斥，旧 ABI没有签名变化。
+- [x] caller stream是 mandatory native入参。
+- [x] L1 launch没有 `RuntimeHandle`、poll、wait、finalize-run概念。
+- [x] 所有host输入/descriptor validation在第一个runtime task之前完成；runtime enqueue自身失败按下一项处理。
+- [x] partial enqueue后 sticky poison。
 
 ### L.2 Resource ownership
 
-- [ ] device/context/caller stream从不由 L1销毁。
-- [ ] hidden stream/events只在 init创建、close销毁。
-- [ ] workspace/arena/KernelArgs/Runtime在 capture前固定地址。
-- [ ] launch中没有 allocation/free或 lazy binary load/register。
-- [ ] callable ID不重绑定；每个callable内func ID/address snapshot不变，不同callable可重复使用func ID数值。
-- [ ] graph可能引用的 binary/device descriptor pin到 context close。
-- [ ] L1 close不调用 reset/aclFinalize，不依赖隐式 sync。
-- [ ] 第一项destructive teardown前进入粘性 `CLOSING`；任何释放失败后prepare/launch均fail-closed，但close可显式重试且仍保留device claim/DSO/handle ownership。
+- [x] device/context/caller stream从不由 L1销毁。
+- [x] hidden stream/events只在 init创建、close销毁。
+- [x] workspace/arena/KernelArgs/Runtime在 capture前固定地址。
+- [x] launch中没有 allocation/free或 lazy binary load/register。
+- [x] callable ID不重绑定；每个callable内func ID/address snapshot不变，不同callable可重复使用func ID数值。
+- [x] graph可能引用的 binary/device descriptor pin到 context close。
+- [x] L1 close不调用 reset/aclFinalize，不依赖隐式 sync。
+- [x] 第一项destructive teardown前进入粘性 `CLOSING`；任何释放失败后prepare/launch均fail-closed，但close可显式重试且仍保留device claim/DSO/handle ownership。
 
 ### L.3 Task args
 
-- [ ] AICPU每次使用独立 WithHostArgs invocation snapshot。
-- [ ] stack invocation在 API返回后不被 PyPTO保存。
-- [ ] AICore只接收 persistent device `KernelArgs *`。
-- [ ] per-call tensor/scalar/callable不写进可被下一 launch覆盖的共享 host/device args。
-- [ ] child task arena只在 serial-tail之后 reset/reuse。
-- [ ] 不存在与固定 launch数量绑定的自建 pool。
+- [x] AICPU每次使用独立 WithHostArgs invocation snapshot。
+- [x] stack invocation在 API返回后不被 PyPTO保存。
+- [x] AICore只接收persistent device `KernelArgs *`及prepare-time trusted Runtime override，不读取下一次Host调用可覆盖的参数。
+- [x] per-call tensor/scalar/callable不写进可被下一 launch覆盖的共享 host/device args。
+- [x] child task arena只在 serial-tail之后 reset/reuse。
+- [x] 不存在与固定 launch数量绑定的自建 pool。
 
 ### L.4 Stream/capture
 
-- [ ] AICPU在 caller stream，AICore在 hidden stream。
-- [ ] 不存在 private AICPU run stream，不预启动 AICPU/AICore kernel 等待未来 invocation。
-- [ ] start 依赖位于 caller predecessor 与 handshake invalidation 之后，并在 AICPU/AICore并行前建立，不产生抢核死锁。
-- [ ] hidden AICore 只能在 wait start 之后启动，不能越过单算子 entry。
-- [ ] downstream caller stream同时等待 AICPU自身顺序和 AICore done，不能越过单算子 exit。
-- [ ] 同caller stream依赖FIFO；host调用换stream时在enqueue前非阻塞query上一operator tail，not-ready直接fail-closed，complete也不将capture外event wait导入图。
-- [ ] capture时执行一次PyPTO host launch以录制runtime task；replay不再进入Python/PyPTO host callback。
-- [ ] eager/capture 使用同一 launch 拓扑，没有 capture-only early mode。
-- [ ] PyPTO不查询 capture状态，不获取/保存 model/graph handle，不调用 `rtStreamAddToModel`。
-- [ ] hidden AICore branch 只通过 event fork/join 被 graph 捕获；不支持就停在 Phase 0，不降级边界。
-- [ ] 调用方在所有graph销毁前持有context和graph-bound tensors；adapter只承担deferred callback lease与default allocator `recordStream`，不伪装成graph lifetime owner。
+- [x] AICPU在 caller stream，AICore在 hidden stream。
+- [x] 不存在 private AICPU run stream，不预启动 AICPU/AICore kernel 等待未来 invocation。
+- [x] start依赖位于caller predecessor与handshake invalidation之后，并在AICPU/AICore分支前建立；A2/A3上板未出现抢核死锁。
+- [x] hidden AICore 只能在 wait start 之后启动，不能越过单算子 entry。
+- [x] downstream caller stream同时等待 AICPU自身顺序和 AICore done，不能越过单算子 exit。
+- [x] 同caller stream依赖FIFO；host调用换stream时在enqueue前非阻塞query上一operator tail，not-ready直接fail-closed，complete也不将capture外event wait导入图。
+- [x] capture时执行一次PyPTO host launch以录制runtime task；replay不再进入Python/PyPTO host callback。
+- [x] eager/capture 使用同一 launch 拓扑，没有 capture-only early mode。
+- [x] PyPTO不查询 capture状态，不获取/保存 model/graph handle，不调用 `rtStreamAddToModel`。
+- [x] hidden AICore branch只通过event fork/join被graph捕获；A2/A3 TRB/HBG capture与连续replay已通过。
+- [x] 调用方在所有graph销毁前持有context和graph-bound tensors；adapter只承担deferred callback lease与default allocator `recordStream`，不伪装成graph lifetime owner。
 
 ### L.5 Python/PyTorch
 
-- [ ] simpler core不 link torch/torch_npu。
-- [ ] taskQueue/current stream只在 adapter。
-- [ ] Python L1 wrapper强制显式 `out=`；native低层对完整tensor descriptor/direction/pointer/device做独立强校验。
-- [ ] graph核心测试使用预分配 `out=`。
-- [ ] wrapper forward-only，`requires_grad=True` 明确拒绝，不声称autograd/alias schema。
-- [ ] default torch_npu caching-allocator storage经 `recordStream` 保护；external/from-blob/custom allocator storage明确要求外部owner持有到最后真实stream/device use完成，capture时还覆盖graph销毁后的外部quiescence。
-- [ ] explicit prepare/warmup/close文档和错误信息完整。
-- [ ] `__del__` 不在未知 graph生命周期下释放关键资源。
+- [x] simpler core不 link torch/torch_npu。
+- [x] taskQueue/current stream只在 adapter。
+- [x] Python L1 wrapper强制显式 `out=`；native低层对完整tensor descriptor/direction/pointer/device做独立强校验。
+- [x] graph核心测试使用预分配 `out=`。
+- [x] wrapper forward-only，`requires_grad=True` 明确拒绝，不声称autograd/alias schema。
+- [x] default torch_npu caching-allocator storage经 `recordStream`保护；external/from-blob/custom allocator storage明确要求外部owner持有到最后真实stream/device use完成，capture时还覆盖graph销毁后的外部quiescence。
+- [x] explicit prepare/warmup/close文档和错误信息完整。
+- [x] `__del__` 不在未知 graph生命周期下释放关键资源。
 
 ### L.6 Test/compatibility
 
-- [ ] Phase 0硬门槛在 A2/A3、A5都有结果。
+- [x] Phase 0硬门槛在当前A2/A3范围有正式结果；A5按用户要求移出当前gate。
 - [ ] launch禁止项有可自动检查的 trace/counter。
 - [ ] trace/counter 明确检查 capture query、model attach、private AICPU launch 和 early-mode 均为零。
 - [ ] eager/ACLGraph 都有延迟 predecessor 和延迟 AICore tail 的 entry/exit 边界测试。
-- [ ] 连续异步 args不串包。
-- [ ] eager、multi-kernel、workspace、graph pre/post op均覆盖。
-- [ ] replay stress不编码 runtime内部上限。
+- [x] 连续异步 args不串包。
+- [x] eager、multi-kernel、workspace、graph pre/post op均覆盖。
+- [x] replay stress不编码 runtime内部上限。
 - [x] L2 one-shot/reuse和 L3 persistent/pipeline定向回归在A2/A3 device0通过；全量与A5仍按上述边界单列。
-- [ ] poisoned/close/device ownership负面路径通过。
+- [x] poisoned/close/device ownership负面路径通过。
 
 ## 附录 M：最终交付物
 
 首期实现完成时应同时交付：
 
-1. Phase 0 probe源码及 A2/A3、A5 结果记录，其中必须包含 event-only hidden-stream capture、entry/exit marker 和无 `rtStreamAddToModel` trace；
+1. Phase 0 probe源码及当前A2/A3结果记录，其中必须包含event-only hidden-stream capture、entry/exit marker和无`rtStreamAddToModel` trace；A5已移出本阶段交付范围；
 2. L1 native C ABI、borrowed execution mode和 persistent state；
 3. TRB AICPU WithHostArgs entry与 AICore persistent args；
 4. direct-device tensor binder和固定 stream/event launch；
 5. `pypto_init`/operator/prepare/warmup/close Python API；
 6. 独立 torch_npu current-stream/taskQueue adapter；
 7. eager/ACLGraph onboard tests及 launch禁止项检查，包括无 capture query/model attach/private-AICPU early launch；
-8. L2/L3 全量回归结果；
+8. A2/A3 L2/L3全量回归结果；
 9. 用户使用说明：静态 shape、显式 warmup、无并发、graph先销毁再close、内部 workspace；
 10. 后续设计 backlog：dynamic shape、外部 workspace、binary recycle、并发 invocation、public AICore binary API迁移；
 11. 独立的 `host_build_graph` 性能优化 backlog：以完整图为调度边界提前展开 orchestration，不在 L1 中复活 early mode 或 `rtStreamAddToModel`。
