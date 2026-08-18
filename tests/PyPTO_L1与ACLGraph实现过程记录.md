@@ -5984,3 +5984,86 @@ multi-child与内部workspace、两个HBG graph交替replay、同进程顺序con
 entry/exit压力拓扑。20个deselection/selection中的9项来自平台参数过滤或不匹配的case，不代表失败；
 本次实际选择的11项全部通过。运行前再次确认NPU process table为空，运行中与teardown均未调用
 device reset。
+
+### 10.59 A2/A3 launch禁止API的自动源码守卫与真实CANN符号trace
+
+#### 10.59.1 为什么exact-order fake还不足以单独闭环
+
+`L1LaunchSequenceOps`从设计上只允许wait event、memset、record event、AICPU/AICore launch和失败
+CANCEL，既有C++ UT也已经检查固定调用顺序。但它只能证明这个operation table没有提供禁止操作，
+不能自动发现未来有人在`DeviceRunnerBase::launch_l1_callable()`的table外直接插入一次sync、capture
+query或model attach；同时，fake stream数值也不能证明真实`aclrtLaunchKernelWithHostArgs`最终收到的
+就是torch_npu caller stream。
+
+因此本轮没有把旧fake UT重新命名后冒充runtime证据，而是增加两层互补门禁。
+
+第一层位于runtime提交`f48d7c29`：
+`runtime/tests/ut/py/test_l1_launch_source_guard.py`用brace-balanced提取真实
+`DeviceRunnerBase::launch_l1_callable()`函数体，并自动拒绝下列API族重新进入launch：
+
+- ACL/RT stream或device synchronize及timeout变体；
+- ACL/RT capture begin/end/query、`rtStreamAddToModel`和`rtModelBindStream`；
+- stream/event create/destroy；
+- device malloc/free、binary load/unload和lazy AICore registration；
+- AICPU callback绕过其`stream`形参读取hidden stream，或AICore callback恢复lazy register。
+
+测试还要求正式函数只调用一次`enqueue_l1_launch_sequence()`。它是无硬件的源码结构守卫，能在
+review/CI阶段立即阻止明显回归。
+
+#### 10.59.2 只归因PyPTO调用者的preload tracer
+
+第二层新增
+`tests/st/runtime/l1/support/l1_cann_api_trace.cpp`和
+`tests/st/runtime/l1/test_l1_cann_api_trace.py`。pytest父进程用`g++ -shared -fPIC`在临时目录构建
+tracer，再以`LD_PRELOAD`启动全新的子进程，保证CANN符号第一次解析前interposer已经生效。tracer
+使用`dladdr(return_address)`过滤调用者，只有直接来自`libhost_runtime.so`的调用才进入snapshot；
+因此测试代码/torch_npu用于warmup、graph begin/end、replay和外部synchronize的API不会被误归因给
+PyPTO。
+
+tracer的fixed-size ABI不分配内存，最多记录32个operation，并对以下禁止族独立计数：
+
+- ACL、RT、RTS的stream/device sync及timeout变体；
+- ACL/RT capture begin/end/query；
+- stream-to-model attach与model bind；
+- stream/event create/destroy；
+- device malloc/free；
+- AICPU launch stream不等于本次caller stream、AICore错误使用caller stream；
+- AICPU在caller Start record以前launch的early mode。
+
+允许调用也被真实interpose并转发。每个普通launch必须严格得到：
+
+```text
+memset(caller) -> memset(caller) -> record Start(caller)
+-> wait Start(hidden) -> launch AICore(hidden) -> record Done(hidden)
+-> launch AICPU(caller) -> wait Done(caller) -> record Tail(caller)
+```
+
+capture从warmup stream切换到独立stream时，序列前允许且要求出现一次非阻塞
+`aclrtQueryEventStatus`，用于fail-closed确认上一次真实tail已完成；它是event completion query，不是
+capture-state query，也不会向graph导入capture外event wait。tracer同时比较Start record/wait和Done
+record/wait的真实event handle，避免只比较操作名称而漏掉错代event。
+
+#### 10.59.3 device0结果与证据边界
+
+runtime源码守卫与相邻L1 wrapper UT结果为：
+
+```text
+8 passed in 0.05s
+```
+
+确认NPU process table为空后，A2/A3 device0执行preloaded tracer。子进程内部依次创建并关闭TRB与
+HBG context，各自完成warmup、一次eager trace、独立stream capture trace和一次replay验数：
+
+```text
+child trace: 1 passed in 8.65s
+parent probe: 1 passed in 16.50s
+```
+
+四个真实launch窗口全部观察到一份AICPU和一份AICore launch；AICPU使用精确caller raw stream，
+AICore使用同一非caller hidden stream，完整operation/event顺序匹配。PyPTO来源的stream/device
+sync、capture API、model attach、resource lifecycle、device allocation、private AICPU stream、
+caller-stream AICore和early launch计数全部为0。TRB与HBG replay数值均正确。
+
+这项证据只覆盖当前A2/A3+CANN 9.2进程内实际导出的符号集合；第三方CANN在一个允许API内部执行
+的实现细节不会被错误归因为PyPTO直接调用。未来若CANN增加新的同义禁止入口，应同时扩展源码token
+集合和interposer列表。本轮没有构建或运行A5/A5 simulator，也没有据A2/A3结果外推A5。
