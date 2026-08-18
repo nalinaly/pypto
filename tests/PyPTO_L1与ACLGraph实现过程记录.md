@@ -4830,7 +4830,15 @@ runtime阶段提交为：
 
 ```text
 3575f60b Test: 增加L1 HostArgs与placeholder上板探针
+eedfdc90 Test: 将HostArgs探针纳入常规C++回归
 ```
+
+第二个提交将完全相同的AICPU parser源码和Host self-test接入
+`tests/ut/cpp/CMakeLists.txt`的`no_hardware`标签；不是重新实现一份mock parser。定向
+`test_host_args_probe_parser`通过后，重新构建并执行完整
+`ctest -LE requires_hardware`，结果从此前98项增加为`99/99 passed`。这样后续任何probe
+ABI、编译属性或parser行为回归都会进入常规C++门禁，而不依赖开发者记得手工运行probe
+build脚本。
 
 #### 10.47.7 当前证据边界与下一次device1动作
 
