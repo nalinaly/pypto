@@ -4903,3 +4903,184 @@ git diff --check                            passed
 AICPU leader执行copy/publish，也没有证明A2/A3或A5的cache clean/invalidate、peer acquire、
 AICore descriptor读取和ACLGraph第二次replay可见性。因此设计文档N.10.4/N.10.5的device项
 没有被勾选；下一步仍需test-build-only fault hook和device1的production HBG replay证据。
+
+### 10.48 device1 HBG扩展矩阵与large HostArgs正式探针结果
+
+#### 10.48.1 上板前先把GPT Python/native环境重新收敛
+
+runtime提交`620f1df4`后，GPT venv最初仍加载由`f8b9056a`源码构建的`_task_interface`。
+`simpler.task_interface`按设计比较build commit并拒绝导入，没有让新Python驱动旧C++布局。
+先在`gpt_pypto/runtime/.venv`重建runtime editable，最终native stamp精确为：
+
+```text
+_task_interface.__build_commit__ = 620f1df4b3149e7a8a85685b942b29131f8c551b
+```
+
+第一次重建顶层adapter时没有禁用user-site，导致build阶段看到系统Torch 2.7，而pytest运行时
+看到user-site Torch/Torch-NPU 2.12。`L1Context`在native init前比较adapter build version并
+明确拒绝。第二次尝试修正adapter版本后，又因为shell没有固定PTOAS，`@pl.jit`自动生成
+`skip_ptoas=True`的compile-only artifact；`CompiledProgram`在native init前检查缺失的
+`kernel_config.py`并拒绝执行。两次都没有启动PyPTO AICPU/AICore，但test在进入context前已
+创建普通NPU tensor，因此确实发生过device1的Torch allocation/fill，不能写成“完全没有NPU
+行为”。
+
+最终恢复10.43已经使用过的隔离环境：
+
+```text
+PYTHONNOUSERSITE=1
+PYTHONSAFEPATH=1
+PYTHONPATH=gpt_pypto/python:gpt_pypto/runtime/python:gpt_pypto/runtime:gpt_pypto/tests/st
+PTOAS_ROOT unset
+PATH first = PTOAS/build-v0.57-llvm21-cann9.2-clean/tools/ptoas
+torch       = 2.7.1+cpu
+torch_npu   = 2.7.1.post4
+adapter     = built against 2.7.1+cpu / 2.7.1.post4
+ptoas       = 0.57
+```
+
+该环境的`pypto`、`simpler`、`_task_interface`和`pypto._torch_npu_l1`全部来自GPT工作目录
+或GPT venv；没有加载Grok editable package或build产物。
+
+#### 10.48.2 production HBG扩展ST结果
+
+先单独运行最关键的
+`test_hbg_sequential_context_generation_resets_resident_registries[a2a3]`。第一context注册
+scalar callable，在独立capture stream完成warmup、capture和replay后按“外部sync -> graph
+reset -> context close”销毁；第二context在同一pytest进程里注册不同的two-child callable，
+二者都从`callable_id=0`和callable-local `func_id=0`开始。结果：
+
+```text
+1 passed, 11 deselected in 9.82s
+```
+
+这直接复验了10.45首次暴露的resident registry代际问题；第二context不再把新callable视为
+旧generation冲突，也没有依赖device reset。
+
+随后一次执行全部HBG扩展case：
+
+```text
+test_l1_async_tensor_and_scalar_snapshots_do_not_alias[host_build_graph]
+test_l1_multi_output_multi_child_workspace_aclgraph[host_build_graph]
+test_hbg_two_graphs_retain_distinct_addresses_and_scalars
+test_hbg_sequential_context_generation_resets_resident_registries
+
+4 passed, 8 deselected in 32.21s
+```
+
+这四项共同证明：连续四次Host异步调用的tensor地址与FP32 scalar snapshot不串包；多output
+方向、两个child和`pl.create_tensor`内部workspace可进入同一个captured operator序列；两张
+同时存活的graph按A/B/A/B replay仍保留各自地址/scalar/package；同一进程第二context可以
+重新注册不同binary。所有case结束都由调用方先quiesce，再reset graph、close context。
+
+#### 10.48.3 探针首次507018不是large HostArgs限制
+
+独立probe第一次运行64 KiB eager时，`aclrtLaunchKernelWithHostArgs`成功返回，但stream sync
+得到507018。device日志给出更精确的根因：
+
+```text
+dispatcher wrote:
+  simpler_inner_04a8002c680d06ad_1.so
+descriptor requested:
+  simpler_host_args_probe_04a8002c680d06ad_1.so
+AICPU result:
+  11002, open so failed
+```
+
+共享dispatcher的文件名协议描述被bootstrap的inner DSO内容，而不是其中导出的probe symbol；
+它固定使用`simpler_inner_<fingerprint>_<device>.so`。probe错误地为descriptor创造了另一前缀，
+因此设备loader根本没有进入probe parser，507018不能用来推断64 KiB参数不受支持。
+
+runtime提交`6a5f70a9`抽出`format_dispatcher_inner_so_basename`，让descriptor复用dispatcher
+真实命名；pure-Host self-test固定断言
+`simpler_inner_0123456789abcdef_1.so`并拒绝负device id。修复后的build/self-test、常规
+`test_host_args_probe_parser`与pre-commit全部通过。更重要的是，发生11002后没有reset设备，
+下一进程的小矩阵和后续全部正式矩阵仍成功；这只证明loader错误后的device/context可重新
+建立，不等价于HBG hidden AICore no-reset故障矩阵。
+
+#### 10.48.4 默认large HostArgs与allocator压力矩阵
+
+默认矩阵的四个eager payload全部在launch返回后立即读取scratch pointer slot、把scratch
+poison为`0xa5`、释放并申请同尺寸`0x5a`复用buffer；外部stream同步后AICPU仍对runtime-owned
+bytes计算出完整checksum和首/中/尾样本：
+
+| args size | launch返回耗时 | task完成总耗时 | 实际args base | mod 64 |
+| --- | ---: | ---: | --- | ---: |
+| 64 KiB | 143 us | 1094 us | `0x12c0c001b000` | 0 |
+| 1 MiB | 1790 us | 3134 us | `0x12c0c002b000` | 0 |
+| 16 MiB | 30065 us | 49006 us | `0x12c081200000` | 0 |
+| 64 MiB | 114349 us | 190851 us | `0x12c082200000` | 0 |
+
+三个Host pointer slot在API返回时已经分别变成`args_base + payload_offset[i]`，而canonical
+完整hash始终不变，证明CANN只patch本次writable scratch。随后连续发射512个64 KiB
+WithHostArgs task，每个task的Host source都立即poison/free/reuse；tail invocation完整通过。
+
+graph A为1 MiB、graph B为16 MiB，capture返回后Host scratch同样立即销毁。经过上述512次
+压力后，两张graph各100次按A/B交替replay全部通过；每次观察到的args base固定为各自独立
+地址：
+
+```text
+graph A args = 0x12c0c0022000, replay约2.7～3.5 ms
+graph B args = 0x12c081200000, replay约42.5～43.1 ms
+```
+
+HBM采样为：
+
+| 阶段 | used bytes |
+| --- | ---: |
+| context建立后 | 152674304 |
+| eager完成、capture前 | 236560384 |
+| 两graph capture后 | 236560384 |
+| 512次压力后 | 173645824 |
+| 200次交替replay后 | 177410048 |
+| graph destroy后 | 177410048 |
+| result释放后 | 177410048 |
+
+小allocation由CANN allocator缓存，所以不能要求graph destroy后free bytes精确回到首样本；
+关键结论是200次replay期间没有随次数单调增长，也没有因512次新task覆盖旧graph payload。
+
+#### 10.48.5 64 MiB captured graph与2048次压力
+
+加强矩阵把graph A扩大到64 MiB、graph B保持1 MiB，并在capture后连续发射2048个64 KiB
+task。两个graph仍各100次A/B交替replay全部通过：
+
+```text
+64 MiB capture = 30966 us, replay约170.7～171.7 ms
+1 MiB  capture =  1954 us, replay约  2.7～  3.3 ms
+allocator pressure = 2048 successful launches
+```
+
+对应HBM为：
+
+| 阶段 | used bytes |
+| --- | ---: |
+| context建立后 | 152588288 |
+| 两graph capture后 | 219697152 |
+| 2048次压力后 | 223891456 |
+| 200次交替replay后 | 227201024 |
+| graph destroy后 | 160092160 |
+| result释放后 | 160092160 |
+
+graph destroy后used精确下降`67108864` bytes，即64 MiB captured args allocation在外部quiescence
+后随graph owner释放；剩余约7.5 MiB相对context首样本的差值可由runtime/allocator缓存解释，
+不能假装为零。2048只是本次pressure point，不进入PyPTO产品限制。
+
+#### 10.48.6 本轮可以勾选和仍不能勾选的边界
+
+设计文档N.10已经按证据勾选placeholder地址、三pointer、Host scratch即时销毁、canonical
+immutability、四个成功size的full checksum/tail、512/2048压力、双graph各100次replay、
+64 MiB graph destroy回收、production HBG多callable/第二context和正常close。
+
+以下项仍明确未完成：
+
+- 所有真实CANN args base本轮都恰好`mod64=0`；unaligned parser只有纯Host反例，不能声称
+  device backend给出过未对齐地址；
+- 64 MiB generic payload不等于“真实HBG最大image”，也没有扫描首个失败size；
+- 只有A2/A3 device1，A5没有同等级硬件时延、错误码和cache证据；
+- production HBG restore还没有显式poison ready queue/wake list/completion/task state/mailbox；
+- wrong slot/callable/blob/affinity/KernelArgs、restore/scheduler/shutdown/destroy阶段仍缺
+  test-build-only fault hook和hidden AICore tail证据；
+- graph owner在device尚未external quiescent时的拒绝/保活尚未单独注入验证。
+
+本轮所有正式HBG与probe均显式使用device1，没有调用`aclrtResetDevice`/`aclrtResetDeviceForce`
+或任何device reset。结束后`npu-smi`仍显示两个physical die的历史AICore 100%与固定HBM、
+process table为空；与运行前观测一致，不能据此归因给Grok，也不能把该计数当作本轮资源泄漏。

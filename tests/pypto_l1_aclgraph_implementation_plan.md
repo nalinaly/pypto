@@ -2566,34 +2566,44 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 > 只有完整成功restore才能覆盖整个被污染slot并发布正确generation/hash。完整no-hardware C++
 > 矩阵仍为99/99通过。这是Host算法和事务边界证据，不证明AICPU cache maintenance、AICore
 > 可见性或ACLGraph replay，因此N.10.4/N.10.5对应device checkbox仍保持未勾选。
+>
+> **2026-08-18 device1快照：** 修复探针descriptor与共享dispatcher的content-addressed
+> basename契约后（runtime `6a5f70a9`），A2/A3 device1完成两组真实矩阵：默认矩阵覆盖
+> 64 KiB/1 MiB/16 MiB/64 MiB eager、512次64 KiB压力，以及1 MiB/16 MiB双graph各
+> 100次A/B交替replay；加强矩阵覆盖64 MiB captured graph、1 MiB companion graph各100次
+> replay和2048次64 KiB压力。所有三placeholder实际地址、full checksum、首/中/尾样本和
+> canonical hash均通过。正式PyPTO HBG扩展ST另有4/4通过，包括异步tensor/scalar快照、
+> multi-output、multi-child/internal workspace、双graph和同进程第二context重新从
+> `callable_id=0`注册。以下仅勾选这些证据直接证明的项目；A5、真实HBG最大image、显式
+> mutable-state poison、cache可见性和no-reset fault hook仍未完成。
 
 #### N.10.1 placeholder、snapshot与canonical immutability
 
-- [ ] AICPU最小kernel验证placeholder pointer等于runtime args base + inline offset。
-- [ ] 验证多个placeholder可分别指向SM、arena和restore manifest。
-- [ ] launch API返回立即poison/free/reuse host blob，eager仍读到原payload。
-- [ ] 证明CANN原地patch只改写第2层scratch，第1层canonical plan hash不变。
+- [x] AICPU最小kernel验证placeholder pointer等于runtime args base + inline offset。
+- [x] 验证三个独立placeholder可分别代表SM、arena和restore manifest payload。
+- [x] launch API返回立即poison/free/reuse host blob，eager仍读到原payload。
+- [x] 证明CANN原地patch只改写第2层scratch，第1层canonical plan hash不变。
 - [ ] 未对齐runtime args base不会导致typed UB，AICPU parser先做aligned local header copy。
 
 #### N.10.2 large args和backend边界
 
 - [ ] 至少扫描64 KiB、1 MiB、16 MiB、64 MiB、真实HBG常规image、真实最大image和失败边界。
-- [ ] 每个size检查tail bytes/checksum，防止old backend clamp后仅头部数值正确。
-- [ ] `argsSize > UINT32_MAX`、offset addition overflow、placeholder越界由PyPTO在host稳定拒绝。
+- [x] 已扫描的64 KiB、1 MiB、16 MiB、64 MiB成功size均检查full checksum和tail bytes，防止old backend clamp后仅头部数值正确。
+- [x] `argsSize > UINT32_MAX`、offset addition overflow、placeholder越界由PyPTO在host稳定拒绝。
 - [ ] 记录A2/A3和A5各自错误码、内存占用、capture/instantiate延迟和replay延迟，不将内部常量固化为PyPTO限制。
 
 #### N.10.3 captured-node lifetime
 
-- [ ] capture后立即销毁host blob，instantiate/replay至少100次仍正确。
-- [ ] capture后发射大量其他WithHostArgs task并制造args allocator环绕/压力，旧graph payload不串包。
-- [ ] graph A/B包含不同tail canary与topology/scalar，顺序交替replay仍持有各自payload。
-- [ ] 观察capture、instantiate、首次replay、graph destroy前后的arg handle/memory accounting，确认真实回收点。
+- [x] capture后立即销毁host blob，instantiate/replay至少100次仍正确。
+- [x] capture后发射大量其他WithHostArgs task并制造args allocator环绕/压力，旧graph payload不串包。
+- [x] graph A/B包含不同tail canary与topology/scalar，顺序交替replay仍持有各自payload。
+- [x] 观察capture、instantiate、首次replay、graph destroy前后的arg handle/memory accounting，确认64 MiB captured args在graph destroy后回收；小allocation的runtime cache保留单独记录。
 - [ ] graph销毁但device未external quiescent时，不提前释放working slot/context roots。
 
 #### N.10.4 per-replay restore正确性
 
-- [ ] 同一ACLGraph不重新host build，至少连续replay两次。
-- [ ] graph A/B的callable都从 `func_id=0` 编号但绑定不同binary，交替replay必须分别命中各自runtime-arena中的完整函数表；不得回读outer Runtime的最后一次绑定。
+- [x] 同一ACLGraph不重新host build，至少连续replay两次。
+- [x] graph A/B的callable都从 `func_id=0` 编号但绑定不同binary，交替replay必须分别命中各自runtime-arena中的完整函数表；不得回读outer Runtime的最后一次绑定。
 - [ ] 篡改restored `HbgPrebuiltInvocationState` 的magic/version/count/task数/stored hash或任一函数地址，leader必须在wire/classify/dispatch前fail-closed；header identity中的task数/hash与arena state不一致也必须拒绝。
 - [ ] 第一次执行后用test hook poison ready queue、wake list、completion flags、task state、runtime pointer、mailbox等known mutable spans。
 - [ ] 第二次replay必须从该node的immutable source恢复，不是依赖某些field碰巧未变。
@@ -2617,9 +2627,9 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 #### N.10.7 close、fallback和无并发契约
 
 - [ ] graph仍可replay时close fail-closed或按明确外部契约被拒绝，不free working slot/binary/workspace。
-- [ ] graph destroyed + external quiescence后close成功，所有资源只释放一次。
+- [x] graph destroyed + external quiescence后close成功，所有资源只释放一次。
 - [ ] runtime-owned路径失败时，external-source fallback有独立lease和memory accounting，不默默复用单buffer。
-- [ ] 两个graph顺序replay通过；并发replay不在v1 supported matrix中，文档和test均不声称支持。
+- [x] 两个graph顺序replay通过；并发replay不在v1 supported matrix中，文档和test均不声称支持。
 
 #### N.10.8 no-reset故障注入与hidden AICore完成性
 
