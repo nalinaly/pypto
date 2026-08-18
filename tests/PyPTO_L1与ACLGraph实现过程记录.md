@@ -6496,3 +6496,138 @@ PyPTO起步时gitlink固定的`3165cc89b6ea6b58a0bc01cbec2d5f72f2029c35`作为�
 因此最终发布拓扑是`nalinaly/pypto:main`引用`nalinaly/simpler:pypto-l1-aclgraph`中的
 `f48d7c29`。simpler的`origin`仍保留为`hw-native-sys/simpler`用于对照，新增`nalinaly` remote只承载
 本次PyPTO L1分支。
+
+### 10.65 以最新simpler/main为基线完成正式发布迁移
+
+本节记录2026-08-19的最终迁移状态，并明确取代10.64中“simpler保留在基于`3165cc89`的独立
+`pypto-l1-aclgraph`分支”这一过渡发布关系。用户最终要求是：
+
+1. `https://github.com/nalinaly/simpler`的`main`先强制对齐主仓
+   `https://github.com/hw-native-sys/simpler`的最新`main`；
+2. L1/ACLGraph修改直接提交在该最新`main`之上，并推送到fork的`main`；
+3. PyPTO同步迁移到最新simpler的Buffer/ChipTensor ABI，submodule直接固定fork的L1提交；
+4. 当前只把A2/A3列为实现和验收范围，不以A5或A5sim构建结果阻塞发布。
+
+#### 10.65.1 simpler fork main的强制对齐与安全备份
+
+操作前读取两个远端引用并冻结旧fork状态；没有把旧`main`直接丢弃，而是先把它保存在远端
+`main-backup-20260819`。随后将fork的`main`用带lease保护的force push精确对齐主仓：
+
+```text
+upstream/origin main: 93a0fde014f2206ad3b71b31109698aefb7064ea
+fork backup branch:   main-backup-20260819
+fork aligned main:    93a0fde014f2206ad3b71b31109698aefb7064ea
+```
+
+L1实现迁移、冲突处理、A2/A3构建与测试完成后，在这个新基线上形成一个可审阅的原子提交：
+
+```text
+repository: https://github.com/nalinaly/simpler.git
+branch:     main
+commit:     4922d5933e2937790aa5b01e737986114ac28d1d
+subject:    Add: support borrowed L1 ACLGraph execution
+```
+
+本地`git ls-remote nalinaly refs/heads/main`已确认远端引用精确为`4922d593`；正式PyPTO工作树中的
+`runtime`也checkout这个`main`，不再跟踪旧的`pypto-l1-aclgraph`过渡分支。
+
+#### 10.65.2 HBG resident global迁移为Context-owned registry
+
+这次迁移没有把旧resident DSO中的进程级可变registry继续带到最新simpler。最终所有权被收敛为
+`DeviceContextHandle`/L1 context拥有的`HbgContextRegistry`，其核心约束如下：
+
+1. callable registration、callable-local `func_id -> kernel address`表、graph package目录、mutable working
+   slot和generation都属于一个L1 context；不同context不再共享可写registry；
+2. resident orchestration SO只保留执行代码和显式传入的context入口，不再作为callable或graph package
+   的隐式owner；context close后不会留下可与下一context发生`status=7 Conflict`的注册表状态；
+3. generation用于同一context内部识别每次execution image，不再承担跨context清理进程级global的职责；
+4. registry销毁仍遵守L1 borrowed-resource契约：调用方必须先让caller/hidden stream quiescent，并销毁或
+   reset所有引用该operator的ACLGraph，然后才允许显式`context.close()`释放slot、Runtime和binary；
+5. close中任一资源释放失败，context保持Closing/可重试owner，不能释放registry所有权后让第二context
+   进入半拆状态。
+
+这个变化不是单纯把一张map从全局变量搬到成员变量。它把“注册身份、graph package、working state、
+generation和资源回收”放进同一个生命周期事务，从结构上消除resident DSO跨context污染；同时保留
+同一context内多个`@pl.program`都从`func_id=0`开始编号的合法性，因为函数表按callable隔离。
+
+#### 10.65.3 当前HBG graph package的生命周期
+
+HBG graph被当作本次L1 task的tiling-class入参管理，但必须区分不可变source与执行时会被scheduler修改的
+working state。当前正式路径的owner关系是：
+
+1. **Canonical GraphPlan**：Host build得到不可变拓扑、初始shared memory、runtime arena、function
+   binding、tensor/scalar布局和完整性元数据；它是构图结果与校验的trust root。
+2. **Writable serialization scratch**：每次形成launch image时，从GraphPlan生成一份可写序列化副本。
+   `aclrtLaunchKernelWithHostArgs`允许runtime对placeholder做patch，因此不能把canonical plan本体直接
+   交给runtime修改。
+3. **Runtime-owned task snapshot**：成功launch后，完整HostArgs由CANN跟随该eager task或captured node
+   保存，等价于AscendC launch中由runtime管理的tiling参数。下一次Host调用可以立即复用自己的临时
+   serialization scratch，不会覆盖前一个node的图包；PyPTO不依赖固定kernel-launch数量，也不按Host
+   launch返回时机回收device task args。
+4. **Context-owned mutable working slot**：graph image不能原地重复执行，因为scheduler会消费ready queue、
+   completion flags、watermark和Runtime指针。每次eager执行或ACLGraph replay时，AICPU leader都在Start
+   event之后、scheduler dispatch之前，把该node snapshot中的pristine SM与arena完整恢复到context的
+   fixed working slot。v1不允许同一context并发，因此slot与workspace可以按context单份复用。
+5. **Context-resident execution resources**：Runtime、KernelArgs、workspace、AICore report区、hidden stream、
+   events和binary都由context持有。PyPTO不查询capture状态、不获取graph handle、不调用
+   `rtStreamAddToModel`、不在launch中H2D/分配/synchronize/reset；graph-bound tensor由torch adapter和
+   allocator stream recording覆盖device消费期，context则必须由用户持有到graph reset之后。
+
+因此一次capture中的两个HBG node即使来自同一callable，也各自拥有独立的CANN task snapshot；两个
+callable还各自拥有独立function table与GraphPlan。它们可以串行复用context working slot，但不会退化成
+“所有captured node都指向最后一次Host build图包”。若未来允许L1并发，必须把working slot/workspace提升为
+per-inflight execution lease；不能只移除当前的并发检查。
+
+#### 10.65.4 PyPTO对最新simpler ABI的迁移
+
+PyPTO没有在旧`3165cc89` ABI上继续打补丁，而是吸收主仓已经完成的soft SYNCALL与Buffer ABI迁移
+`8662deb9`，并按当前L1分支解决冲突。本地正式迁移提交为：
+
+```text
+PyPTO base before migration: d920dd37
+upstream migration source:   8662deb9
+local integrated commit:     245cadb1
+simpler gitlink:              4922d5933e2937790aa5b01e737986114ac28d1d
+```
+
+迁移后的关键事实包括：
+
+1. L1参数打包使用最新`ChipTensor.make_strided`，不再引用旧`Tensor` wire对象；
+2. L2/L3走worker-owned Buffer/ChipTensor语义，PyPTO不再把旧address-owning Tensor ABI混入新simpler；
+3. HBG requirements仍由orchestration codegen、Python binding、类型桩、artifact和simpler validator完整贯通；
+4. distributed dispatch只有存在`domain_provider`时才传该可选关键字，保持旧mock/第三方dispatch callable
+   的源兼容；为避免`runtime.__init__`的既有导入环，`RunConfig`继续显式使用有说明的lazy import；
+5. cherry-pick中来自另一基线的rank-reducing orchestration slice片段依赖当前分支不存在的`drop_dims`
+   前置改动，已经按本分支原有feature边界剔除；这不是回退当前main已有功能，而是避免把半套无定义实现
+   带入正式提交。
+
+#### 10.65.5 最终验证与范围
+
+最新simpler上的A2/A3正式路径已有device0证据：TRB golden、HBG golden、双callable独立package三项
+同进程测试全部通过，HBG连续创建第二context的generation/registry反例也通过。测试前确认设备无其他
+使用者，没有执行device reset。A5与A5sim按用户明确范围不运行、不作为本次结论依据。
+
+PyPTO迁移后重新构建editable extension，并使用全新`PYTHONPYCACHEPREFIX`消除目录rename遗留字节码，
+完整执行runtime与codegen无硬件回归：
+
+```text
+tests/ut/runtime + tests/ut/codegen
+1555 passed, 63 warnings in 223.26s
+```
+
+此前普通cache下的34个golden/path失败已证明来自`.pyc`中残留的旧`/pto/gpt_pypto`路径；新cache下全部
+消失。另5个distributed mock兼容失败由上述可选`domain_provider`调用修复。最终pre-commit的header、
+英文、文档一致性、YAML、EOF/空白、clang-format、cpplint、ruff和pyright全部通过，`git diff --check`
+也通过。
+
+最终发布拓扑因此变为：
+
+```text
+nalinaly/pypto:main
+  -> runtime gitlink 4922d593
+     -> nalinaly/simpler:main
+        -> based directly on hw-native-sys/simpler:main 93a0fde0
+```
+
+旧`nalinaly/simpler:pypto-l1-aclgraph`仍可用于历史追溯，但不再是正式PyPTO main的依赖或后续开发
+基线；旧fork main则由`main-backup-20260819`提供可恢复引用。
