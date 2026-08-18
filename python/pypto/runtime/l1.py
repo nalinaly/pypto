@@ -57,7 +57,7 @@ from .task_interface import (
     MAX_TENSOR_DIMS,  # pyright: ignore[reportAttributeAccessIssue]
     ArgDirection,  # pyright: ignore[reportAttributeAccessIssue]
     ChipStorageTaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
-    Tensor,  # pyright: ignore[reportAttributeAccessIssue]
+    ChipTensor,  # pyright: ignore[reportAttributeAccessIssue]
     torch_dtype_to_datatype,  # pyright: ignore[reportAttributeAccessIssue]
 )
 
@@ -712,7 +712,7 @@ class L1Context:
             if any(stride <= 0 or stride > _UINT32_MAX for stride in strides):
                 raise ValueError(f"L1 tensor {info.name!r} requires positive uint32 strides, got {strides}")
             packed.add_tensor(
-                Tensor.make_strided(
+                ChipTensor.make_strided(
                     data=value.data_ptr(),
                     shapes=actual_shape,
                     strides=strides,

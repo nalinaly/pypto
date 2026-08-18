@@ -56,6 +56,11 @@ class OrchestrationResult:
         ...
 
     @property
+    def orchestration_requirements_v1(self) -> int:
+        """Host-build graph requirements exported by the orchestration program."""
+        ...
+
+    @property
     def func_name_to_id(self) -> dict[str, int]:
         """Kernel function name to func_id mapping."""
         ...

@@ -258,48 +258,6 @@ _KERNEL_HEADER = """\
 #include "tensor.h"
 {spmd_override}
 
-#if defined(__CPU_SIM)
-// PTOAS v0.50+ emits cache_line_t::ENTIRE_DATA_CACHE / SINGLE_CACHE_LINE as
-// scoped identifiers, but the pto-isa cpu_stub.hpp defines them as bare macros
-// (#define ENTIRE_DATA_CACHE 0) — which breaks cache_line_t::ENTIRE_DATA_CACHE
-// into cache_line_t::0. Undefine the macros and provide proper namespace-scoped
-// constexpr constants. The same headers also #define dcci/dsb as macros that
-// would expand our own inlines, so undefine + redefine all of them here.
-#include <atomic>
-
-// Forward-declare the overloads so the undefs below don't break chained includes.
-namespace pypto_sim_detail {{
-    template <typename... Args>
-    static inline void sim_dcci(Args...);  // defined after the undefs
-    static inline void sim_dsb(int kind);  // ditto
-}}
-
-// Undefine conflicting macros from pto-isa cpu_stub.hpp / inner_kernel.h
-// so our namespace-scoped constants and inline functions are used instead.
-#undef ENTIRE_DATA_CACHE
-#undef SINGLE_CACHE_LINE
-#undef DSB_DDR
-#undef dcci
-#undef dsb
-#undef CACHELINE_OUT
-
-namespace cache_line_t {{
-    constexpr int ENTIRE_DATA_CACHE = 0;
-    constexpr int SINGLE_CACHE_LINE = 0;
-    constexpr int CACHELINE_OUT     = 0;
-}}
-typedef int mem_dsb_t;
-#define DSB_DDR 0
-
-static inline void dcci(...) {{
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-}}
-static inline void dsb(mem_dsb_t) {{
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-}}
-#endif  // __CPU_SIM
-
-
 using namespace pto;
 
 """
@@ -498,7 +456,9 @@ def _generate_arg_unpacking(func: _ir_core.Function, *, uses_spmd: bool = False)
         assert isinstance(param.type, _ir_core.TensorType)
         c_type = param.type.dtype.to_c_type_string()
         lines.append(f"    // Unpack tensor: {param_name}")
-        lines.append(f"    __gm__ Tensor* {param_name}_tensor = reinterpret_cast<__gm__ Tensor*>(args[{i}]);")
+        lines.append(
+            f"    __gm__ ChipTensor* {param_name}_tensor = reinterpret_cast<__gm__ ChipTensor*>(args[{i}]);"
+        )
         if param_name == "__gm_pipe_buffer" and uses_spmd:
             lines.append("    // SPMD: shard GM pipe workspace by logical block_idx to avoid overlap.")
             lines.append("    int64_t __pypto_gm_block_num = static_cast<int64_t>(__pypto_spmd_block_num);")
@@ -1508,12 +1468,12 @@ def _materialize_builtin_next_levels(
 
 
 def _emit_sub_worker_module(func: _ir_core.Function) -> str:
-    """Emit a self-contained SubWorker module callable as ``fn(args: TaskArgs)``.
+    """Emit a self-contained SubWorker module callable as ``fn(args: MappedArgs)``.
 
     The user's function body lives on ``func.body`` as an :class:`InlineStmt`
     captured by the decorator. The emitted module wraps the body in
     ``def _user_{name}(<params>)`` plus a dispatcher ``{name}(args)`` that
-    unpacks tensors from ``TaskArgs``.
+    unpacks tensors from Simpler's mapped receive-side arguments.
     """
     import textwrap  # noqa: PLC0415
 
@@ -1542,14 +1502,12 @@ def _emit_sub_worker_module(func: _ir_core.Function) -> str:
 
     indented_body = textwrap.indent(body.body, "    ") if body.body else "    pass"
     unpack_block = (
-        "\n".join(
-            f"    {name} = _tensor_from_continuous(args.tensor({i}))" for i, name in enumerate(param_names)
-        )
+        "\n".join(f"    {name} = _tensor_from_continuous(args[{i}])" for i, name in enumerate(param_names))
         or "    pass"
     )
 
     return (
-        f'"""SubWorker: {func.name} — auto-generated, callable as fn(args: TaskArgs)."""\n'
+        f'"""SubWorker: {func.name} — auto-generated, callable as fn(args: MappedArgs)."""\n'
         f"\n"
         f"import torch\n"
         f"\n"
