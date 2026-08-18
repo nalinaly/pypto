@@ -4554,3 +4554,17 @@ capability启用及对应C++/Python/产物ABI反例。提交前验证范围为ru
 host/AICPU/AICore共十二套构建。提交信息同样明确说明：这些结果不等价于device 1
 上的第二个HBG context已经复验；该项与双callable capture/replay仍是下一次上板的
 硬门槛。
+
+顶层PyPTO的runtime选择、artifact owner、L1/HBG Python入口、ST与用户文档形成
+后续独立提交：
+
+```text
+beb06bd4 Add: 接通HBG L1编译选择与ACLGraph入口
+```
+
+该提交将nested runtime指针固定到`f8b9056a`，所以顶层提交不能在未同步对应runtime
+提交的环境中单独验证。提交后再次只读执行`npu-smi info -m`与`npu-smi info`：
+device 0/physical 14仍为AICore 100%、HBM 3246 MiB，device 1/physical 15仍为
+AICore 100%、HBM 2874 MiB，process table仍为空。该证据只能排除`npu-smi`可见的
+活跃Host进程，不能证明device已经quiescent；因此没有在此状态下执行第二个HBG
+context、双callable ACLGraph replay或任何reset。
