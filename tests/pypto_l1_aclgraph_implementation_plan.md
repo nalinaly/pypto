@@ -2174,7 +2174,7 @@ v1 契约仍禁止并发 replay，但需观察两个图共享 context events时 
 - [ ] 连续异步 args不串包。
 - [ ] eager、multi-kernel、workspace、graph pre/post op均覆盖。
 - [ ] replay stress不编码 runtime内部上限。
-- [ ] L2 one-shot/reuse和 L3 persistent/pipeline回归通过。
+- [x] L2 one-shot/reuse和 L3 persistent/pipeline定向回归在A2/A3 device0通过；全量与A5仍按上述边界单列。
 - [ ] poisoned/close/device ownership负面路径通过。
 
 ## 附录 M：最终交付物
@@ -2587,6 +2587,12 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 > 又完成ACLGraph capture和两次replay。该ST没有调用device reset。它直接闭合restore失败和
 > 这七个stage的tail/reuse证据，但不替代slot/callable/affinity/KernelArgs/physical-core、
 > assign内部或真实scheduler-dispatch内部故障，因此N.10.8对应的大集合checkbox仍按边界保留。
+>
+> **2026-08-18 device0兼容性回归证据：** 在同一GPT隔离工作树和native build上，
+> TRB L1/ACLGraph选择集`3 passed`；HBG L2 vector graph与TRB L2双callable显式dispatch
+> 各`1 passed`；单卡L3显式register/handle/run与三次异步submit、两帧有界复用、
+> resident `DeviceTensor`各`1 passed`。这些是A2/A3 device0的定向兼容性证据，
+> 不冒充A5上板或L2/L3全量suite。
 
 #### N.10.1 placeholder、snapshot与canonical immutability
 

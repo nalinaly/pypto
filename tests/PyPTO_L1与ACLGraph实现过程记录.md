@@ -5205,3 +5205,88 @@ callable task package、异步tensor/scalar snapshot、多output/multi-child/int
   op-timeout/driver fault-containment边界。
 
 因此实现加速了关键generation内部闭环，但没有用一个绿色ST替代剩余故障矩阵。
+
+### 10.50 device0最终定向兼容性回归
+
+#### 10.50.1 隔离与执行前提
+
+本轮开始前，顶层与runtime子仓都是clean，且都位于
+`gpt/pypto-l1-aclgraph`分支。所有命令都从
+`/mnt/workspace/inductor/pto/gpt_pypto`或其`runtime`子目录执行，`PYTHONPATH`只指向
+GPT工作树与其editable runtime；没有修改或导入同级Grok工作树
+`/mnt/workspace/inductor/pto/pypto`。用户明确释放device0后才执行以下上板用例，
+本轮没有device reset。
+
+#### 10.50.2 TRB L1与ACLGraph
+
+使用device0运行普通L1 ACLGraph和扩展矩阵的TRB参数分支：
+
+```text
+pytest -q \
+  tests/st/runtime/l1/test_l1_aclgraph.py \
+  tests/st/runtime/l1/test_l1_extended_matrix.py \
+  --platform=a2a3 --device=0 -k tensormap_and_ringbuffer
+
+3 passed, 15 deselected in 10.44s
+```
+
+`deselected`项包含HBG专属参数和非TRB case，不是TRB失败。与10.49已记录的
+HBG默认选择集`6 passed`组合后，两种runtime的L1 eager/capture/replay都有当前
+device0实证。
+
+#### 10.50.3 HBG/TRB L2旧路径
+
+HBG L2使用runtime仓现成vector graph scene，覆盖host构图、intermediate HeapRing、
+AICPU/AICore调度与数值回读：
+
+```text
+pytest -q tests/st/a2a3/host_build_graph/vector_example \
+  --platform a2a3 --device 0 --runtime host_build_graph --level 2
+
+1 passed in 9.72s
+```
+
+TRB L2使用顶层显式dispatch ST，注册两个不同callable，分别执行add/mul，
+复用registered handle并由`close()`回收worker-owned device tensor。为缩短本轮占卡时间，
+只把性能循环调低为3次，首次注册、双callable和重用语义未缩减：
+
+```text
+PYPTO_DISPATCH_LOOP_ITERS=3 pytest -q \
+  tests/st/runtime/test_explicit_dispatch_onboard.py \
+  --platform=a2a3 --device=0
+
+1 passed in 5.18s
+```
+
+#### 10.50.4 单卡L3显式dispatch与pipeline复用
+
+首先运行单卡L3显式dispatch用例。虽然只使用device0，但仍建立完整
+HOST orchestrator→CHIP worker→InCore层级，并覆盖`prepare/register/handle/run/close`、
+resident weight和close后handle失效：
+
+```text
+pytest -q \
+  tests/st/distributed/test_l3_explicit_dispatch_onboard.py::test_l3_explicit_dispatch_single_chip \
+  --platform=a2a3 --device=0
+
+1 passed in 3.10s
+```
+
+随后运行L3 `DeviceTensor`复用用例：一次上传resident weight，连续提交三组不同
+input/output，前两次同时占用有界metadata frame，第三次等待最旧frame后复用：
+
+```text
+pytest -q tests/st/distributed/test_l3_device_tensor.py \
+  --platform=a2a3 --device=0
+
+1 passed in 3.06s
+```
+
+这两个L3用例分别给出显式接口和persistent/pipeline的真实device证据，也证明
+本轮`ChipCallable` ABI、runtime选择、L1-only state和HBG改造没有破坏这两条旧路径。
+
+#### 10.50.5 结论边界
+
+本轮可以将“L2 one-shot/reuse与L3 persistent/pipeline定向回归”标为A2/A3 device0
+通过。但这不是整个L2/L3 ST suite，也不是A5上板证据；两者继续作为更广
+发布矩阵，不用这四个绿色用例过度声称“全量回归完成”。
