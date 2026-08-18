@@ -36,6 +36,7 @@ _FAULT_STAGES = (
     "platform_bridge",
     "affinity_inputs",
     "kernel_args_runtime",
+    "physical_core_mapping",
 )
 
 

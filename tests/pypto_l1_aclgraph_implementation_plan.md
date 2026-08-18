@@ -2585,11 +2585,15 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 > `runtime_destroy`七个受控中止点；runtime `50c3badd`进一步增加`scheduler_init`，在真实
 > `post_handshake_init()`成功、AICore window已分配后让`init_rc`失败，并修正该分支原先未逐线程
 > `shutdown()`便进入completion gate的缺口。后续A2/A3专属扩展继续加入`scheduler_assign`、
-> `scheduler_dispatch`、`platform_bridge`、`affinity_inputs`和`kernel_args_runtime`，把矩阵扩为13个
+> `scheduler_dispatch`、`platform_bridge`、`affinity_inputs`、`kernel_args_runtime`和
+> `physical_core_mapping`，把矩阵扩为14个
 > task-local、完整hash认证的stage：assign在core discovery后、assignment前触发；dispatch只有在
 > `dispatch_ready_tasks()`真实publish过任务后触发；后三项分别走generation建立前的平台桥、
-> affinity validator和persistent KernelArgs/Runtime binding拒绝闭包。A2/A3 device0现已连续执行
-> 全部13个中止点；每次外部device synchronize均返回，除允许已经publish部分工作量的真实dispatch
+> affinity validator、persistent KernelArgs/Runtime binding拒绝闭包，以及已report core的
+> per-core pre-window CANCEL。physical-core stage分别选择一个实际有效的AIC和AIV report，把其
+> effective register mapping视为0；只有两类entry都实际命中CANCEL且没有并发自然mapping错误时才
+> 允许controlled success。A2/A3 device0现已连续执行
+> 全部14个中止点；每次外部device synchronize均返回，除允许已经publish部分工作量的真实dispatch
 > stage外，其余output保持sentinel，随后同一context的正常generation恢复完整working slot并验数，
 > 最后同一context又完成ACLGraph capture和两次replay。该ST没有调用device reset。它不替代
 > slot/callable/bad-blob的未认证自然损坏、真实device KernelArgs篡改、physical-core故障或完全失联
@@ -2665,10 +2669,11 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 
 - [x] task-local hook在A2/A3 device0覆盖restore copy/publish、真实scheduler init失败、
   scheduler init完成后、classify前、dispatch前、shutdown后、runtime destroy后、assign内部、
-  真实scheduler dispatch内部、platform bridge、affinity inputs和KernelArgs/Runtime binding共13个stage；
+  真实scheduler dispatch内部、platform bridge、affinity inputs、KernelArgs/Runtime binding和
+  physical-core mapping共14个stage；
   受控错误只有在内部实际命中且共享
   error等于该stage专属值时才转成测试成功，不吞掉自然错误。
-- [x] 上述13个case逐一证明caller tail可达；除真实dispatch内部故障允许已经publish部分工作量外，
+- [x] 上述14个case逐一证明caller tail可达；除真实dispatch内部故障允许已经publish部分工作量外，
   其余case的output保持sentinel；每个case后下一次同context
   合法eager恢复并验数；全部case后同一context继续完成ACLGraph capture与两次replay，全程无reset。
 - [x] `SchedulerAssign`在core discovery完成但尚未调用`assign_cores_to_threads()`时执行
@@ -2683,9 +2688,10 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 - [ ] callable缺失、bad blob/header/identity/placeholder等**未通过完整package认证**的自然错误，generation建立前CANCEL在A2/A3可见；不能把这些损坏伪装成受控success来做测试。
 - [ ] `allowed_count/launch_count`为0、超过 `MAX_GATE_THREADS`或allowed多于launched时，也在真实device路径证明任何线程进入affinity barrier前失败；当前A2/A3 device只注入代表性负数，完整输入矩阵已有no-hardware validator反例。
 - [ ] 真实篡改device `KernelArgs::runtime_args`时，AICPU向registered Runtime写CANCEL，AICore通过第二个trusted Runtime launch参数读取同一control并退出；当前stage只在绑定实际正确时认证并演练同一拒绝闭包，不声称已经安全篡改device内存；AIC/AIV entry仍需分别取证。
-- [ ] A2/A3 physical core id越界和范围内但register address为0时，AICPU只写对应per-core CANCEL，不访问未知SPR；A5相关项已移出当前验收范围。
+- [x] A2/A3 device0分别从真实有效AIC与AIV report中选择一项，把effective register mapping注入为0；AICPU不访问该项SPR，只向对应旧Handshake control line写per-core CANCEL，其余已打开core走emergency shutdown；只有AIC/AIV两bit都命中且无自然mapping错误时才受控成功，随后同context恢复及ACLGraph replay通过。
+- [ ] A2/A3真实physical core id越界报告仍需故障源或安全等价注入取证；不能用“有效id + 注入zero mapping”冒充越界id本身。A5相关项已移出当前验收范围。
 - [x] restore、scheduler-init、assign、dispatch、shutdown和runtime-destroy各阶段注入错误，所有有效AICPU participant均完成arrive/finalize/snapshot/depart，只有last-depart清代际状态；A2/A3 device0已经逐点覆盖assign与实际dispatch内部故障。
-- [x] 当前13个受控故障case后caller-stream tail event均可达，context不依赖device reset，随后同context合法eager成功；全部case后同context capture/replay成功。
+- [x] 当前14个受控故障case后caller-stream tail event均可达，context不依赖device reset，随后同context合法eager成功；全部case后同context capture/replay成功。
 - [ ] 完全不进入或不report的硬件core按外部op-timeout/driver恢复边界记录，不伪装成PyPTO算子内可恢复case。
 
 ### N.11 独立硬阻塞：host orchestration的tensor-data依赖

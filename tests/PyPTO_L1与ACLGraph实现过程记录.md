@@ -5594,3 +5594,120 @@ pytest -q \
 
 这些边界不会阻止当前A2/A3主路径和13项安全可控故障矩阵收口，但在对应功能被纳入产品保证前，
 必须继续保持fail-closed表述，不能用本轮绿色结果代替尚未执行的破坏性实机实验。
+
+### 10.53 A2/A3 physical-core pre-window CANCEL的AIC/AIV实机闭环
+
+#### 10.53.1 为什么已有静态predicate还不够
+
+10.18已经实现了`aicore_register_mapping_invalid()`和per-core pre-window CANCEL：AICPU看到
+`physical_core_id`越界或对应register address为0时，不能访问未知SPR，而是向该logical worker的
+旧Handshake control line写`AICORE_PRE_WINDOW_CANCEL`并flush；AICore在等待
+`DATA_MAIN_BASE`期间周期invalidate该line，看到CANCEL后直接退出。独立`L1AicoreReport`又保证
+AICore report与AICPU control不再共享写所有权。
+
+但此前证据只有predicate UT、A2/A3/A5交叉构建和源码时序，没有真实证明以下完整链条：
+
+```text
+AICore实际report
+  -> AICPU识别不可用mapping
+  -> 不执行platform_init_aicore_regs(0)
+  -> 对该core发布GM CANCEL
+  -> hidden AICore kernel中对应block退出
+  -> 其他已打开core收到register EXIT
+  -> hidden done event与caller tail到达
+  -> 同context下一代仍可执行
+```
+
+这条链直接决定borrowed-device L1是否需要reset，不能用Host predicate为真来替代device行为。
+
+#### 10.53.2 task-local stage 14与自然错误隔离
+
+新增`PhysicalCoreMapping = 14`，仍沿用每份runtime-owned HostArgs中的hash认证marker。先在两组
+common UT和device ST中引用新枚举，再构建得到预期红灯：
+
+```text
+error: ‘PhysicalCoreMapping’ is not a member of ‘simpler::hbg::HbgL1FaultStage’
+```
+
+实现后，A2/A3 `AicpuExecutor::init()`把认证后的stage传入每个participant的
+`handshake_partition()`。每个partition照常invalidate并读取真实`L1AicoreReport`，先计算真实
+`physical_core_id`、`core_type`和register address。注入不写坏report、不修改全局register表，也不
+访问伪造SPR；它只对一个**原本完全有效**的report把本次局部`effective reg_addr`视为0，从而进入
+production不可用mapping分支并执行真实`publish_pre_window_cancel()`。
+
+为了避免依赖“logical worker 0恰好是哪一种core”，最终实现没有固定worker id，而是使用一个
+原子type bitmask：
+
+```text
+bit 0：首个原本有效的AIC report已经走注入拒绝/CANCEL
+bit 1：首个原本有效的AIV report已经走注入拒绝/CANCEL
+```
+
+同类型其余core继续走正常开window路径；不同AICPU slice通过`fetch_or`竞争各类型唯一注入者。
+leader只有在以下条件全部满足时才把`-1714`识别为受控故障：
+
+1. 完整task package与marker认证成功；
+2. AIC与AIV两个bit都已经由真实有效report置位；
+3. `handshake_failed_`确实到达leader；
+4. `handshake_unexpected_failure_`仍为false；
+5. `post_handshake_init()`返回值精确等于stage 14专属错误。
+
+若任意core同时出现真正的id越界或真实register address为0，代码会单独置
+`handshake_unexpected_failure_`；即使两个测试bit也已经命中，leader仍返回自然失败，绝不会被
+test marker吞掉。leader对所有已经开window的core执行`emergency_shutdown()`；两个注入core则只
+依赖各自GM CANCEL退出。之后每个AICPU participant仍执行逐线程shutdown、
+arrive/finalize/snapshot/depart，last-depart才清代际状态。
+
+#### 10.53.3 两轮device0验证及证据强度
+
+第一版stage 14先固定选择logical worker 0，A2/A3 device0完整14阶段矩阵通过：
+
+```text
+1 passed, 1 deselected in 38.52s
+```
+
+这个结果证明了单个真实report的CANCEL链，但无法证明AIC/AIV两种kernel entry都覆盖，因此没有以
+该结果结束。改为双type bitmask、重新构建GPT runtime后，再次确认NPU process table为空，并在
+device0重跑同一矩阵：
+
+```text
+pytest -q -s tests/st/runtime/l1/test_l1_hbg_fault_injection.py \
+  --platform=a2a3 --device=0
+
+1 passed, 1 deselected in 38.44s
+```
+
+stage 14若没有同时命中AIC和AIV两个bit会返回非零并使该ST失败；因此这次绿色结果同时证明两类
+entry都完成了report→per-core CANCEL→hidden kernel退出。该stage保持output sentinel；紧邻的
+同context正常generation得到7，全部14项后同一context ACLGraph对输入11和-3的replay分别得到16
+和2。全程只有外部测试侧synchronize，没有device reset。
+
+随后在fault环境变量未设置的独立进程中重跑正常A2/A3 HBG L1选择集：
+
+```text
+6 passed, 12 deselected in 46.62s
+```
+
+无硬件与构建证据为：
+
+```text
+test_hbg_launch_blob + test_hbg_aicpu_invocation   2/2 passed
+A2/A3 onboard HBG AICPU                            build passed
+clang-format dry-run                               passed
+```
+
+本节仍严格遵守A2/A3-only范围，没有修改、构建或运行A5专属路径。
+
+#### 10.53.4 仍未被本case证明的边界
+
+本case可以勾选“范围内有效physical id但本次mapping被判为0时，AIC/AIV均通过GM CANCEL退出且
+不访问未知SPR”。它不能被表述为已经证明：
+
+- 硬件或report内存真正产生越界`physical_core_id`时的全部日志/故障传播行为；
+- AICore完全未进入或从未publish report时的算子内恢复；
+- 任意真实SPR/MMIO故障均可由PyPTO恢复；
+- A5具有相同行为。
+
+其中完全不report的core仍属于外部CANN op-timeout、driver fault containment或context/device
+recovery边界。L1单算子既不能内部stream/device sync，也不能reset用户设备；文档继续明确这一点，
+不把无法观察的硬件失联伪装成可由算子内协议修复。
