@@ -2758,3 +2758,27 @@ HBG L1 + ACLGraph只在同时满足下列条件后才可以宣布完成：
 11. TRB L1、HBG/TRB L2和L3回归通过，当前已确定的API与所有权不被暗中改写。
 
 本附录明确把WithHostArgs inline payload定义为**已经接通源码、仍需要device P0证明的首选路径**，而不是已经得到CANN产品行为保证的能力。它遵循AscendC tiling data的核心所有权形态：每个launch task/captured node带一份immutable inline参数快照；但HBG graph image会被执行消费，所以还必须由该task在每次execution/replay把pristine source恢复到context-owned mutable working slot。任何只保持一份device graph buffer、只在capture时H2D一次、不在每次replay恢复working state，或用临时host source和隐式sync规避lifetime问题的实现，均不满足第二阶段完成定义。
+
+### N.13 2026-08-18 A2/A3当前状态覆盖与Grok交叉审查
+
+N.9～N.12保留了HBG实现过程中的阶段门槛，其中“strong capability仍返0”、“第二context
+尚未上板”和“large HostArgs/working-slot restore尚无device证据”是当时的真实快照，不得作为当前
+HEAD状态。当下A2/A3结论以本节和过程记录10.48～10.62为准：
+
+1. HBG L1 capability已打开；TRB/HBG均经正式`pypto_init -> prepare -> warmup -> capture/replay`高层路径
+   上板；
+2. context generation已解决resident AICPU registry跨context冲突，ELF符号隔离已解决同进程
+   TRB→HBG preemption；两项都已有A2/A3设备证据；
+3. WithHostArgs已有64 KiB～64 MiB、压力task、双captured graph各100次replay和destroy回收证据；
+   正式HBG已证明task/node-local immutable source向context mutable working slot的per-generation full restore；
+4. v1仍只支持外部保证无并发的顺序eager/graph replay；graph-bound tensor与context必须存活到外部
+   quiescence及`graph.reset()`之后，再close context；
+5. 2026-08-18对Grok HEAD的只读交叉审查没有发现应迁移的A2/A3 P0/P1生产修复。Grok值得吸收
+   的是更广的算子证据；因此新增ReLU+SiLU双program、真实multi-child matmul+bias接64×64
+   独立program的TRB/HBG设备回归，与已有交叉case合并在device0得到`10 passed`。
+
+不采用Grok当前“CANN HostArgs中的SM/arena同时作为执行working image，replay时手工重置已知字段”
+的简化。它对已实测小图有效，但依赖持续枚举scheduler/runtime_destroy的全部可变状态，与完整
+pristine restore不等价。GPT继续保持canonical plan、writable serialization scratch、CANN task/node-local
+immutable snapshot、context mutable working slot与context-resident runtime resources五层owner；这是当前HBG图作为
+AscendC tiling类参数时的长期生命周期契约。

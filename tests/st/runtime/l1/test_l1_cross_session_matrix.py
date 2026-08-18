@@ -20,6 +20,9 @@ import pypto.language as pl
 import pytest
 import torch
 import torch_npu
+from examples.beginner.activation import fused_add_relu, silu
+from examples.beginner.elementwise import tile_add_64
+from examples.intermediate.fused_linear import fused_matmul_bias
 from harness.core.harness import ONBOARD_PLATFORMS
 from pypto.l1 import L1InitializationError, pypto_init
 from pypto.runtime import RunConfig
@@ -59,6 +62,20 @@ def _l1_mul_f16(
 def _compile(kernel: Any, *, platform: str, device_id: int, runtime: str):
     kernel._cache.clear()
     return kernel.compile(config=RunConfig(platform=platform, device_id=device_id, runtime=runtime))
+
+
+def _compile_with_args(
+    kernel: Any,
+    *args: torch.Tensor,
+    platform: str,
+    device_id: int,
+    runtime: str,
+):
+    kernel._cache.clear()
+    return kernel.compile(
+        *args,
+        config=RunConfig(platform=platform, device_id=device_id, runtime=runtime),
+    )
 
 
 def _cleanup_context(context: Any, graphs: Sequence[Any], device_id: int) -> None:
@@ -235,6 +252,166 @@ def test_two_graphs_on_distinct_streams_replay_sequentially(
     finally:
         graphs = tuple(graph for graph in (graph_a, graph_b) if graph is not None)
         _cleanup_context(context, graphs, device_id)
+
+
+@pytest.mark.parametrize("runtime", _RUNTIMES)
+@pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+def test_distinct_nonlinear_programs_share_one_graph(
+    test_config: RunConfig,
+    platform: str,
+    runtime: str,
+) -> None:
+    """Two unlike vector programs keep independent callable-local state."""
+    device_id = test_config.device_id
+    torch_npu.npu.set_device(device_id)
+    device = torch.device(f"npu:{device_id}")
+    relu_lhs = torch.zeros((128, 128), dtype=torch.float32, device=device)
+    relu_rhs = torch.zeros((128, 128), dtype=torch.float32, device=device)
+    relu_output = torch.empty((128, 128), dtype=torch.float32, device=device)
+    silu_input = torch.zeros((32, 128), dtype=torch.float32, device=device)
+    silu_output = torch.empty((32, 128), dtype=torch.float32, device=device)
+    relu_program = _compile_with_args(
+        fused_add_relu,
+        relu_lhs,
+        relu_rhs,
+        relu_output,
+        platform=platform,
+        device_id=device_id,
+        runtime=runtime,
+    )
+    silu_program = _compile_with_args(
+        silu,
+        silu_input,
+        silu_output,
+        platform=platform,
+        device_id=device_id,
+        runtime=runtime,
+    )
+
+    context = None
+    graph = None
+    try:
+        try:
+            context = pypto_init(programs=(relu_program, silu_program), device=device_id)
+        except L1InitializationError as exc:
+            context = exc.cleanup_context
+            raise
+        relu_op = context.operator(relu_program)
+        silu_op = context.operator(silu_program)
+        capture_stream = torch_npu.npu.Stream(device=device_id)
+
+        context.prepare()
+        relu_op.warmup(relu_lhs, relu_rhs, out=relu_output)
+        silu_op.warmup(silu_input, out=silu_output)
+        torch_npu.npu.synchronize(device_id)
+
+        graph = torch_npu.npu.NPUGraph()
+        with torch_npu.npu.graph(graph, stream=capture_stream):
+            relu_op(relu_lhs, relu_rhs, out=relu_output)
+            silu_op(silu_input, out=silu_output)
+
+        relu_count = relu_lhs.numel()
+        silu_count = silu_input.numel()
+        for offset in (-2.5, 0.0, 3.0):
+            host_relu_lhs = torch.linspace(-4.0, 4.0, relu_count).reshape(relu_lhs.shape)
+            host_relu_rhs = torch.full(relu_rhs.shape, offset)
+            host_silu = torch.linspace(-3.0 + offset, 2.0 + offset, silu_count).reshape(silu_input.shape)
+            with torch_npu.npu.stream(capture_stream):
+                relu_lhs.copy_(host_relu_lhs)
+                relu_rhs.copy_(host_relu_rhs)
+                silu_input.copy_(host_silu)
+                graph.replay()
+            capture_stream.synchronize()
+            torch.testing.assert_close(relu_output.cpu(), torch.relu(host_relu_lhs + host_relu_rhs))
+            torch.testing.assert_close(
+                silu_output.cpu(),
+                host_silu * torch.sigmoid(host_silu),
+                rtol=2e-3,
+                atol=2e-3,
+            )
+    finally:
+        _cleanup_context(context, () if graph is None else (graph,), device_id)
+
+
+@pytest.mark.parametrize("runtime", _RUNTIMES)
+@pytest.mark.parametrize("platform", ONBOARD_PLATFORMS)
+def test_multichild_matmul_then_distinct_small_tile_program(
+    test_config: RunConfig,
+    platform: str,
+    runtime: str,
+) -> None:
+    """A cube+vector multi-child callable composes with a separate 64x64 callable."""
+    device_id = test_config.device_id
+    torch_npu.npu.set_device(device_id)
+    device = torch.device(f"npu:{device_id}")
+    shape = (64, 64)
+    lhs = torch.zeros(shape, dtype=torch.float32, device=device)
+    rhs = torch.eye(shape[0], dtype=torch.float32, device=device)
+    bias = torch.zeros(shape, dtype=torch.float32, device=device)
+    matmul_output = torch.empty(shape, dtype=torch.float32, device=device)
+    tail = torch.zeros(shape, dtype=torch.float32, device=device)
+    output = torch.empty(shape, dtype=torch.float32, device=device)
+    matmul_program = _compile_with_args(
+        fused_matmul_bias,
+        lhs,
+        rhs,
+        bias,
+        matmul_output,
+        platform=platform,
+        device_id=device_id,
+        runtime=runtime,
+    )
+    assert matmul_program.chip_callable.child_count >= 2
+    add_program = _compile_with_args(
+        tile_add_64,
+        matmul_output,
+        tail,
+        output,
+        platform=platform,
+        device_id=device_id,
+        runtime=runtime,
+    )
+
+    context = None
+    graph = None
+    try:
+        try:
+            context = pypto_init(programs=(matmul_program, add_program), device=device_id)
+        except L1InitializationError as exc:
+            context = exc.cleanup_context
+            raise
+        matmul_op = context.operator(matmul_program)
+        add_op = context.operator(add_program)
+        capture_stream = torch_npu.npu.Stream(device=device_id)
+
+        context.prepare()
+        matmul_op.warmup(lhs, rhs, bias, out=matmul_output)
+        add_op.warmup(matmul_output, tail, out=output)
+        torch_npu.npu.synchronize(device_id)
+
+        graph = torch_npu.npu.NPUGraph()
+        with torch_npu.npu.graph(graph, stream=capture_stream):
+            matmul_op(lhs, rhs, bias, out=matmul_output)
+            add_op(matmul_output, tail, out=output)
+
+        element_count = shape[0] * shape[1]
+        host_lhs_base = torch.linspace(-1.0, 1.0, element_count).reshape(shape)
+        for scale, bias_value, tail_value in ((0.5, -1.0, 2.0), (2.0, 0.25, -0.5), (-1.0, 3.0, 1.0)):
+            host_lhs = host_lhs_base + scale
+            host_rhs = torch.eye(shape[0], dtype=torch.float32) * scale
+            host_bias = torch.full(shape, bias_value)
+            host_tail = torch.linspace(tail_value, tail_value + 1.0, element_count).reshape(shape)
+            with torch_npu.npu.stream(capture_stream):
+                lhs.copy_(host_lhs)
+                rhs.copy_(host_rhs)
+                bias.copy_(host_bias)
+                tail.copy_(host_tail)
+                graph.replay()
+            capture_stream.synchronize()
+            expected = host_lhs * scale + host_bias + host_tail
+            torch.testing.assert_close(output.cpu(), expected, rtol=1e-3, atol=1e-3)
+    finally:
+        _cleanup_context(context, () if graph is None else (graph,), device_id)
 
 
 if __name__ == "__main__":

@@ -9,8 +9,19 @@
 
 # Load resource limits from the primary checkout so linked worktrees share the
 # same machine profile. Unclassified machines use conservative defaults.
-PYPTO_GIT_COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
-PYPTO_PRIMARY_WORKTREE=$(dirname "$PYPTO_GIT_COMMON_DIR")
+if ! PYPTO_GIT_COMMON_DIR=$(git rev-parse --git-common-dir 2>/dev/null); then
+    echo "load-env.sh must be sourced from a Git worktree" >&2
+    return 1
+fi
+case "$PYPTO_GIT_COMMON_DIR" in
+    /*) ;;
+    *)
+        PYPTO_GIT_COMMON_PARENT=$(cd "$(dirname -- "$PYPTO_GIT_COMMON_DIR")" && pwd -P) || return $?
+        PYPTO_GIT_COMMON_DIR="$PYPTO_GIT_COMMON_PARENT/$(basename -- "$PYPTO_GIT_COMMON_DIR")"
+        unset PYPTO_GIT_COMMON_PARENT
+        ;;
+esac
+PYPTO_PRIMARY_WORKTREE=$(dirname -- "$PYPTO_GIT_COMMON_DIR")
 PYPTO_TESTING_ENV="$PYPTO_PRIMARY_WORKTREE/.claude/skills/testing/testing.env"
 
 if [ -f "$PYPTO_TESTING_ENV" ]; then

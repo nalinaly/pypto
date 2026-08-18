@@ -6265,3 +6265,119 @@ pytest -q -s tests/st/runtime/l1/test_l1_cross_session_matrix.py \
 没有要求或调用device reset，也没有修改runtime生产代码。结论是：Grok的核心功能点在GPT中已有
 同等或更强闭环，本轮吸收的是能增加交叉实现置信度的设备反例，而不是降低GPT的taskQueue、lifetime、
 fail-closed或no-reset约束来追求表面代码一致。
+
+### 10.62 复核Grok比较结论并补齐异构算子上板证据
+
+#### 10.62.1 比较文字引用了GPT的过期阶段快照
+
+用户转发的Grok评价对两边基本红线的归纳是准确的：两边都不查capture state、不拿graph handle、
+不用`rtStreamAddToModel`、不在正常launch里做H2D/sync/device allocation，close不reset借用的device。
+它对GPT的taskQueue、失败owner和callable-local `func_id`评价也与当前源码一致。但下列判断引用的是
+10.43～10.45之间的中间状态，不是本轮HEAD：
+
+1. **“HBG长期`supported=0`”已过期。** A2/A3 HBG L1 capability已在硬门槛通过后打开，普通eager、
+   ACLGraph、双callable和故障注入均走正式高层API，不是实验私有入口；
+2. **“第二个HBG context仍因`status=7 Conflict`未闭环”已过期。** 该真实问题曾经被GPT上板发现，
+   之后通过context generation有序reset resident registry修复；device1已证明同一Host进程的第二context可重新
+   从`callable_id=0`/`func_id=0`注册并完成capture/replay；
+3. **“TRB→HBG不能共进程”已过期。** HBG orchestration/runtime DSO的ELF符号隔离已修复跨runtime
+   symbol preemption；同一进程先TRB再HBG的首context和后续context已有设备证据；
+4. **“CANN大HostArgs/captured-node lifetime和working-slot restore没有板上证据”已过期。** 独立探针
+   已扫描64 KiB、1 MiB、16 MiB和64 MiB，包括64 MiB captured graph、2048个压力task、双graph各100次交替
+   replay和graph destroy后回收；正式HBG又验证了每代full restore、双package和no-reset fault matrix；
+5. **“GPT上板只有一条黄金路径”也不再成立。** 当前A2/A3证据已包括TRB/HBG、同callable双node、
+   双callable、双graph、multi-output、internal workspace、scalar、FP16、非均匀输入、8次replay、stream边界压力、
+   真实CANN API trace和16阶段HBG no-reset故障矩阵。
+
+上述并不否定Grok在较早时间点更快拿到HBG简单算子验数；它只是阻止用过期快照反向得出“当前GPT
+HBG仍不可用”的结论。当前对比必须分开“曾经暴露并修复的问题”和“HEAD仍未修的问题”。
+
+#### 10.62.2 Grok HBG blob并不是比五层owner更简单的等价实现
+
+只读核对Grok当前A2/A3 HBG实现后，其`L1HbgGraphHeader + SM + arena`确实作为
+`aclrtLaunchKernelWithHostArgs`的tiling-class blob跟随task。但设备执行时并不是“不可变source每次恢复到
+另一份working slot”：AICPU直接把CANN task args里的SM/arena地址挂到Runtime，执行就地修改这份blob，
+下一次replay再由`reset_l1_hbg_execution_state()`手工重置选定的completion flag、slot state、watermark和ready queue。
+`host_done_mask`只有64 bit，当前默认task window又为16；这个模型已能支持它实测的小图，但它对“所有被
+scheduler/runtime_destroy消费的可变字段”的完整性依赖人工枚举，与full pristine restore不等价。
+
+GPT当前保留五个独立owner，不是为了抽象层次而抽象：
+
+1. canonical `GraphPlan`是Host不可变的构图结果和hash trust root；
+2. writable serialized scratch只用来生成一次WithHostArgs launch image，允许CANN做placeholder patch，不污染plan；
+3. CANN按eager task/captured node持有各自的immutable HostArgs source snapshot，因而graph A/B不会被后一次host build覆盖；
+4. context内只有一份mutable device working slot，v1在外部保证无并发时允许复用；每次eager/replay由AICPU leader
+   在Start之后、dispatch之前完整restore pristine SM与runtime arena；
+5. Runtime/KernelArgs、workspace、binary、hidden stream/events属于context-resident resources，只在graph已reset且外部quiescent后close。
+
+这个模型与用户对“HBG graph就是该task的AscendC tiling参数”的约束一致，又额外处理了HBG image会被
+执行消费的特性。Grok的板上结果证明了“WithHostArgs可以承载这类图包”，是有价值的交叉证据；
+它不证明应该把GPT的immutable source与mutable slot合并，因此本轮不迁移这一实现。
+
+#### 10.62.3 真正值得吸收的是算子多样性反例
+
+Grok的泛化矩阵在ReLU、SiLU、真实matmul多child和64×64小tile上比GPT早先的test-local add/mul更广。
+这不是可以靠阅读代码消除的差距，因此继续扩展
+`tests/st/runtime/l1/test_l1_cross_session_matrix.py`，添加两组每组同时参数化TRB/HBG的case：
+
+1. 同一context注册`fused_add_relu`和`SiLU`，同一ACLGraph依次调用两个不同shape/不同运算链的
+   callable，三轮用非均匀linspace和正负offset同时验证ReLU与SiLU；
+2. 第一个callable使用真实64×64 cube matmul + vector bias，并硬断言`child_count >= 2`；第二个callable
+   是独立64×64 tile add，同一graph建立`matmul+bias -> add`真实tensor依赖。三轮replay更换矩阵、
+   对角rhs、bias和tail，直接检验两张差异很大的callable-local函数表、multi-child internal workspace、
+   HBG package和working-slot restore，不再用add+mul作为唯一反例。
+
+所有case继续使用严格销毁顺序：先外部device synchronize，再`graph.reset()`，最后`context.close()`，
+并保持所有graph-bound tensor的强引用至graph reset完成。没有照搬Grok测试中直接`ctx.close()`且让graph
+稍后随Python析构的宽松lifetime。
+
+#### 10.62.4 环境误配拦截与device0最终结果
+
+首次执行时虽按要求source了`.claude/skills/testing/load-env.sh`，但该脚本在当前Git上会将
+`--path-format=absolute`当作普通输出，`dirname`因而报错，机器环境未真正载入。结果进程误用user-site
+Torch 2.12/Torch-NPU 2.12，且PATH上没有PTOAS：
+
+- nonlinear两case在`pypto_init`前被adapter build-version检查拒绝；
+- matmul两case生成`skip_ptoas=True`的compile-only artifact，在访问`chip_callable`时被缺少
+  `kernel_config.py`检查拒绝；
+- 四个case都没有创建PyPTO L1 context，也没有launch PyPTO AICPU/AICore；但测试在拦截前已创建
+  普通NPU tensor，因此只能精确写为“无PyPTO device task”，不写成“无任何NPU行为”。
+
+本轮同时修正了loader的Git 2.25兼容性：不再使用该版本尚不支持的
+`git rev-parse --path-format=absolute`，而是读取`--git-common-dir`后显式把相对路径归一化为绝对路径。
+`bash -n`、工作树根目录source和`tests/`子目录source全部通过，两者都安静得到默认
+`PYPTO_BUILD_JOBS=2`/`PYPTO_TEST_JOBS=2`。主工作树当前没有忽略的`testing.env`，所以按testing skill
+保留`unclassified`的保守默认值；该loader只负责机器资源上限，不会选择Torch/PTOAS，下述显式
+Python与工具隔离仍是必需的。
+
+随后保留source脚本这一要求，另外显式固定隔离环境：
+
+```text
+PYTHONNOUSERSITE=1
+PYTHONSAFEPATH=1
+PYTHONPATH=gpt_pypto/python:gpt_pypto/runtime/python:gpt_pypto/runtime:gpt_pypto/tests/st
+PTOAS_ROOT unset
+PATH first = PTOAS/build-v0.57-llvm21-cann9.2-clean/tools/ptoas
+torch       = 2.7.1+cpu
+torch_npu   = 2.7.1.post4
+adapter     = built against 2.7.1+cpu / 2.7.1.post4
+```
+
+静态结果为Ruff check/format、`py_compile`、`git diff --check`全部通过，collect-only得到10个A2/A3
+选中项和10个A5 deselection。用户已明确授权使用device0；测试前`npu-smi`的process table为
+`No running processes found`，本轮不执行device reset。先只跑新增四项：
+
+```text
+4 passed, 16 deselected, 1 warning in 30.11s
+```
+
+再在同一新pytest进程中运行整份交叉矩阵：
+
+```text
+10 passed, 10 deselected, 1 warning in 60.22s
+```
+
+10个选中项即五个场景乘TRB/HBG；除新增四项外，同进程还重新验证了同callable双node、
+FP16和不同capture stream的两张graph。因此本轮“有则改之”的具体产物是四个更强的A2/A3设备
+回归case，不是生产实现修补；对比和上板均没有发现一个Grok已正确解决而GPT HEAD仍缺失的A2/A3
+P0/P1代码问题。
