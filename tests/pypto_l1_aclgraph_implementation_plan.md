@@ -2559,6 +2559,13 @@ task入队仍复用同一单算子拓扑：caller stream完成handshake memset�
 本矩阵是第二阶段开工门槛，不并入当前TRB Phase 0的已实现声明。优先使用device 1，device 0留给并行会话。
 
 > **2026-08-18探针快照：** runtime `3575f60b`已经把N.10.1～N.10.3中属于通用CANN WithHostArgs owner的部分做成独立可执行探针，路径为`tests/st/l1/host_args_probe`。默认eager size为64 KiB、1 MiB、16 MiB、64 MiB，默认双graph size为1 MiB/16 MiB、各100次交替replay，并可配置pressure count/size；另有纯Host self-test验证三指针解析、错误placeholder诊断和非对齐typed-access规避。runtime `eedfdc90`又把同一parser/self-test纳入常规无硬件CMake矩阵，当前C++结果为99/99通过。上述提交只证明探针本身可构建和Host解析逻辑正确，尚未产生任何device行为证据；以下checkbox只有真实device 1日志、数值结果、错误码、时延与memory accounting齐备后才能更新。
+>
+> **2026-08-18 restore反例快照：** runtime `620f1df4`补充跨越多条64-byte cache line的
+> pristine SM/runtime-arena恢复测试。测试连续restore两次，在两次之间破坏首、中、尾字节，
+> 并验证每一轮都重新复制、publish完整region；另验证一次copy/publish失败不发布commit，之后
+> 只有完整成功restore才能覆盖整个被污染slot并发布正确generation/hash。完整no-hardware C++
+> 矩阵仍为99/99通过。这是Host算法和事务边界证据，不证明AICPU cache maintenance、AICore
+> 可见性或ACLGraph replay，因此N.10.4/N.10.5对应device checkbox仍保持未勾选。
 
 #### N.10.1 placeholder、snapshot与canonical immutability
 

@@ -4858,3 +4858,48 @@ table为空；无法证明quiescent，所以没有运行probe，也没有运行1
 当前probe不验证HBG leader restore、working slot、scheduler completion gate或hidden AICore
 CANCEL；这些仍必须由production HBG路径和专用fault injection证明，不能因为通用
 WithHostArgs probe未来全绿就省略。
+
+#### 10.47.8 HBG跨cache-line恢复与失败后重试反例
+
+在建设device fault hook之前，先复核现有`test_hbg_launch_blob`能够证明什么。原测试已经
+覆盖“每次调用restore都会复制两份region”，但其SM/arena样本较小，也没有把首、中、尾
+分布到多条cache line；restore失败case只检查commit保持sentinel，没有继续证明被部分修改的
+mutable slot可以由下一次完整restore修复。这两处如果没有反例，未来把restore错误地优化成
+只更新header或只在首次执行复制，也可能让已有UT继续通过。
+
+runtime提交`620f1df4`增加独立`MultiLineRestoreHarness`，使用：
+
+```text
+pristine SM size       = 5 * 64 + 13 bytes
+pristine arena size    = 7 * 64 + 31 bytes
+restore regions        = SM + runtime arena
+连续restore次数       = 2
+每个region破坏位置    = first / middle / tail
+预期copy/publish次数   = 4 / 4
+```
+
+两份source由不同的逐字节确定性pattern填充，而不是只有头尾canary。第一次restore后逐字节比较
+整个working SM和arena；随后分别翻转两个region的首、中、尾字节，再执行第二次restore并再次
+逐字节比较。callback还记录每次publish的size，结果必须精确为
+`{sm_size, arena_size, sm_size, arena_size}`。这证明Host restore算法不会因为跨越cache line、
+非64-byte整数长度或第二次调用而缩短region。
+
+失败事务case也被扩展：先分别注入copy和publish失败，确认`HbgRestoreCommit`始终保持调用前
+sentinel；然后清除故障，把整个working SM/arena覆盖为新pattern，再次执行完整restore。只有
+这一次成功后才能看到全部pristine bytes、`plan_generation=51`和正确`plan_hash`。这里允许
+失败尝试已经部分改写mutable slot，但绝不允许把它发布为ready generation；后续恢复必须
+覆盖整份source，不能依赖失败前遗留内容。
+
+本次验证使用GPT runtime工作树、并发2执行：
+
+```text
+test_hbg_launch_blob                         1/1 passed
+runtime C++ ctest -LE requires_hardware     99/99 passed
+pre-commit（该C++文件）                    all passed
+git diff --check                            passed
+```
+
+这组结果只证明`restore_hbg_launch_blob`的Host算法、region长度与commit事务边界。它没有让真实
+AICPU leader执行copy/publish，也没有证明A2/A3或A5的cache clean/invalidate、peer acquire、
+AICore descriptor读取和ACLGraph第二次replay可见性。因此设计文档N.10.4/N.10.5的device项
+没有被勾选；下一步仍需test-build-only fault hook和device1的production HBG replay证据。
