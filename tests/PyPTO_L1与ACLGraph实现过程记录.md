@@ -6478,3 +6478,21 @@ runtime/tests/ut/py/test_l1_chip_worker.py
 warning仍是系统`torch_npu`安装目录中`libop_plugin_atb.so`的owner不匹配提示，与路径交换和本次源码
 无关。至此正式main、Grok保留分支、两个可见目录、嵌套runtime仓、submodule、editable安装和默认build
 目录均完成隔离；后续实现与A2/A3上板默认只在`/mnt/workspace/inductor/pto/pypto`进行。
+
+### 10.64 远端发布关系
+
+用户进一步明确：PyPTO直接发布到`nalinaly/pypto`的`main`；simpler不改写其当前远端main，必须以
+PyPTO起步时gitlink固定的`3165cc89b6ea6b58a0bc01cbec2d5f72f2029c35`作为历史基线，发布到
+`nalinaly/simpler`的独立分支。最终按依赖顺序完成：
+
+1. 在simpler创建`pypto-l1-aclgraph`，确认其merge-base精确为`3165cc89`，其上保持29个原始顺序
+   提交，不rebase、不merge当前upstream/main，也不force push；
+2. 将该分支推送到`https://github.com/nalinaly/simpler.git`，远端HEAD为
+   `f48d7c290e0979f572fa6e55a21f652f04833886`；正式工作目录中的runtime也checkout该分支并跟踪
+   `nalinaly/pypto-l1-aclgraph`；
+3. simpler gitlink远端可获取后，把PyPTO本地main从远端`8ead22af`普通fast-forward推到
+   `52d2d62f`，没有force push。
+
+因此最终发布拓扑是`nalinaly/pypto:main`引用`nalinaly/simpler:pypto-l1-aclgraph`中的
+`f48d7c29`。simpler的`origin`仍保留为`hw-native-sys/simpler`用于对照，新增`nalinaly` remote只承载
+本次PyPTO L1分支。
