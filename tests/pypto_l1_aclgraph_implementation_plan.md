@@ -2,6 +2,17 @@
 
 <!-- markdownlint-disable MD036 MD060 -->
 
+> **2026-08-19 接口与生命周期收口说明：**本文完整保留最初以
+> `pypto_init/L1Context/L1Operator` 为中心的底层实现推导、阶段记录和历史结论，供
+> native 协议审计使用；它不再代表推荐的用户接口。最终公开入口、A2/A3 验收范围、
+> 动态 callable admission、HBG/TRB 生命周期和零 binary-unload 规则，以
+> `PyPTO_Triton风格L1_JIT调用接口设计.md` 及当前中英文用户文档为准。具体而言：普通
+> 用户直接调用 `@pl.jit(execution="l1", runtime=...)`；HBG package 随 launch/captured
+> node 自包含；TRB code registry 动态 append 且不复用；不存在公开 64-callable
+> 上限；新增 L1 路径永不调用 `aclrtBinaryUnLoad`/`rtsBinaryUnload`。本文后续出现的
+> “首期只支持 TRB”“首次批量声明全部 program”“sealed 后拒绝新 callable”“A5 必须
+> 验收”或“close 时卸载 binary”等文字均是对应阶段的历史设计，不覆盖上述最终决策。
+>
 > 状态：第一阶段TRB L1已在A2/A3 device 1完成正式无探针上板：`context.prepare()`、eager warmup、独立caller stream ACLGraph capture、图内PyTorch→L1→PyTorch顺序以及三次连续replay均通过，L2 control亦通过；对应runtime收口提交为`3631ea0d`。A5目前没有同等真实硬件证据，不能泛化为已上板。HBG第二阶段已经实现“每个task/captured node一份tiling-like graph package”：DeviceRunner按本次callable与参数构建immutable `HbgGraphPlan`，生成fresh writable HostArgs blob和placeholder，经独立HBG WithHostArgs run entry交给CANN；AICPU run entry取得prepare-time slot/callable trust roots，exactly-one leader在每次执行/replay前完整恢复共享working SM/runtime arena，peers只在统一restore verdict后进入classify/dispatch。函数地址表是callable-local快照，`callable_id`是context-global身份，两个program可以都从`func_id=0`开始。
 >
 > runtime `8427ffd7`完成HBG no-reset源码协议：generation内所有有效AICPU participant采用arrive/finalize/snapshot/depart两阶段完成门，generation前错误通过独立64-byte control line释放hidden AICore，已report但physical id/regs mapping无效的core走per-core CANCEL；prepare-time resident control地址覆盖slot registry不可用，Host直传的Runtime override避免AICPU/AICore因坏`KernelArgs::runtime_args`读取不同control，affinity越界在进入barrier前失败。runtime `80615b1e`与PyPTO提交`b8b3dd35`闭合versioned `pypto_orchestration_requirements_v1`生产/消费链：真正生成Host `get_tensor_data/set_tensor_data`的orchestration在borrowed HBG L1构图前fail-closed，只生成device predicate metadata的tensor read保持允许。在这些门禁后，当前工作树已令A2/A3与A5的`l1_runtime_supported_impl()`返回1，并通过`RunConfig(runtime="host_build_graph")`显式选择HBG；默认仍是TRB。

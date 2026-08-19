@@ -62,7 +62,7 @@ from collections.abc import Callable, Sequence
 from typing import Any, NamedTuple
 
 from pypto._external_source import external_source_digest
-from pypto._runtime_names import DEFAULT_RUNTIME
+from pypto._runtime_names import DEFAULT_RUNTIME, validate_runtime_name
 from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir
@@ -1560,6 +1560,7 @@ class JITFunction:
         func_type: str | None = None,
         level: Any = None,
         auto_scope: bool = True,
+        execution_config: tuple[str, str | None] = ("default", None),
         external_core_type: str | None = None,
         external_aic_source: str | None = None,
         external_aiv_source: str | None = None,
@@ -1570,6 +1571,7 @@ class JITFunction:
         self._func_type = func_type or "orchestration"
         self._level = level
         self._auto_scope = auto_scope
+        self._execution, self._execution_runtime = execution_config
         # External C++ kernel backing (func_type == "extern"): resolved absolute
         # paths the specializer emits as @pl.function(external_source=...).
         self._external_core_type = external_core_type
@@ -2139,6 +2141,162 @@ class JITFunction:
         ]
         return compiled, ordered_args, run_config
 
+    def _l1_output_names(self) -> tuple[str, ...]:
+        """Return pure ``pl.Out`` parameters in declaration order."""
+        out_params, _, _, _, _ = _classify_params(_get_func_def(self._func))
+        return tuple(out_params)
+
+    def _l1_resolve_annotation(self, name: str) -> Any:
+        """Resolve one annotation without applying typing's type restrictions."""
+        parameter = inspect.signature(self._func).parameters[name]
+        annotation = parameter.annotation
+        if isinstance(annotation, str):
+            try:
+                annotation = eval(annotation, _func_name_lookup(self._func))  # noqa: S307
+            except Exception as exc:  # noqa: BLE001
+                raise TypeError(
+                    f"@pl.jit(execution='l1') cannot resolve annotation for output {name!r}: {annotation!r}"
+                ) from exc
+        return annotation
+
+    def _l1_allocate_outputs(self, bound: inspect.BoundArguments, output_names: tuple[str, ...]) -> None:
+        """Allocate an all-or-none set of omitted pure outputs for eager L1."""
+        missing = tuple(name for name in output_names if name not in bound.arguments)
+        if not missing:
+            return
+        if len(missing) != len(output_names):
+            supplied = tuple(name for name in output_names if name in bound.arguments)
+            raise TypeError(
+                "@pl.jit(execution='l1') output omission is all-or-none; "
+                f"supplied={supplied}, omitted={missing}"
+            )
+
+        torch = _get_torch()
+        if torch is None:
+            raise RuntimeError("@pl.jit(execution='l1') requires PyTorch")
+        reference = next((value for value in bound.arguments.values() if _is_tensor(value)), None)
+        if reference is None:
+            raise TypeError(
+                "@pl.jit(execution='l1') cannot infer an output device without a tensor argument; "
+                "pass every output explicitly"
+            )
+
+        from pypto.ir.compiled_program import _to_torch_dtype  # noqa: PLC0415
+        from pypto.language.typing.tensor import Tensor  # noqa: PLC0415
+
+        for name in output_names:
+            annotation = self._l1_resolve_annotation(name)
+            if not isinstance(annotation, Tensor) or annotation.shape is None or annotation.dtype is None:
+                raise TypeError(
+                    f"@pl.jit(execution='l1') cannot allocate output {name!r}: use a complete "
+                    "pl.Out[pl.Tensor[[static_shape], dtype]] annotation or pass the output explicitly"
+                )
+            shape = tuple(annotation.shape)
+            if not shape or any(
+                isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0 for dim in shape
+            ):
+                raise TypeError(
+                    f"@pl.jit(execution='l1') cannot allocate output {name!r} "
+                    f"with non-static shape {shape!r}; "
+                    "pass the output explicitly"
+                )
+            dtype = _to_torch_dtype(annotation.dtype)
+            if dtype is None:
+                raise TypeError(
+                    f"@pl.jit(execution='l1') cannot allocate output {name!r} with dtype {annotation.dtype}"
+                )
+            bound.arguments[name] = torch.empty(shape, dtype=dtype, device=reference.device)
+
+    def _l1_validate_run_config(
+        self,
+        run_config: Any | None,
+        arguments: Sequence[Any],
+        *,
+        for_dispatch: bool = False,
+    ) -> Any:
+        """Resolve the fixed A2/A3 L1 compile/dispatch configuration."""
+        from pypto.runtime.runner import RunConfig  # noqa: PLC0415
+
+        tensors = [value for value in arguments if _is_tensor(value)]
+        if not tensors:
+            device_id = 0
+        else:
+            device_types = {str(value.device.type) for value in tensors}
+            if for_dispatch and device_types != {"npu"}:
+                raise ValueError(
+                    "@pl.jit(execution='l1') accepts only NPU tensors; "
+                    f"got device types {sorted(device_types)}"
+                )
+            if device_types == {"npu"}:
+                device_ids = {
+                    int(value.device.index if value.device.index is not None else value.get_device())
+                    for value in tensors
+                }
+                if len(device_ids) != 1:
+                    raise ValueError(
+                        "@pl.jit(execution='l1') tensor arguments span multiple devices: "
+                        f"{sorted(device_ids)}"
+                    )
+                device_id = next(iter(device_ids))
+            else:
+                # compile()/lower() may continue to use ordinary CPU sample
+                # tensors for shape/dtype specialization; they do not dispatch.
+                device_id = 0
+
+        if run_config is None:
+            return RunConfig(platform="a2a3", device_id=device_id, runtime=self._execution_runtime)
+        if not isinstance(run_config, RunConfig):
+            raise TypeError("config must be pypto.runtime.RunConfig or None")
+        if run_config.platform != "a2a3":
+            raise ValueError(
+                "@pl.jit(execution='l1') currently supports only A2/A3 onboard platform='a2a3'; "
+                f"got {run_config.platform!r}"
+            )
+        if run_config.runtime != self._execution_runtime:
+            raise ValueError(
+                "@pl.jit(execution='l1') runtime conflict: "
+                f"decorator={self._execution_runtime!r}, config={run_config.runtime!r}"
+            )
+        if run_config.distributed_config is not None:
+            raise ValueError("@pl.jit(execution='l1') does not support distributed_config")
+        if for_dispatch and tensors and run_config.device_id != device_id:
+            raise ValueError(
+                "@pl.jit(execution='l1') device conflict: "
+                f"tensor device={device_id}, config.device_id={run_config.device_id}"
+            )
+        if for_dispatch and run_config.codegen_only:
+            raise ValueError(
+                "@pl.jit(execution='l1') cannot dispatch with codegen_only=True; use kernel.compile()"
+            )
+        return run_config
+
+    def _l1_prepare_dispatch_call(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Bind, optionally allocate pure outputs, and attach an L1 RunConfig."""
+        call_kwargs = dict(kwargs)
+        run_config = call_kwargs.pop("config", None)
+        signature = inspect.signature(self._func)
+        try:
+            bound = signature.bind_partial(*args, **call_kwargs)
+        except TypeError as exc:
+            raise TypeError(f"@pl.jit function '{self.__name__}': {exc}") from exc
+        self._l1_allocate_outputs(bound, self._l1_output_names())
+        try:
+            bound = signature.bind(**bound.arguments)
+            bound.apply_defaults()
+        except TypeError as exc:
+            raise TypeError(f"@pl.jit function '{self.__name__}': {exc}") from exc
+        resolved_config = self._l1_validate_run_config(
+            run_config,
+            tuple(bound.arguments.values()),
+            for_dispatch=True,
+        )
+        ordered_args = bound.args
+        ordered_kwargs = dict(bound.kwargs)
+        ordered_kwargs["config"] = resolved_config
+        return ordered_args, ordered_kwargs
+
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Specialize, compile (or serve from cache), and execute on device.
 
@@ -2172,6 +2330,20 @@ class JITFunction:
             attribute — read it from the runtime's ``[STRACE]`` log markers
             (simpler PR #1177).
         """
+        if self._execution == "l1":
+            args, kwargs = self._l1_prepare_dispatch_call(args, kwargs)
+            compiled, ordered_args, run_config = self._resolve_compiled(args, kwargs)
+            from pypto.runtime.l1_jit import dispatch  # noqa: PLC0415
+
+            assert run_config is not None
+            assert self._execution_runtime is not None
+            return dispatch(
+                compiled,
+                ordered_args,
+                runtime=self._execution_runtime,
+                run_config=run_config,
+            )
+
         compiled, ordered_args, run_config = self._resolve_compiled(args, kwargs)
         if run_config is not None:
             return compiled(*ordered_args, config=run_config)
@@ -2266,6 +2438,13 @@ class JITFunction:
         Returns:
             The cached :class:`CompiledProgram` for this specialization.
         """
+        if self._execution == "l1":
+            config = kwargs.get("config")
+            sample_arguments = tuple(args) + tuple(
+                value for name, value in kwargs.items() if name != "config"
+            )
+            kwargs = dict(kwargs)
+            kwargs["config"] = self._l1_validate_run_config(config, sample_arguments)
         compiled, _ordered_args, _run_config = self._resolve_compiled(args, kwargs, allow_signature_mode=True)
         return compiled
 
@@ -2291,6 +2470,13 @@ class JITFunction:
         import pypto.language as pl  # noqa: PLC0415
         from pypto.ir.compile import _run_pass_pipeline  # noqa: PLC0415
 
+        if self._execution == "l1":
+            config = kwargs.get("config")
+            sample_arguments = tuple(args) + tuple(
+                value for name, value in kwargs.items() if name != "config"
+            )
+            kwargs = dict(kwargs)
+            kwargs["config"] = self._l1_validate_run_config(config, sample_arguments)
         specialization, run_config = self._resolve_specialization(
             args,
             kwargs,
@@ -2773,7 +2959,14 @@ class _JITDecorator:
         self.opaque = _SubFunctionDecorator("opaque", allow_level=False)
         self.extern = _ExternKernelDecorator()
 
-    def __call__(self, func: Any = None, *, auto_scope: bool = True) -> Any:
+    def __call__(
+        self,
+        func: Any = None,
+        *,
+        auto_scope: bool = True,
+        execution: str = "default",
+        runtime: str | None = None,
+    ) -> Any:
         """Decorate an entry-point JIT function (Orchestration).
 
         Supports both the bare ``@pl.jit`` form and the parenthesized
@@ -2781,9 +2974,28 @@ class _JITDecorator:
         out of compiler-inserted AUTO runtime scopes so the body can place
         them by hand with ``with pl.scope()``.
         """
+        if execution not in ("default", "l1"):
+            raise ValueError("pl.jit execution must be 'default' or 'l1'")
+        if execution == "default" and runtime is not None:
+            raise ValueError(
+                "pl.jit runtime= is only valid with execution='l1'; use RunConfig for default execution"
+            )
+        resolved_runtime = None
+        if execution == "l1":
+            resolved_runtime = validate_runtime_name(runtime or DEFAULT_RUNTIME, parameter="pl.jit runtime")
+
+        def make_jit(f: Any) -> JITFunction:
+            return JITFunction(
+                f,
+                func_type="orchestration",
+                level=None,
+                auto_scope=auto_scope,
+                execution_config=(execution, resolved_runtime),
+            )
+
         if func is None:
-            return lambda f: JITFunction(f, func_type="orchestration", level=None, auto_scope=auto_scope)
-        return JITFunction(func, func_type="orchestration", level=None, auto_scope=auto_scope)
+            return make_jit
+        return make_jit(func)
 
 
 # Singleton decorator object exposed as ``pl.jit``

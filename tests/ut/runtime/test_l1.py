@@ -206,16 +206,35 @@ def test_context_rejects_mixed_runtimes_before_native_init(tmp_path: Path, l1_fa
     assert worker.init_calls == []
 
 
-def test_context_rejects_callable_capacity_before_native_init(tmp_path: Path, l1_fakes) -> None:
+def test_context_has_no_public_fixed_callable_capacity(tmp_path: Path, l1_fakes) -> None:
     _, worker, _ = l1_fakes
-    programs = [
-        _compiled(tmp_path, f"program_{index}") for index in range(l1_mod.MAX_REGISTERED_CALLABLE_IDS + 1)
-    ]
+    programs = [_compiled(tmp_path, f"program_{index}") for index in range(65)]
 
-    with pytest.raises(ValueError, match="callable capacity exceeded"):
-        l1_mod.pypto_init(programs=programs, device=1)
+    ctx = l1_mod.pypto_init(programs=programs, device=1)
 
-    assert worker.init_calls == []
+    assert len(worker.init_calls) == 1
+    ctx.prepare()
+    assert worker.prepare_capsules == list(range(65))
+    ctx.close()
+
+
+def test_context_appends_callable_after_first_warmup(tmp_path: Path, l1_fakes) -> None:
+    _, worker, adapter = l1_fakes
+    first = _compiled(tmp_path, "first_warm")
+    second = _compiled(tmp_path, "late_append")
+    ctx = l1_mod.pypto_init(programs=[first], device=1)
+    x = torch.ones((2, 3), dtype=torch.float32)
+    first_out = torch.empty((2, 3), dtype=torch.float32)
+    second_out = torch.empty((2, 3), dtype=torch.float32)
+
+    assert ctx.operator(first)(x, 1.0, out=first_out) is first_out
+    late = ctx.add_program(second)
+    assert not late.prepared
+    assert late(x, 2.0, out=second_out) is second_out
+
+    assert worker.prepare_capsules == [0, 1]
+    assert [call[0][0] for call in adapter.calls] == ["prepare", "launch", "prepare", "launch"]
+    ctx.close()
 
 
 def test_warmup_packs_tensors_then_scalar_and_returns_explicit_out(tmp_path: Path, l1_fakes) -> None:

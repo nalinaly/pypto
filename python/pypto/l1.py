@@ -10,5 +10,6 @@
 """Public PyPTO L1 single-operator API."""
 
 from .runtime.l1 import L1Config, L1Context, L1InitializationError, L1Operator, pypto_init
+from .runtime.l1_jit import shutdown
 
-__all__ = ["L1Config", "L1Context", "L1InitializationError", "L1Operator", "pypto_init"]
+__all__ = ["L1Config", "L1Context", "L1InitializationError", "L1Operator", "pypto_init", "shutdown"]

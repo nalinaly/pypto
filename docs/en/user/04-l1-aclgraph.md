@@ -1,147 +1,185 @@
 # L1 Operators and ACLGraph
 
-PyPTO L1 presents a compiled `@pl.jit` or `@pl.program` as one asynchronous,
-AscendC-like operator call. PyTorch owns the current device, input/output
-storage, and caller stream. PyPTO owns its internal workspace, persistent
-runtime state, and one hidden AICore stream, but does not synchronize streams,
-inspect capture state, reset the device, or expose that hidden branch.
+PyPTO L1 exposes a compiled program as one asynchronous, AscendC-like operator
+call. The normal interface intentionally looks like Triton: annotate a regular
+`@pl.jit` function with `execution="l1"`, then call the function with torch NPU
+tensors.
 
-L1 supports both Simpler runtimes on onboard targets:
+PyTorch owns the current device, caller stream, and external tensor storage.
+PyPTO owns its internal workspace, persistent runtime state, and one hidden
+AICore stream. A launch never synchronizes streams, queries capture state,
+resets the device, or exposes the hidden AICPU/AICore fork-and-join.
 
-| Runtime | Compile value | Execution model |
-| ------- | ------------- | --------------- |
+The supported L1 target is A2/A3 onboard. Two runtimes are available:
+
+| Runtime | Decorator value | Execution model |
+| ------- | --------------- | --------------- |
 | TensorMap and ring buffer (TRB) | `"tensormap_and_ringbuffer"` | AICPU builds and dispatches tasks at execution time |
-| Host-built graph (HBG) | `"host_build_graph"` | Host builds a pristine task graph package; each invocation restores it before dispatch |
+| Host-built graph (HBG) | `"host_build_graph"` | Host builds a self-contained graph package; every invocation restores it before dispatch |
 
-## Compile and initialize
-
-Select the runtime when compiling. It is part of the generated artifact and
-the JIT cache key, not a launch-time switch:
+## Define and call an L1 operator
 
 ```python
-import torch
-import torch_npu
+import pypto.language as pl
 
-from pypto.l1 import pypto_init
-from pypto.runtime import RunConfig
 
-device = 1
-torch_npu.npu.set_device(device)
+@pl.jit(execution="l1", runtime="host_build_graph")
+def add(
+    lhs: pl.Tensor[[64, 128], pl.FP32],
+    rhs: pl.Tensor[[64, 128], pl.FP32],
+    out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        lhs_tile = pl.load(lhs, [0, 0], [64, 128])
+        rhs_tile = pl.load(rhs, [0, 0], [64, 128])
+        pl.store(pl.add(lhs_tile, rhs_tile), [0, 0], out)
+    return out
 
-compiled = my_kernel.compile(
-    config=RunConfig(
-        platform="a2a3",
-        device_id=device,
-        runtime="host_build_graph",  # or "tensormap_and_ringbuffer"
-    )
-)
 
-ctx = pypto_init(programs=[compiled], device=device)
-op = ctx.operator(compiled)
+# Ordinary eager use. PyPTO compiles, initializes, and prepares lazily. A pure
+# output omitted by the caller is allocated through torch.empty on the input
+# device, so this has the same call shape as a normal torch operator.
+result = add(lhs, rhs)
 ```
 
-For a program object, use
-`ir.compile(program, platform="a2a3", runtime="host_build_graph")`. A
-`DistributedConfig.runtime` value is inherited when no explicit runtime is
-given; two explicit sources must agree. Every program declared in one
-`L1Context` must use the same onboard platform and runtime.
+Omitting `runtime` selects `"tensormap_and_ringbuffer"`. Runtime selection is
+part of the JIT cache key and generated artifact; it is not a launch-time
+switch. The first tensor call infers the device, which must already be the
+current torch_npu device. PyPTO never changes it.
 
-Default JIT output directories are atomically unique, so compiling the same
-specialization for TRB and HBG cannot alias files even within one clock tick.
-If `RunConfig.save_kernels_dir` is explicit, do not reuse that directory for a
-different runtime, or for different cache keys of the same `JITFunction`;
-PyPTO rejects those conflicts before they can overwrite the first lazy
-artifact. Historical same-runtime rebuilding by a distinct compiler/JIT owner
-still treats an explicit directory as caller-owned.
+Use existing PyPTO scalar annotations such as `pl.Scalar[pl.FP32]`; L1 does not
+introduce a second scalar syntax. Tensor addresses and scalar values may change
+between calls, while shape, dtype, stride, and argument layout are fixed by the
+first successful enqueue.
 
-`device` is mandatory. It must equal the current torch_npu device; PyPTO never
-changes the caller's device.
+One process-owned L1 owner is created lazily per device. Later JIT
+specializations and functions using the same platform, runtime, and runtime
+configuration are appended to it; no public batch-prepare or fixed callable
+capacity is exposed. A conflicting runtime/configuration fails before launch.
 
 ## Warm up, capture, and replay
 
-Prepare and warm up outside capture, then synchronize explicitly before
-capturing:
+The first call must be an ordinary eager call outside capture. It performs the
+lazy compilation/initialization/prepare needed by the operator. PyPTO does not
+query whether a stream is being captured, so an uninitialized first call made
+inside capture fails with a warm-up diagnostic rather than silently mutating
+global state.
+
+ACLGraph does not allocate operator outputs. Allocate graph-bound outputs before
+capture and pass them with `out=`:
 
 ```python
-graph = None
-try:
-    ctx.prepare()
-    op.warmup(x, weight, out=y)
-    torch_npu.npu.synchronize(device)  # caller-owned warmup boundary
+import pypto
+import torch
+import torch_npu
 
-    capture_stream = torch_npu.npu.Stream(device=device)
-    graph = torch_npu.npu.NPUGraph()
-    with torch_npu.npu.graph(graph, stream=capture_stream):
-        torch.add(prefix, 1, out=x)
-        op(x, weight, out=y)
-        torch.mul(y, 2, out=result)
 
+# Warm up every specialization that will appear in the graph.
+add(lhs, rhs, out=warmup_out)
+torch_npu.npu.synchronize(device)
+
+capture_stream = torch_npu.npu.Stream(device=device)
+graph = torch_npu.npu.NPUGraph()
+with torch_npu.npu.graph(graph, stream=capture_stream):
+    torch.add(source, bias, out=pre_l1)
+    add(pre_l1, rhs, out=add_out)
+    torch.mul(add_out, 2, out=result)
+
+for new_input in replay_inputs:
+    source.copy_(new_input)
     graph.replay()
     capture_stream.synchronize()
-finally:
-    # No graph may replay after this point.
-    torch_npu.npu.synchronize(device)
-    if graph is not None:
-        graph.reset()
-    ctx.close()
+
+# Optional retirement. It is not tied to destruction of one graph: the caller
+# must first prove that every L1 task and every graph that can replay on this
+# device is quiescent.
+torch_npu.npu.synchronize(device)
+graph.reset()
+pypto.l1.shutdown(device=device)
 ```
 
-`prepare()` and `warmup()` report successful enqueue, not device completion.
-The external synchronize before capture is therefore required. Calling an
-unprepared operator in ordinary eager mode performs a convenience prepare, but
-the first call must never occur inside capture: PyPTO deliberately does not ask
-whether the current stream is being captured.
+Eager output omission is all-or-none for multiple pure outputs. During capture,
+all outputs must be supplied explicitly because allocator activity belongs
+outside the captured operator call. Input/output tensors and any external
+storage referenced by a graph must remain alive until that graph is destroyed
+and its streams are complete.
 
-The default taskQueue adapter obtains the current raw stream without draining
-the queue and records ordinary torch_npu caching-allocator storage on that
-stream. `L1Config(use_task_queue=False)` is only a bring-up/debug path; obtaining
-the Python raw stream can drain an enabled taskQueue.
+The default torch_npu adapter enters taskQueue through `RunOpApiV2`, obtains the
+raw stream with `.stream(false)`, retains C++ tensor handles until the queued
+callback runs, and records ordinary caching-allocator storage on the launch
+stream. This makes L1 one ordered torch operator rather than a Python-side raw
+stream escape. External, `from_blob`, or custom-allocator storage is not owned
+by the caching allocator; its owner must enforce the longer lifetime.
 
-## HBG graph-package ownership
+## HBG graph-package lifetime
 
-An HBG image is mutable execution state, not an immutable executable: scheduler
-queues, completion flags, task state, and runtime pointers are consumed or
-rewritten while the operator runs. PyPTO therefore uses two objects:
+An HBG image is mutable execution state: scheduler queues, completion flags,
+task state, and runtime pointers are consumed or rewritten while it runs. L1
+therefore separates:
 
-- a pristine, immutable graph package embedded in the launch's mutable HostArgs
-  blob; CANN copies it with that launch task/captured node, like AscendC inline
-  tiling data;
-- one context-owned mutable execution slot whose address stays fixed and whose
-  shared-memory and runtime-arena images are restored by the AICPU leader before
-  every eager execution and every graph replay.
+- a self-contained, pristine graph package in that launch's HostArgs blob;
+  CANN snapshots and owns it with the launch task/captured node, analogously to
+  inline AscendC tiling data; and
+- a context-owned mutable execution slot with a stable device address. The
+  AICPU leader restores the pristine shared-memory and runtime-arena images into
+  this slot before every eager execution and every graph replay.
 
-Two captured HBG nodes consequently retain independent graph packages and
-callable-local function tables even when both compiled programs number their
-first kernel as `func_id=0`. PyPTO does not reuse or infer the lifetime of a
-captured package from a host-side event.
+Each captured HBG node consequently has its own graph package and
+callable-local function table, even when two programs both number their first
+kernel as `func_id=0`. There is no fixed resident callable table and PyPTO never
+uses an event to guess that CANN has released a captured package.
 
-HBG L1 borrows external device tensors and never stages their contents through
-host memory. The host graph builder may use tensor addresses, shapes, strides,
-dtypes, scalar values, and static topology. A generated orchestration that
-would read or write tensor contents on the host is rejected fail-closed before
-its graph can be used.
+Generated HBG orchestration may use tensor addresses, shapes, strides, dtypes,
+scalar values, and static topology. An orchestration that requires the host to
+read or write borrowed tensor contents is rejected before graph construction.
 
-## Lifetime and supported boundary
+## TRB registry and binary lifetime
 
-Keep the context and all graph-referenced tensors/storage alive until the graph
-can no longer replay. For `from_blob` or custom/external allocator storage,
-`recordStream` may not extend its lifetime; its external owner must remain live
-through graph destruction and actual stream completion. `close()` performs no
-implicit synchronization and is intentionally not a context manager. If native
-teardown fails, ownership remains with the context so `close()` can be retried
-after external quiescence.
+TRB needs a device-resident code-address registry. L1 appends immutable entries
+dynamically as new callables are encountered. Entries are never evicted,
+recycled, or overwritten, and the public API has no 64-callable limit. This is
+deliberately safer than reusing an address that a captured task may still
+reference, but long-lived processes compiling unbounded specializations can
+grow device/AICPU metadata without bound; applications must control
+specialization cardinality and monitor memory.
 
-The first L1 version has these boundaries:
+There is no public runtime guarantee that a captured graph keeps a registered
+function handle valid after binary unload. Consequently the L1 path never calls
+`aclrtBinaryUnLoad` or `rtsBinaryUnload`, including during `shutdown()`. Binary
+code and function handles remain process-pinned. This is an explicit lifetime
+policy, not an accidental leak to be repaired with eager unloading.
 
-- onboard `a2a3` and `a5` only; simulator execution is unsupported;
-- static shape and dtype; shape, dtype, and stride are fixed by the first
-  successful enqueue, while tensor addresses and scalar values may change;
-- explicit caller-provided outputs via `out=`;
-- inference only: no autograd, distributed/`CommCtx`, SDMA, or DFX;
-- one non-concurrent L1 context per device, with no concurrent eager calls or
-  graph replays; PyPTO currently occupies the configured AICore set;
-- workspace remains internal to PyPTO and is shared only under that serial
-  execution contract.
+## Optional shutdown and ownership
 
-See `tests/st/runtime/l1/test_l1_aclgraph.py` for the maintained end-to-end
-TRB/HBG capture and replay examples.
+`pypto.l1.shutdown(device=...)` is optional:
+
+- omitting it quietly pins the L1 owner until process exit;
+- it never synchronizes and must be called only after all L1 tasks and all
+  graph owners on that device are quiescent;
+- repeated calls are idempotent;
+- a teardown failure retains the owner and can be retried;
+- Python GC and `atexit` never perform runtime teardown or binary unload.
+
+Destroying one ACLGraph is not a reason to shut down the device owner because
+other graphs may still reference it.
+
+## Supported boundary
+
+- A2/A3 onboard only; A5 and simulator execution are outside the current
+  verified scope.
+- Static shape, dtype, stride, and argument layout; tensor addresses and scalar
+  values may vary.
+- Eager pure-output allocation is supported; capture requires preallocated
+  explicit outputs.
+- Inference only: no autograd, distributed/`CommCtx`, SDMA, or DFX.
+- Concurrent eager calls, eager-versus-replay overlap, and concurrent graph
+  replays are unsupported. Host-side overlap is rejected best-effort, but
+  externally initiated graph replay cannot always be observed by PyPTO; callers
+  must serialize it.
+- Workspace remains internal to PyPTO and is shared under that serial execution
+  contract.
+
+The low-level `pypto_init`/`L1Context` API remains available for implementation
+tests and advanced bring-up, but it is not the normal user interface. See
+`tests/st/runtime/l1/test_l1_jit_aclgraph.py` for the maintained public-API TRB
+and HBG capture/replay test.

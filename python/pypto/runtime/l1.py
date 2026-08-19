@@ -34,14 +34,15 @@ the actual stream completion (and through graph destruction for capture).
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import importlib
 import re
 import struct
 import threading
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -53,7 +54,6 @@ from .runner import RunConfig
 from .task_interface import (
     CHIP_MAX_SCALAR_ARGS,  # pyright: ignore[reportAttributeAccessIssue]
     CHIP_MAX_TENSOR_ARGS,  # pyright: ignore[reportAttributeAccessIssue]
-    MAX_REGISTERED_CALLABLE_IDS,  # pyright: ignore[reportAttributeAccessIssue]
     MAX_TENSOR_DIMS,  # pyright: ignore[reportAttributeAccessIssue]
     ArgDirection,  # pyright: ignore[reportAttributeAccessIssue]
     ChipStorageTaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
@@ -62,6 +62,7 @@ from .task_interface import (
 )
 
 _MISSING = object()
+_INT32_MAX = 2**31 - 1
 _UINT32_MAX = 2**32 - 1
 _QUEUE_CALL_ABI_VERSION = 1
 _SUPPORTED_L1_SCALAR_DTYPES = frozenset(
@@ -137,6 +138,7 @@ class _OperatorState:
     param_infos: list[Any]
     output_indices: tuple[int, ...]
     op_name: str
+    prepared: bool = False
     warmed: bool = False
     bound_tensor_metadata: tuple[tuple[tuple[int, ...], torch.dtype, tuple[int, ...]], ...] | None = None
 
@@ -273,7 +275,7 @@ def _pack_l1_scalar(value: ctypes._SimpleCData, dtype: Any) -> int:
     if not isinstance(value, ctypes._SimpleCData):
         raise TypeError(f"L1 scalar was not coerced to a ctypes value: {type(value).__name__}")
 
-    scalar = value.value
+    scalar = cast(bool | int | float, value.value)
     if dtype_name == "fp16":
         return struct.unpack("<H", struct.pack("<e", float(scalar)))[0]
     if dtype_name == "fp32":
@@ -308,6 +310,102 @@ def _safe_op_name(program: CompiledProgram, callable_id: int) -> str:
     if not leaf:
         leaf = "operator"
     return f"pypto_l1_{callable_id}_{leaf[:80]}"
+
+
+def _callable_content_key(chip_callable: Any) -> tuple[int, bytes] | tuple[str, int]:
+    """Return a collision-resistant key for one canonical ChipCallable image."""
+    buffer_ptr = getattr(chip_callable, "buffer_ptr", None)
+    buffer_size = getattr(chip_callable, "buffer_size", None)
+    if callable(buffer_ptr) and callable(buffer_size):
+        size = cast(Callable[[], int], buffer_size)()
+        if size <= 0:
+            raise ValueError("L1 ChipCallable has an empty canonical buffer")
+        pointer = cast(Callable[[], int], buffer_ptr)()
+        image = ctypes.string_at(pointer, size)
+        return size, hashlib.sha256(image).digest()
+    # Unit-test and third-party wrappers may not expose their backing bytes.
+    # Object identity remains safe but deliberately disables cross-wrapper
+    # deduplication for those non-production objects.
+    return "identity", id(chip_callable)
+
+
+def _build_operator_state(
+    program: CompiledProgram,
+    callable_id: int,
+    *,
+    platform: str,
+    runtime: str,
+) -> tuple[_OperatorState, int | None]:
+    if not isinstance(program, CompiledProgram):
+        raise TypeError("PyPTO L1 programs must be CompiledProgram values")
+    if program.platform != platform:
+        raise ValueError(
+            f"all L1 programs must target one platform; got {platform!r} and {program.platform!r}"
+        )
+    if _contains_distributed_types(program):
+        raise ValueError("PyPTO L1 v1 does not support CommCtx/DistributedTensor programs")
+    program_runtime = validate_runtime_name(
+        program.runtime_name, parameter=f"program {program.output_dir} runtime"
+    )
+    if program_runtime != runtime:
+        raise ValueError(
+            f"all L1 programs must use the same runtime; got {runtime!r} and {program_runtime!r}"
+        )
+
+    chip_callable = program.chip_callable
+    if bool(program.runtime_config.get("enable_sdma", False)):
+        raise ValueError("PyPTO L1 v1 does not support SDMA workspace programs")
+
+    param_infos, output_indices, _ = program._get_metadata()
+    tensor_count = sum(info.shape is not None for info in param_infos)
+    scalar_count = len(param_infos) - tensor_count
+    if tensor_count > CHIP_MAX_TENSOR_ARGS or scalar_count > CHIP_MAX_SCALAR_ARGS:
+        raise ValueError(
+            "program exceeds the L1 task-argument ABI capacity: "
+            f"tensors={tensor_count}/{CHIP_MAX_TENSOR_ARGS}, scalars={scalar_count}/{CHIP_MAX_SCALAR_ARGS}"
+        )
+    for info in param_infos:
+        if info.shape is not None:
+            if not info.shape or len(info.shape) > MAX_TENSOR_DIMS or any(dim <= 0 for dim in info.shape):
+                raise ValueError(
+                    f"PyPTO L1 v1 requires rank in [1, {MAX_TENSOR_DIMS}] and a positive static shape "
+                    f"for {info.name!r}; got {info.shape}"
+                )
+            if any(dim > _UINT32_MAX for dim in info.shape):
+                raise ValueError(f"shape for {info.name!r} exceeds the L1 uint32 tensor ABI")
+            torch_dtype = _to_torch_dtype(info.dtype)
+            if torch_dtype is None:
+                raise ValueError(f"L1 tensor {info.name!r} uses unsupported dtype {info.dtype}")
+            try:
+                torch_dtype_to_datatype(torch_dtype)
+            except KeyError as exc:
+                raise ValueError(
+                    f"L1 tensor {info.name!r} dtype {info.dtype} has no simpler runtime ABI mapping"
+                ) from exc
+        elif info.direction == ParamDirection.Out:
+            raise ValueError(
+                f"PyPTO L1 v1 does not support pure-Out scalar parameter {info.name!r}; "
+                "scalar outputs need an explicit future ABI"
+            )
+        elif str(info.dtype) not in _SUPPORTED_L1_SCALAR_DTYPES:
+            raise ValueError(
+                f"PyPTO L1 scalar {info.name!r} uses unsupported dtype {info.dtype}; "
+                f"supported dtypes are {sorted(_SUPPORTED_L1_SCALAR_DTYPES)}"
+            )
+
+    _validate_final_callable_signature(chip_callable, param_infos)
+    baked_count = program.runtime_config.get("aicpu_thread_num")
+    return (
+        _OperatorState(
+            program=program,
+            callable_id=callable_id,
+            chip_callable=chip_callable,
+            param_infos=list(param_infos),
+            output_indices=tuple(int(index) for index in output_indices),
+            op_name=_safe_op_name(program, callable_id),
+        ),
+        None if baked_count is None else int(baked_count),
+    )
 
 
 def _tensor_device_index(tensor: torch.Tensor) -> int:
@@ -364,25 +462,18 @@ class L1Context:
         if any(not isinstance(program, CompiledProgram) for program in declared):
             raise TypeError("pypto_init programs must contain only CompiledProgram values")
 
-        # Object identity, not output-path equality, defines membership.  The
-        # same object may appear twice in a caller-produced list; prepare it
-        # once.  Distinct objects remain distinct declared operators even if
-        # they happen to point at the same artifact directory.
+        # Object identity removes literal duplicates first. Canonical
+        # ChipCallable bytes below additionally deduplicate distinct wrappers
+        # of the same immutable artifact.
         unique_programs: list[CompiledProgram] = []
         seen_ids: set[int] = set()
         for program in declared:
             if id(program) not in seen_ids:
                 seen_ids.add(id(program))
                 unique_programs.append(program)
-        if len(unique_programs) > MAX_REGISTERED_CALLABLE_IDS:
-            raise ValueError(
-                "PyPTO L1 callable capacity exceeded: "
-                f"got {len(unique_programs)} distinct programs, limit={MAX_REGISTERED_CALLABLE_IDS}"
-            )
-
         self._states: list[_OperatorState] = []
         self._states_by_identity: dict[int, _OperatorState] = {}
-        self._prepared = False
+        self._states_by_content: dict[object, _OperatorState] = {}
         self._closed = False
         self._init_failed = False
         self._worker: Any = None
@@ -406,89 +497,28 @@ class L1Context:
             parameter="program runtime",
         )
         self._runtime = runtime
+        self._platform = platform
 
         baked_aicpu_counts: set[int] = set()
         for callable_id, program in enumerate(unique_programs):
-            if program.platform != platform:
-                raise ValueError(
-                    f"all L1 programs must target one platform; got {platform!r} and {program.platform!r}"
-                )
-            if _contains_distributed_types(program):
-                raise ValueError("PyPTO L1 v1 does not support CommCtx/DistributedTensor programs")
-            program_runtime = validate_runtime_name(
-                program.runtime_name,
-                parameter=f"program {program.output_dir} runtime",
+            state, baked_count = _build_operator_state(
+                program,
+                callable_id,
+                platform=platform,
+                runtime=runtime,
             )
-            if program_runtime != runtime:
-                raise ValueError(
-                    f"all L1 programs must use the same runtime; got {runtime!r} and {program_runtime!r}"
-                )
-
-            # Loading is host-only compile/assembly work.  Do it for every
-            # program before initializing the borrowed native context so a bad
-            # artifact cannot leave a partially initialized device owner.
-            chip_callable = program.chip_callable
-            if bool(program.runtime_config.get("enable_sdma", False)):
-                raise ValueError("PyPTO L1 v1 does not support SDMA workspace programs")
-
-            param_infos, output_indices, _ = program._get_metadata()
-            tensor_count = sum(info.shape is not None for info in param_infos)
-            scalar_count = len(param_infos) - tensor_count
-            if tensor_count > CHIP_MAX_TENSOR_ARGS or scalar_count > CHIP_MAX_SCALAR_ARGS:
-                raise ValueError(
-                    "program exceeds the L1 task-argument ABI capacity: "
-                    f"tensors={tensor_count}/{CHIP_MAX_TENSOR_ARGS}, "
-                    f"scalars={scalar_count}/{CHIP_MAX_SCALAR_ARGS}"
-                )
-            for info in param_infos:
-                if info.shape is not None:
-                    if (
-                        not info.shape
-                        or len(info.shape) > MAX_TENSOR_DIMS
-                        or any(dim <= 0 for dim in info.shape)
-                    ):
-                        raise ValueError(
-                            "PyPTO L1 v1 requires rank in "
-                            f"[1, {MAX_TENSOR_DIMS}] and a positive static shape "
-                            f"for {info.name!r}; got {info.shape}"
-                        )
-                    if any(dim > _UINT32_MAX for dim in info.shape):
-                        raise ValueError(f"shape for {info.name!r} exceeds the L1 uint32 tensor ABI")
-                    torch_dtype = _to_torch_dtype(info.dtype)
-                    if torch_dtype is None:
-                        raise ValueError(f"L1 tensor {info.name!r} uses unsupported dtype {info.dtype}")
-                    try:
-                        torch_dtype_to_datatype(torch_dtype)
-                    except KeyError as exc:
-                        raise ValueError(
-                            f"L1 tensor {info.name!r} dtype {info.dtype} has no simpler runtime ABI mapping"
-                        ) from exc
-                elif info.direction == ParamDirection.Out:
-                    raise ValueError(
-                        f"PyPTO L1 v1 does not support pure-Out scalar parameter {info.name!r}; "
-                        "scalar outputs need an explicit future ABI"
-                    )
-                elif str(info.dtype) not in _SUPPORTED_L1_SCALAR_DTYPES:
-                    raise ValueError(
-                        f"PyPTO L1 scalar {info.name!r} uses unsupported dtype {info.dtype}; "
-                        f"supported dtypes are {sorted(_SUPPORTED_L1_SCALAR_DTYPES)}"
-                    )
-
-            _validate_final_callable_signature(chip_callable, param_infos)
-
-            baked_count = program.runtime_config.get("aicpu_thread_num")
             if baked_count is not None:
-                baked_aicpu_counts.add(int(baked_count))
-            state = _OperatorState(
-                program=program,
-                callable_id=callable_id,
-                chip_callable=chip_callable,
-                param_infos=list(param_infos),
-                output_indices=tuple(int(index) for index in output_indices),
-                op_name=_safe_op_name(program, callable_id),
-            )
+                baked_aicpu_counts.add(baked_count)
+            content_key = _callable_content_key(state.chip_callable)
+            existing = self._states_by_content.get(content_key)
+            if existing is not None:
+                self._states_by_identity[id(program)] = existing
+                continue
+            state.callable_id = len(self._states)
+            state.op_name = _safe_op_name(program, state.callable_id)
             self._states.append(state)
             self._states_by_identity[id(program)] = state
+            self._states_by_content[content_key] = state
 
         if self._config.aicpu_thread_num is None and len(baked_aicpu_counts) > 1:
             raise ValueError(
@@ -498,6 +528,8 @@ class L1Context:
         resolved_aicpu_count = self._config.aicpu_thread_num
         if resolved_aicpu_count is None and baked_aicpu_counts:
             resolved_aicpu_count = next(iter(baked_aicpu_counts))
+        self._resolved_aicpu_count = resolved_aicpu_count
+        self._next_callable_id = len(self._states)
 
         run_config = RunConfig(
             platform=platform,
@@ -542,7 +574,7 @@ class L1Context:
     @property
     def prepared(self) -> bool:
         """Whether all prepare calls were successfully enqueued, not completed."""
-        return self._prepared
+        return bool(self._states) and all(state.prepared for state in self._states)
 
     @property
     def closed(self) -> bool:
@@ -572,9 +604,47 @@ class L1Context:
     def operator(self, program: CompiledProgram) -> L1Operator:
         self._check_open()
         state = self._states_by_identity.get(id(program))
-        if state is None or state.program is not program:
+        if state is None:
             raise KeyError("program was not declared in this pypto_init(programs=[...]) context")
         return L1Operator(self, state)
+
+    def add_program(self, program: CompiledProgram) -> L1Operator:
+        """Append one immutable callable to this live L1 owner.
+
+        Registration is lazy: this method performs host validation and assigns
+        a never-reused context-local id, while the first call/prepare enqueues
+        native registration. Canonically identical ChipCallable images share
+        the existing record.
+        """
+        self._check_open()
+        existing = self._states_by_identity.get(id(program))
+        if existing is not None and existing.program is program:
+            return L1Operator(self, existing)
+        if self._next_callable_id > _INT32_MAX:
+            raise RuntimeError("PyPTO L1 callable identity space is exhausted")
+
+        candidate, baked_count = _build_operator_state(
+            program,
+            self._next_callable_id,
+            platform=self._platform,
+            runtime=self._runtime,
+        )
+        if baked_count is not None and baked_count != self._resolved_aicpu_count:
+            raise ValueError(
+                "a late L1 specialization cannot change the frozen aicpu_thread_num: "
+                f"owner={self._resolved_aicpu_count!r}, program={baked_count!r}"
+            )
+        content_key = _callable_content_key(candidate.chip_callable)
+        content_match = self._states_by_content.get(content_key)
+        if content_match is not None:
+            self._states_by_identity[id(program)] = content_match
+            return L1Operator(self, content_match)
+
+        self._states.append(candidate)
+        self._states_by_identity[id(program)] = candidate
+        self._states_by_content[content_key] = candidate
+        self._next_callable_id += 1
+        return L1Operator(self, candidate)
 
     def _enqueue(self, queue_call: Any, tensors: list[torch.Tensor], op_name: str, direct: Any) -> None:
         self._check_current_device()
@@ -594,6 +664,33 @@ class L1Context:
             tensor.record_stream(stream)
         direct(raw_stream)
 
+    def _prepare_state(self, state: _OperatorState) -> None:
+        if state.prepared:
+            return
+        assert self._worker is not None
+        queue_call = (
+            self._worker.l1_make_prepare_queue_call(state.callable_id, state.chip_callable)
+            if self._config.use_task_queue
+            else None
+        )
+        try:
+            self._enqueue(
+                queue_call,
+                [],
+                f"{state.op_name}_prepare",
+                lambda raw_stream: self._worker.l1_prepare_callable(
+                    state.callable_id, state.chip_callable, raw_stream
+                ),
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "PyPTO L1 specialization is not prepared for ACLGraph capture. "
+                "Call this kernel once with the same shape/dtype/layout outside capture, "
+                "synchronize externally, then capture it. "
+                f"Native prepare error: {exc}"
+            ) from exc
+        state.prepared = True
+
     def prepare(self) -> None:
         """Prepare every declared callable in deterministic order.
 
@@ -601,24 +698,8 @@ class L1Context:
         ACLGraph callers must execute a warmup and then synchronize externally.
         """
         self._check_open()
-        if self._prepared:
-            return
-        assert self._worker is not None
         for state in self._states:
-            queue_call = (
-                self._worker.l1_make_prepare_queue_call(state.callable_id, state.chip_callable)
-                if self._config.use_task_queue
-                else None
-            )
-            self._enqueue(
-                queue_call,
-                [],
-                f"{state.op_name}_prepare",
-                lambda raw_stream, state=state: self._worker.l1_prepare_callable(
-                    state.callable_id, state.chip_callable, raw_stream
-                ),
-            )
-        self._prepared = True
+            self._prepare_state(state)
 
     # This is the single tensors-first ABI packing transaction; the branches
     # deliberately mirror tensor, scalar, input/inout and explicit-out cases.
@@ -743,10 +824,10 @@ class L1Context:
                 f"{state.op_name} tensor layout changed after first successful enqueue: "
                 f"expected={state.bound_tensor_metadata!r}, got={tensor_metadata!r}"
             )
-        if not self._prepared:
+        if not state.prepared:
             # Eager convenience.  Graph users are required to call prepare()
             # before capture; PyPTO deliberately does not query capture state.
-            self.prepare()
+            self._prepare_state(state)
         assert self._worker is not None
         queue_call = (
             self._worker.l1_make_launch_queue_call(state.callable_id, packed)
@@ -803,8 +884,8 @@ class L1Operator:
 
     @property
     def prepared(self) -> bool:
-        """Whether the owning context's prepare calls were successfully enqueued."""
-        return self._context.prepared
+        """Whether this callable's prepare was successfully enqueued."""
+        return self._state.prepared
 
     @property
     def warmed(self) -> bool:
@@ -812,8 +893,9 @@ class L1Operator:
         return self._state.warmed
 
     def prepare(self) -> None:
-        """Prepare all programs declared in the owning context."""
-        self._context.prepare()
+        """Prepare this callable without sealing later append admission."""
+        self._context._check_open()
+        self._context._prepare_state(self._state)
 
     def warmup(self, *args: Any, out: object = _MISSING) -> object:
         """Enqueue one explicit warmup; synchronization remains caller-owned."""

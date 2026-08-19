@@ -25,6 +25,7 @@ repos:
             python tests/lint/check_english_only.py
             --exclude tests/集合通信调试过程.md
             --exclude tests/PyPTO_L1与ACLGraph实现过程记录.md
+            --exclude tests/PyPTO_Triton风格L1_JIT调用接口设计.md
             --exclude tests/pypto_l1_aclgraph_implementation_plan.md
           language: python
           language_version: python3

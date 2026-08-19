@@ -6631,3 +6631,181 @@ nalinaly/pypto:main
 
 旧`nalinaly/simpler:pypto-l1-aclgraph`仍可用于历史追溯，但不再是正式PyPTO main的依赖或后续开发
 基线；旧fork main则由`main-backup-20260819`提供可恢复引用。
+
+#### 10.66 Triton风格L1 JIT、无固定callable上限与binary pin收口
+
+##### 10.66.1 最终决策冻结
+
+本轮以下决策被明确固定，实现不再保留相反的隐式路径：
+
+1. 普通用户使用 `@pl.jit(execution="l1", runtime=...)` 和直接Python call，不接触
+   `pypto_init/context/operator/prepare/warmup/close`。manual API仅作advanced/debug控制面保留。
+2. eager可省略pure Out，由PyTorch wrapper调用 `torch.empty` 和torch allocator。ACLGraph capture要求
+   输出已在图外分配并显式传入。
+3. 不提供公开global init或batch prepare；第一次ordinary eager自动完成init/prepare/warmup。
+4. 首次调用不能在capture内；PyPTO仍不query capture，失败信息要求用户先在图外warmup。
+5. scalar仅使用现有 `pl.Scalar[...]`，不新造constexpr/scalar表达。
+6. 公开的64-callable限制删除，但单callable child-kernel数量和单次tensor/scalar ABI容量保留。
+7. HBG launch package自包含；TRB code registry动态append，id不复用，code不覆盖。
+8. 当前不尝试解决graph replay并发；可观测的host并发尽力fail-fast。
+9. `pypto.l1.shutdown(device=...)` 完全可选、幂等、不做sync；失败保留owner供重试。
+10. 不调用shutdown时默认pin到进程结束；GC/atexit不调runtime close。
+11. CANN没有公开契约保证captured graph引用funcHandle时binary unload后继续保活，因此新L1路径
+    不允许任何 `aclrtBinaryUnLoad` 或 `rtsBinaryUnload`。
+12. 本阶段只以A2/A3为实现与验收门槛，不要求A5或A5sim。
+
+##### 10.66.2 Python公开调用面落地
+
+`python/pypto/jit/decorator.py` 现在将execution选择与现有specialization cache直接结合：
+
+- `_JITDecorator.__call__` 接受 `execution="default"|"l1"` 和L1-only `runtime`。
+- `JITFunction` 使用一个internal `execution_config` tuple保存模式和runtime，避免扩大已经较长的
+  constructor参数表。
+- L1 `compile/lower` 默认到A2/A3 onboard和decorator固定runtime；dispatch之前拒绝platform、runtime、
+  distributed、device和codegen-only冲突。
+- pure Out全省略时解析静态annotation并用第一个tensor的device调 `torch.empty`；显式Out原样返回。
+- 部分Out省略直接fail，不制造部分内部所有的输出集。
+
+新文件 `python/pypto/runtime/l1_jit.py` 提供模块级strong device owner registry。owner绑定device、
+platform、runtime、L1Config和owner thread；第一个specialization建context，后续specialization通过
+`L1Context.add_program()` append。host dispatch/shutdown用non-blocking invoke lock检测可观测并发。
+
+`python/pypto/runtime/l1.py` 将manual和JIT路径共享的事务收敛到同一个实现：
+
+- `prepared` 从context一次性状态改为per-callable状态。
+- `add_program()` 允许第一个callable已launch后追加第二个。
+- canonical `ChipCallable` bytes以SHA-256去重，身份id单调不复用。
+- 张量shape/dtype/stride/device、scalar bit pattern、output和allocator lease的已有强校验不被绕开。
+
+##### 10.66.3 native append admission与64-cap移除
+
+`L1ExecutionState::seal()` 保留旧ABI函数名，但成功launch后的live phase保持 `ReadyEnqueued`。
+prepare/launch仍受同一operation mutex、execution mode和close/poison状态保护，但“已launch”不再等价于
+“禁止新callable”。
+
+Host `DeviceRunnerBase` 对borrowed L1只要求non-negative `int32_t callable_id`；同一函数中legacy L2/L3仍保留
+`MAX_REGISTERED_CALLABLE_IDS`检查。Python simpler wrapper的L1 id校验也改为 `[0, INT32_MAX]`，而旧
+`ChipWorker.register_callable()` 仍使用L2/L3的64-slot allocator。
+
+这保证了“删除L1公开上限”不会偷偷改变L2/L3 wire和资源行为。
+
+##### 10.66.4 HBG package自包含
+
+HBG路径已删除context中的fixed callable registry和prepare-time resident callable registration。
+`HbgAicpuInvocationView` 仅依赖：
+
+1. CANN-owned launch blob中已seal的identity、argument snapshot、function-binding hash/table和pristine regions。
+2. Context-owned execution-slot registration中的working destination、Runtime/KernelArgs地址和generation。
+
+`HbgContextRegistry` ABI minor升级且只保留execution slot。旧
+`simpler_aicpu_l1_hbg_register_callable` 导出作为无resident state的compatibility shim保留，但新runtime
+symbol列表不再请求或launch它。
+
+每个captured node因此自带一份类AscendC tiling data的graph package；新callable的prepare不会改写旧node
+的callable identity或function table。可变scheduler state仍由AICPU leader每次从package的pristine image恢复到
+context working slot，所以replay不是对上一轮已消费image的继续执行。
+
+##### 10.66.5 TRB dynamic code registry
+
+A2/A3 TRB AICPU中legacy `orch_so_table_[64]` 仅服务L2/L3。L1新增 `L1OrchSoNode` 单链表：
+
+```cpp
+struct L1OrchSoNode {
+    int32_t callable_id;
+    uint64_t callable_hash;
+    OrchSoEntry entry;
+    L1OrchSoNode *next;
+};
+```
+
+`L1RegisterCallableArgs` ABI version升为2并增加非零 `callable_hash`。register task先分配未发布node、
+复制callable-local kernel table、`dlopen/dlsym`，全部成功后才链入head。相同id再注册必须hash、
+kernel count和全部binding都一致；否则报immutable conflict。
+
+当前lookup是O(N)，每个node一次heap allocation，数量与映射资源没有公开固定上限。这是已认可风险：
+在没有graph-aware release信号时，宁可增长也不覆盖旧graph可能在未来replay所需的code。后续应先做
+byte/count观测和长时压测，再根据数据选择chunked stable index，不先发明无法安全驱逐的LRU。
+
+##### 10.66.6 BinaryUnLoad零调用契约
+
+`LoadAicpuOp::FinalizeL1Pinned()` 与legacy `Finalize()` 分开。L1 close的顺序是：
+
+1. 先锁定Closing，使所有新prepare/launch fail closed。
+2. 在调用者已外部quiesce的前提下释放bootstrap辅助device buffers。
+3. 任一free失败立即保留后续owner，允许显式close重试。
+4. 成功后只忘掉host loader中的binary/function handle记录，使destructor不会调legacy unload。
+5. L1新路径不执行 `aclrtBinaryUnLoad` 或 `rtsBinaryUnload`。
+
+源码guard test同时检查 `finalize_l1_borrowed()` 只调 `FinalizeL1Pinned()`，以及该函数body中不存在
+任何BinaryUnLoad拼写。Legacy L2/L3 `Finalize()` 仍保持原有unload行为，不被这条L1契约改写。
+
+##### 10.66.7 无硬件结果
+
+完成的定向回归：
+
+```text
+JIT decorator + compile extraction + L1 facade: 169 passed
+L1 Python/taskQueue/lifecycle/source guards:     62 passed
+simpler C++ non-hardware ctest:                 120/120 passed
+A2/A3 onboard TRB/HBG host/AICPU/AICore:        all six target classes built
+ruff / clang-format / git diff --check:          passed for touched files
+```
+
+新测试 `tests/ut/jit/test_l1_jit_api.py` 覆盖decorator参数、默认lower、explicit/implicit Out、部分Out
+拒绝、hidden owner append和shutdown retry。旧 `test_l1.py` 增加了超过legacy 64的Python admission以及
+首次warmup后late append。simpler UT覆盖ABI v2 hash、HBG无resident callable view、context registry ABI和pinned
+close source guard。
+
+##### 10.66.8 device0 A2/A3上板结果与一次stale binary假失败
+
+新增 `tests/st/runtime/l1/test_l1_jit_aclgraph.py`，通过 `PYPTO_L1_JIT_TEST_RUNTIME` 在两个全新进程分别验证
+TRB和HBG。每个进程的最终矩阵是：
+
+1. `L1 add` 首次eager，省略out并验torch allocator结果。
+2. 在add已launch之后首次调 `L1 mul`，验证新specialization的late append。
+3. 外部device sync。
+4. 独立stream capture `torch.add -> L1 add -> L1 mul -> torch.add`。
+5. 三组输入连续replay和逐次验数。
+6. 先quiesce，再graph reset，最后可选shutdown。
+
+第一次扩展为two-callable后，TRB的第二callable prepare曾在taskQueue callback返回 `-5`。源码状态
+与C++ UT不一致，排查发现 `RuntimeBuilder` 实际加载的 `runtime/build/lib/.../libhost_runtime.so` 时间戳
+仍是旧产物，而先前只重编了 `build/cache/...` target。用当前worktree的
+`RuntimeBuilder("a2a3").get_binaries(runtime, build=True)` 把当前A2/A3产物正式stage到 `build/lib`后，
+TRB late append立即通过。这次假失败证明上板前不能用“cache target编译成功”代替“测试实际
+加载的staged binary已更新”。
+
+最终当前staged binaries的实测结果：
+
+```text
+TRB: 1 passed, two late-appended L1 callables, 3 ACLGraph replays
+HBG: 1 passed, two late-appended L1 callables, 3 ACLGraph replays
+```
+
+HBG因此已不再是“只有单callable黄金路径”；本次公开JIT API下的late append、同图两个
+L1 node、前后torch op和连续replay都有device0 A2/A3证据。
+
+提交前又在当前最终源码和当前staged binary上各用一个全新进程重跑TRB/HBG。这次复验先后遇到
+三个纯Host环境问题：未选中PTOAS时生成了`skip_ptoas` artifact；`ptoas-bin`中的打包可执行文件
+需要当前Host不具备的更新GLIBC/GLIBCXX；editable环境里原有`_torch_npu_l1.so`又是旧Torch ABI
+产物，导入时报undefined symbol。这三次都在PyPTO native L1 init/launch前结束，不是TRB/HBG设备路径
+失败。明确使用`PTOAS/build-v0.57-llvm21-cann9.2-clean/tools/ptoas` 0.57，并在Torch
+2.7.1/Torch-NPU 2.7.1.post4环境重建c当前PyPTO editable扩展后，最终复验结果仍为：
+
+```text
+TRB: 1 passed in 5.75s
+HBG: 1 passed in 12.35s
+```
+
+两个最终进程都使用device0、A2/A3 onboard、当前工作树Python/runtime，并执行了全部三次
+ACLGraph replay验数和严格quiesce→graph reset→optional shutdown顺序。
+
+##### 10.66.9 仍保留的明示风险
+
+1. TRB linked registry是O(N)查找，且code mapping、node和kernel table随specialization持续增长。
+2. 暂无byte accounting、软阈值和long-running压测；不将“去掉64限制”误述为“资源无限”。
+3. binary、AICore registered handle和TRB resident code按进程pin，显式shutdown也不卸载它们。
+4. 高层registry把成功shutdown的owner保留为retired，当前不承诺同进程同device重新init。
+5. 无graph-aware release/concurrency协议，所以不做LRU、id复用、working-slot并发或跨graph自动回收。
+6. capture内必须显式out，首次specialization必须在ordinary eager完成。
+7. A5/A5sim不在本次用户指定的验收范围内，对其不做通过声明。
