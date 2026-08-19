@@ -3571,3 +3571,46 @@ device0、A2/A3、Torch 2.12对目标trace的最终复跑结果：
 ACLGraph内`torch.add -> PyPTO HBG direct-AIV -> torch.relu`数值通过，8次replay通过。首次miss仍是约261ms，
 这是当前动态HBG build成本；若要优化“每次都换tensor地址”的eager场景，下一阶段应把不含地址的结构模板
 与per-call参数patch进一步拆开，不能直接忽略地址后复用当前package。
+
+#### 25.12 HBG direct-AIV动态地址与runtime scalar重绑定
+
+25.11的exact-address cache是第一层优化，不是最终L1参数模型。L1普通调用必须允许torch allocator在每次
+调用给出新地址，也必须允许`pl.Scalar[...] = pl.RUNTIME`逐次变化；这些值不能触发新的JIT artifact或约
+261ms的容量级HBG构图，也不能错误复用旧task参数。
+
+当前A2/A3 direct-AIV路径把identity分成两层：
+
+| 层 | 包含 | 用途 |
+| --- | --- | --- |
+| structural identity | callable、tensor数量和静态metadata/layout、task/kernel/work/lane拓扑、function binding、scratch binding | 判断首次immutable plan能否继续作为结构模板 |
+| invocation identity | 本次完整tensor device address、上述metadata、每个runtime scalar原始bit pattern | 判断最近一次task-owned direct package能否原样复用 |
+
+地址和scalar不进入structural identity，但仍进入invocation identity。structural hit + invocation miss时，A2/A3
+runtime用首次package的实际task count选择最小compact Host窗口，重新执行generated host orchestration，生成
+本次`ChipTensor[] + scalar[]` task records，再比较完整direct header结构。只有task数、logical block、work、
+arity、record stride、child function和lane/scratch binding全部不变才提交新package；任何控制流、依赖或
+eligibility变化都回退到完整build。
+
+这不是从旧blob里按数值搜索device pointer，也不是把旧地址排除后直接复用。重新执行orchestration保留了
+scalar表达式、tensor view/offset和依赖证明；compact窗口只消除与实际task数量无关的容量级初始化。cache
+保持一个immutable structural plan和一个“最近调用”package，Host内存不随地址增长。`A -> B -> A`时，
+即使A命中首次plan，仍会发现最近package属于B并重新生成A，避免两层identity混淆。
+
+每个新package仍按普通tiling参数生命周期处理：launch构造独立可写
+`[prefix | inline package]`，placeholder由`aclrtLaunchKernelWithHostArgs` patch到CANN为该eager task或
+captured node持有的device args snapshot。Host cache随后被下一调用替换，不影响已经enqueue/capture的owner。
+
+Python JIT同步修正runtime scalar语义。声明为现有
+`scale: pl.Scalar[pl.FP32] = pl.RUNTIME`的参数，其真实dispatch value保留在ordered runtime args并按dtype
+bit-exact打包，但不进入compile-time `scalar_values`或JIT CacheKey；没有`pl.RUNTIME`声明的literal scalar
+继续沿用旧specialization行为。因此新scalar不再产生第二artifact，也不会因共用`save_kernels_dir`而被拒绝。
+
+device0的地址+scalar联合profile中，首次结构build约262ms；首个动态rebind约1.62ms，随后7个每次地址和
+scalar均不同的rebind为65.76--99.48us，均值90.38us。ACLGraph capture dequeue约70.50us，8次replay验数
+通过；异步`A/B/C/D/A`和双graph不同地址/scalar交替replay也通过。
+
+该优化目前只覆盖严格A2/A3 direct-AIV子集。generic HBG的TensorMap、fanin、predicate及runtime arena可能
+含地址派生状态，仍以完整identity重建来保证正确性。后续泛化必须由编译/Host orchestration生成显式
+tensor/scalar provenance patch表，或引入可验证的sparse pristine-region协议；不允许对generic image做盲目
+地址替换。首次结构build继续由ordinary warmup承担，capture内首次调用仍明确拒绝。A5/A5sim不属于本节
+支持范围。

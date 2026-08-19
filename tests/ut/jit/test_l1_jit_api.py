@@ -49,6 +49,15 @@ def _lowerable_l1_kernel(
     return out
 
 
+@pl.jit(execution="l1", runtime="host_build_graph")
+def _runtime_scalar_l1_kernel(
+    x: pl.Tensor[[2, 3], pl.FP32],
+    out: pl.Out[pl.Tensor[[2, 3], pl.FP32]],
+    scale: pl.Scalar[pl.FP32] = pl.RUNTIME,
+):
+    del x, out, scale
+
+
 def test_l1_decorator_metadata_and_invalid_combinations() -> None:
     assert _explicit_l1_kernel._execution == "l1"
     assert _explicit_l1_kernel._execution_runtime == "tensormap_and_ringbuffer"
@@ -71,6 +80,35 @@ def test_l1_lower_defaults_to_a2a3_without_public_init() -> None:
     lowered = _lowerable_l1_kernel.lower()
 
     assert lowered is not None
+
+
+def test_l1_runtime_scalar_values_share_one_jit_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
+    x = torch.ones((2, 3), dtype=torch.float32)
+    out = torch.empty((2, 3), dtype=torch.float32)
+
+    _, arguments, _, scalar_values, scalar_dtypes, _ = _runtime_scalar_l1_kernel._bind_args(
+        (x, out, 1.25), {}
+    )
+    assert arguments["scale"] == 1.25
+    assert scalar_values == {}
+    assert scalar_dtypes == {"scale": pl.FP32}
+
+    builds: list[dict[str, float]] = []
+    compiled = object()
+
+    def fake_compile(_tensor_meta, values, _dtypes, _dyn, _pl, **_kwargs):
+        builds.append(dict(values))
+        return compiled
+
+    _runtime_scalar_l1_kernel._cache.clear()
+    monkeypatch.setattr(_runtime_scalar_l1_kernel, "_compile", fake_compile)
+    first, first_args, _ = _runtime_scalar_l1_kernel._resolve_compiled((x, out, 1.25), {})
+    second, second_args, _ = _runtime_scalar_l1_kernel._resolve_compiled((x, out, -7.5), {})
+
+    assert first is second is compiled
+    assert builds == [{}]
+    assert first_args[-1] == 1.25
+    assert second_args[-1] == -7.5
 
 
 def test_l1_explicit_output_dispatch_returns_same_tensor(monkeypatch: pytest.MonkeyPatch) -> None:

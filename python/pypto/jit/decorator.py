@@ -343,6 +343,39 @@ def _param_layouts(func: Any, func_name: str) -> dict[str, _ir.TensorLayout]:
     return layouts
 
 
+def _param_runtime_scalar_dtypes(func: Any, func_name: str) -> dict[str, DataType]:
+    """Return scalar parameters declared with ``= pl.RUNTIME``.
+
+    A real dispatch value for such a parameter is per-call data, not a JIT
+    specialization constant.  Reading this contract from the declaration lets
+    tensor-sample/dispatch mode produce the same cache key and symbolic scalar
+    IR as annotation-only ``compile(name=pl.RUNTIME)`` mode.
+    """
+    from pypto.language.typing.scalar import RUNTIME, Scalar  # noqa: PLC0415
+
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return {}
+    ann_ns = _annotation_namespace(func, sig)
+
+    result: dict[str, DataType] = {}
+    for name, param in sig.parameters.items():
+        if name == "self" or param.default is not RUNTIME:
+            continue
+        annotation = _resolve_annotation(param.annotation, ann_ns)
+        scalar_dtype = annotation.dtype if isinstance(annotation, Scalar) else None
+        if scalar_dtype is None and isinstance(annotation, DataType):
+            scalar_dtype = annotation
+        if scalar_dtype is None:
+            raise TypeError(
+                f"@pl.jit function {func_name!r}: parameter {name!r} uses pl.RUNTIME "
+                "but is not annotated as pl.Scalar[dtype] or a scalar DataType"
+            )
+        result[name] = scalar_dtype
+    return result
+
+
 def _signature_tensor_meta(
     annotation: Any,
     dtype: DataType,
@@ -1819,6 +1852,7 @@ class JITFunction:
         # A layout has no runtime counterpart on a torch tensor, so it comes
         # from the annotation even on this path.
         param_layouts = _param_layouts(self._func, self.__name__)
+        runtime_scalar_dtypes = _param_runtime_scalar_dtypes(self._func, self.__name__)
         tensor_meta: dict[str, TensorMeta] = {}
         scalar_values: dict[str, int | float | bool] = {}
         scalar_dtypes: dict[str, DataType] = {}
@@ -1847,7 +1881,15 @@ class JITFunction:
                     value, entry_dyn_map.get(name), param_layouts.get(name)
                 )
             elif isinstance(value, (int, float, bool)):
-                scalar_values[name] = value
+                if name in runtime_scalar_dtypes:
+                    scalar_dtypes[name] = runtime_scalar_dtypes[name]
+                else:
+                    scalar_values[name] = value
+            elif name in runtime_scalar_dtypes:
+                raise TypeError(
+                    f"@pl.jit function '{self.__name__}': runtime scalar parameter '{name}' "
+                    f"must be an int/float/bool, got {type(value).__name__}"
+                )
 
         return param_names, arguments, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn_maps
 

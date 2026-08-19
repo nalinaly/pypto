@@ -144,6 +144,10 @@ def test_l1_async_tensor_and_scalar_snapshots_do_not_alias(
         outputs = [_empty_device_tensor(device_id) for _ in cases]
         for input_tensor, output_tensor, (_, scalar) in zip(inputs, outputs, cases, strict=True):
             op(input_tensor, scalar, out=output_tensor)
+        # Return to the structural plan's original dynamic package after the
+        # cache has advanced through several other addresses/scalars.  The
+        # immutable plan may match while the latest task-owned package does not.
+        op(inputs[0], cases[0][1], out=outputs[0])
 
         # Deliberately synchronize only after every Host invocation has
         # returned and its temporary queue-call/HostArgs container is gone.

@@ -7266,3 +7266,120 @@ NUMERICS=PASS
 首次调用约261ms仍然存在，这是动态Host orchestration和GraphPlan build的真实成本。下一阶段若需要优化
 “每次调用tensor地址都变化”的eager，需要新增不含地址的structural template，再用受验证的per-call patch
 生成task snapshot；不能把当前exact-address key放宽，否则会把旧device pointer封进新task/captured node。
+
+#### 10.71 HBG direct-AIV结构模板与每调用参数重绑定
+
+##### 10.71.1 为什么10.70的exact-address cache仍不够
+
+10.70解决的是标准ACLGraph流程中“ordinary warmup与capture使用同一批预分配tensor”的重复build，但它不
+满足一个合格L1算子接口的基本要求：eager每次拿到新的torch allocator地址，或runtime scalar值变化时，
+不能重新支付约261ms的完整HBG构图成本。能够算对但每次换地址都重新构图，只是语义兜底，不能与Triton
+或AscendC/aclnn的普通算子调用形态相比。
+
+这里不能把地址从原cache key中简单删除。HBG direct package内真实保存每个task的`ChipTensor[]`和
+`scalar[]`；如果新调用直接复用旧package，CANN会为新task/captured node保存旧device pointer，产生静默
+写错地址。正确拆分是：
+
+```text
+callable-local immutable structural plan
+  + 当前调用的tensor metadata结构校验
+  + 当前调用重新生成的task-owned direct package
+  -> aclrtLaunchKernelWithHostArgs runtime-owned args snapshot
+```
+
+结构身份仍包含tensor count、buffer size、owner/offset/version、dtype、address space、shape、stride、
+extent、contiguous/manual-dependency等会影响specialization或依赖分析的字段，但有意排除
+`buffer.addr`和scalar bit值。完整调用身份仍包含地址和scalar；两种hash都必须再做逐字段比较，不能只信
+hash。
+
+##### 10.71.2 A2/A3 direct-AIV compact rebind
+
+`HbgGraphPlanCache`现在同时持有两类状态：
+
+1. 首次完整Host build产生的immutable `HbgGraphPlan`及其结构快照；
+2. 最近一次调用对应的direct package及完整参数快照。
+
+完整地址/scalar命中时直接复用最近package。完整身份miss、但结构身份仍与首次plan一致时，不再使用默认
+`ring_task_window=16384`重建整张SM/runtime arena，而是调用A2/A3专用
+`rebind_l1_hbg_direct_aiv_package_impl()`：
+
+1. 从已验证package header读取实际top-level task count；
+2. 取不小于该task count的最小2次幂窗口，最小值4，并校验不超过prepare时冻结的配置上限；
+3. 在Host临时arena中用该compact窗口重新执行同一generated host orchestration；
+4. 用本次真实tensor地址、scalar及其表达式结果重新生成direct task records；
+5. 再次执行direct eligibility，比较task count、logical block、work count、tensor/scalar arity、record
+   stride、child code、lane/scratch等结构header；
+6. 只有结构完全一致才事务性替换最近package；task拓扑、依赖、kernel或容量变化均返回unsupported，并
+   回退原来的完整GraphPlan build。
+
+重新执行generated orchestration而不是在旧bytes里盲搜地址，保证scalar表达式、tensor view/offset和
+eligibility都由真实PyPTO语义重新计算。对目标profile，一个`pl.spmd(50)`最终只是1个top-level direct task，
+因此重绑定窗口从16384缩到4；无需初始化容量级scheduler image。
+
+这个cache只有一个最近package，不按地址数量增长。CANN在每次
+`aclrtLaunchKernelWithHostArgs`返回前复制本次HostArgs，captured node继续拥有自己的runtime snapshot；下一
+次Host调用替换cache中的最近package不会覆盖已经enqueue或已经capture的task。为覆盖`A -> B -> A`，
+plan的exact identity与最近package identity分开判断：即使A仍精确命中immutable plan，只要最近package是B，
+也必须重新生成A的package，不能错误地把“plan命中”等同于“task args命中”。
+
+##### 10.71.3 公开`@pl.jit` runtime scalar cache key修正
+
+把scalar加入真实profile后还发现一层更早的缺陷：annotation虽然写成
+`scale: pl.Scalar[pl.FP32] = pl.RUNTIME`，dispatch的真实float仍被`_bind_args()`放进`scalar_values`，导致每个
+值形成不同JIT CacheKey。显式`save_kernels_dir`下第二个值甚至在进入simpler rebind前就因“different cache
+keys”被拒绝。
+
+`python/pypto/jit/decorator.py`现在从函数声明解析所有`= pl.RUNTIME` scalar及其现有
+`pl.Scalar[dtype]`/`DataType` annotation：
+
+- dispatch仍把真实value保留在ordered runtime arguments中；
+- value不进入compile-time `scalar_values`和JIT cache key；
+- 声明dtype进入`scalar_dtypes`，生成program继续保留symbolic scalar参数；
+- literal scalar且没有`pl.RUNTIME`声明的旧specialization行为保持不变；
+- runtime scalar收到非int/float/bool时在JIT入口明确拒绝。
+
+因此同一artifact可连续接收不同scalar bit pattern，随后由已有L1 dtype-aware packer和本节direct package
+重绑定传给device，不新造scalar表达方式。
+
+##### 10.71.4 device0性能与正确性证据
+
+使用A2/A3 device0、Torch `2.12.0+cpu`、Torch-NPU `2.12.0+git5462a1b`。扩展目标profile预先分配8组
+彼此不同的source/bias/multiplier/output地址，并令runtime FP32 scalar逐次变化；分配本身不进入active
+replay区间。最终数值通过。
+
+对应`Dequeue@pypto_l1_0_pypto_l1_jit_kernel`为：
+
+```text
+首次完整结构build:       262059.68us
+同地址热调用:                 42.30us, 35.70us
+首个新地址/scalar rebind:   1616.08us
+后续新地址/scalar rebind:     99.48us, 65.76us, 94.40us,
+                               93.02us, 92.51us, 94.35us, 93.15us
+后7次rebind均值:               90.38us
+```
+
+首个rebind含首次进入该动态路径的Host/profiler冷态；稳定值已从约261ms降到约65--100us，而且每次地址和
+scalar都不同。重新运行ACLGraph profile也通过：三次ordinary warmup dequeue约
+`263360.86us / 42.97us / 32.86us`，capture dequeue `70.50us`，8次replay数值通过。
+
+正式ST另外覆盖：
+
+- 五次不做中间sync的Host enqueue，参数序列为`A/B/C/D/A`，input/output地址和FP32 scalar均变化，最后
+  一次回到原始完整identity，最终一次外部sync后全部验数通过；
+- 两张同时存活的ACLGraph分别capture不同地址/scalar package，按A/B/A/B交替replay通过；
+- `aclrtLaunchKernelWithHostArgs`返回后Host临时package可销毁，既有tensor allocator lease和CANN args
+  ownership契约不变。
+
+无硬件回归结果：PyPTO JIT/L1定向140/140通过，simpler C++ non-hardware 122/122通过，A2/A3 HBG
+host/AICPU/AICore staged build通过，新增结构hash、direct结构比较、transactional rebind和A/B/A cache反例
+均通过。
+
+##### 10.71.5 当前明确边界
+
+本节性能收口只适用于已经通过严格eligibility的A2/A3 direct-AIV子集。普通HBG DAG仍可能把地址相关的
+TensorMap、fanin、predicate和runtime arena状态写进pristine image；它在完整identity变化时继续做正确但
+昂贵的全量build，不能拿direct package的90us结论外推。泛化路径若继续优化，需要生成带来源/provenance的
+tensor/scalar patch表，或定义可验证的sparse pristine regions；不能靠搜索旧地址并替换bytes。
+
+首次结构build仍约262ms，当前由ordinary warmup承担；capture内未warmup仍明确不支持。A5/A5sim没有纳入
+本节实现或完成门槛。
