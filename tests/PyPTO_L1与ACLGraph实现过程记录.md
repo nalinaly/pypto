@@ -6790,7 +6790,7 @@ L1 node、前后torch op和连续replay都有device0 A2/A3证据。
 需要当前Host不具备的更新GLIBC/GLIBCXX；editable环境里原有`_torch_npu_l1.so`又是旧Torch ABI
 产物，导入时报undefined symbol。这三次都在PyPTO native L1 init/launch前结束，不是TRB/HBG设备路径
 失败。明确使用`PTOAS/build-v0.57-llvm21-cann9.2-clean/tools/ptoas` 0.57，并在Torch
-2.7.1/Torch-NPU 2.7.1.post4环境重建c当前PyPTO editable扩展后，最终复验结果仍为：
+2.7.1/Torch-NPU 2.7.1.post4环境重建当前PyPTO editable扩展后，最终复验结果仍为：
 
 ```text
 TRB: 1 passed in 5.75s
@@ -6809,3 +6809,20 @@ ACLGraph replay验数和严格quiesce→graph reset→optional shutdown顺序。
 5. 无graph-aware release/concurrency协议，所以不做LRU、id复用、working-slot并发或跨graph自动回收。
 6. capture内必须显式out，首次specialization必须在ordinary eager完成。
 7. A5/A5sim不在本次用户指定的验收范围内，对其不做通过声明。
+
+##### 10.66.10 提交与推送
+
+在两个远端main均与本地基线一致后，严格按submodule先行顺序发布：
+
+1. simpler修改提交为`e58d54c0 Add: support dynamic L1 JIT callables`，已推送到
+   `https://github.com/nalinaly/simpler.git`的`main`。
+2. PyPTO公开JIT API、文档、ST/UT和上述runtime gitlink提交为
+   `0e61fc88 Add: expose Triton-style L1 JIT execution`，已推送到
+   `https://github.com/nalinaly/pypto.git`的`main`。
+3. 本次不属于GPT实现范围的未跟踪文件
+   `examples/runtime/l1_tiled_add_then_mul.py`没有被暂存、提交或推送。
+
+两个提交前均通过本仓pre-commit。simpler clang-tidy使用机器上安装完整、与resource
+headers匹配的LLVM/Clang 18；系统PATH优先的独立Clang 21可执行文件没有配套的
+Clang 21 resource headers，其`stddef.h`/C++ standard library失败是lint环境问题，不是代码
+诊断或被跳过的检查。
