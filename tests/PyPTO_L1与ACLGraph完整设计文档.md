@@ -359,7 +359,7 @@ Collecting/ReadyEnqueued/Poisoned
 | `L1AicoreReport[]` | L1 context | prepare | 是 | close |
 | queue call snapshot | taskQueue entry | 每次 Host 调用 | Host 队列可见 | callback 完成后释放 |
 | CANN HostArgs copy | CANN task/graph node | enqueue/capture | 是 | task 或 graph owner 管理 |
-| HBG host GraphPlan | 单次 HBG Host build | 每次 Host 调用 | 否 | 生成独立 launch blob 后释放 |
+| HBG host GraphPlan | L1 callable-local单条cache | 首次调用或参数语义变化 | 否 | 新identity事务替换旧entry；context close时释放 |
 | HBG serialized launch blob | 单次 Host launch | 每次 Host 调用 | 被 CANN 深拷贝 | API 返回后可释放 |
 | HBG working slot | L1 context | prepare | 是 | close |
 | HBG ContextRegistry | L1 context | prepare | 是 | close |
@@ -851,6 +851,8 @@ Layer 5: Context/caller lifetime roots
 ### Layer 1：不可变 Host GraphPlan
 
 每次 HBG host build产生一个 `HbgGraphPlan`。它深拷贝所有 pristine region，并保存 canonical、未 patch 的序列化表示。对象不暴露 mutable byte view，可以生成任意多个彼此独立的 writable launch snapshot。
+
+L1在每个callable内保留一个context-owned cache entry。只有tensor完整descriptor/address和scalar bit pattern都与entry精确一致时才复用plan；hash只用于快速筛选，随后必须逐字段比较，不能把hash碰撞当作命中。参数变化时先完整构建候选plan，成功后才事务替换旧entry，因此cache有界且失败不破坏上一份可用plan。cache只延长canonical Host plan的寿命，不延长任何mutable execution state，也不替CANN持有某个captured node的参数。
 
 它是 plan hash 的 Host trust root，但不是 CANN task owner。构建失败事务化返回，不改变旧 owner。
 
@@ -2266,7 +2268,7 @@ HBG 需要明确区分五种对象，但这些层不应暴露给 Python 用户�
 
 | 层 | 内容 | owner | 生命周期 |
 | --- | --- | --- | --- |
-| `GraphPlan` | host build 的 canonical pristine graph | PyPTO host builder | 构建本次 invocation |
+| `GraphPlan` | host build 的 canonical pristine graph | L1 callable-local单条cache | 参数语义稳定时跨invocation复用；变化后事务替换 |
 | serialized launch blob | header、regions、identity、pristine payload | 调用栈临时对象 | 到 `WithHostArgs` 接管 |
 | runtime-owned HostArgs | CANN 复制后的 task args 和 inline payload | CANN task/captured node | task 完成或 graph 销毁 |
 | working execution slot | mutable SM、runtime arena、heap、Runtime/KernelArgs | PyPTO device owner | hidden context lifetime |
@@ -3518,8 +3520,8 @@ for work_id = block_idx; work_id < work_count; work_id += block_num:
 该严格子集无需跨核atomic cursor，避免引入不必要的claim/contention协议。task成本不均匀时可能出现tail
 imbalance，未来若需要动态均衡，应设计和验证A2/A3自己的atomic协议。
 
-package生命周期仍遵守HBG的tiling原则：`HbgGraphPlan`拥有canonical tensor/scalar/task snapshot，每次launch
-复制一份可写HostArgs；`aclrtLaunchKernelWithHostArgs`的placeholder把单pointer参数patch到CANN为eager task
+package生命周期仍遵守HBG的tiling原则：`HbgGraphPlan`拥有canonical tensor/scalar/task snapshot；相同完整参数
+语义可命中callable-local单条cache，但每次launch仍复制一份可写HostArgs；`aclrtLaunchKernelWithHostArgs`的placeholder把单pointer参数patch到CANN为eager task
 或captured node保有的inline package。context只拥有per-lane mutable scratch和child code；package不引用Host
 临时vector。binary/function handle按process pin，禁止`BinaryUnLoad`。
 
@@ -3532,3 +3534,40 @@ A5sim作支持声明。
 `direct L1 -> torch.mul` ACLGraph三次replay均验数通过；最终重建复跑的热replay（含successor和
 stream sync）约61.4us。
 完整调试证据、拒绝矩阵和所有权单测见实现过程记录10.69。
+
+#### 25.11 HBG GraphPlan热调用cache与taskQueue dequeue
+
+torch_npu profiler把taskQueue callback的全部Host工作都计入`Dequeue@pypto_*`。原实现每次callback都调用
+Host orchestration、构建HBG graph、复制pristine region并生成direct package，即使warmup、后续eager和
+capture使用完全相同的tensor地址、layout和scalar，也会重复约260ms的GraphPlan构建；这不是taskQueue
+出队调度本身的固定开销。
+
+当前实现给每个L1 HBG callable增加一个`HbgGraphPlanCache`，契约如下：
+
+1. cache key覆盖tensor count、每个tensor的device address、buffer size、owner、offset、version、dtype、
+   address space、shape、stride、extent、contiguous/manual-dependency标志，以及所有scalar原始bit pattern；
+2. 先比较稳定hash，再逐字段比较完整语义快照，unused dimension与padding不参与identity；
+3. cache只有一个entry。新地址、layout或scalar产生miss，重新执行Host build，并在成功后原子替换；不会按
+   capture次数或地址数量无界积累Host graph；
+4. callable function table、execution-slot binding和runtime配置在当前context内prepare后冻结；cache本身
+   归callable/context所有，close时随`CallableState`释放；
+5. cache命中只复用immutable canonical plan/direct package。普通HBG每次仍生成fresh writable launch blob，
+   direct-AIV每次仍生成fresh `[prefix | inline package]` HostArgs；CANN继续为每个eager task或captured node
+   持有自己的runtime-owned snapshot，working slot仍在每次执行/replay完整restore；
+6. `plan_generation`标识package/restore identity，而非每次Host提交都必须递增的执行计数。同一个captured
+   node replay本就重复同一代；只要每次restore完整执行，普通eager重复提交同一plan也遵循相同协议。
+
+device0、A2/A3、Torch 2.12对目标trace的最终复跑结果：
+
+| 指标 | 优化前 | 优化后 |
+| --- | ---: | ---: |
+| 4次launch dequeue均值 | 262716.89us | 65398.89us（包含一次miss） |
+| 首次warmup/cache miss | 264644.73us | 261455.55us |
+| 后续两次warmup/cache hit | 261144.46/261701.17us | 42.24/31.40us |
+| capture launch/cache hit | 263377.18us | 66.36us |
+| 三次热hit均值 | 262074.27us量级 | 46.67us |
+
+热均值约缩短5629倍，capture dequeue约缩短3969倍；四次总和因仍保留一次必要build而缩短约4.02倍。
+ACLGraph内`torch.add -> PyPTO HBG direct-AIV -> torch.relu`数值通过，8次replay通过。首次miss仍是约261ms，
+这是当前动态HBG build成本；若要优化“每次都换tensor地址”的eager场景，下一阶段应把不含地址的结构模板
+与per-call参数patch进一步拆开，不能直接忽略地址后复用当前package。

@@ -7128,8 +7128,141 @@ user-site 2.12重建editable adapter，并逐项核对adapter build/runtime版�
 2. grid-stride适合task代价相近的严格子集；task代价高度不均匀时会有tail imbalance。
 3. scratch借用frozen runtime arena尾部依赖当前no-concurrency契约；开放多graph并发前必须显式reserve并按
    execution slot隔离。
-4. Host每次仍要执行orchestration来证明eligibility并构造package；可在specialization identity稳定后研究
-   template化，但不能跳过tensor/scalar地址快照。
+4. 首次参数identity或参数变化时仍要执行orchestration来证明eligibility并构造package；相同完整
+   tensor/scalar语义现在命中callable-local单条GraphPlan cache，详见10.70。后续若优化频繁换地址的eager，
+   仍需拆分结构模板与地址patch，不能跳过tensor/scalar地址快照。
 5. binary与function handle继续append/pin，不做unload；这是ACLGraph graph-aware release缺失下的正确取舍。
 6. A5/A5sim没有被修改、编译或宣称支持；未来若做A5，必须在A5平台上独立选择复用原FDWIC协议还是实现
    更窄的direct路径，不能从本次A3结果外推。
+
+#### 10.70 从torch_npu Dequeue中移除重复HBG Host build
+
+##### 10.70.1 原始profiling与定位
+
+用户指出
+`inductor_pto/build_output/profiling/mixed_add_pypto_mul_relu/mixed_l1_jit_aclgraph_trace.json`
+中的torch_npu dequeue异常长。优化前同一轮profile有4个
+`Dequeue@pypto_l1_0_pypto_l1_jit_kernel`：
+
+```text
+264644.73us
+261144.46us
+261701.17us
+263377.18us
+total = 1050867.54us
+mean  = 262716.89us
+```
+
+prepare dequeue为13794.09us，不是主要矛盾。展开第一个launch dequeue后，tensor pointer attribute校验约
+3us即结束，之后Host线程约263ms没有进入下一个aclrt launch API；真正的
+`aclrtLaunchKernelWithHostArgs`约1.2ms。源码对应关系是
+`DeviceRunnerBase::launch_l1_callable()`在每次taskQueue callback中无条件执行
+`build_l1_hbg_graph_plan_impl()`：
+
+1. 调用Host orchestration重新生成整张HBG；
+2. 重新建立SM/runtime arena pristine image；
+3. 重新证明direct-AIV eligibility；
+4. 重新构造direct package或普通launch blob；
+5. 最后才进入CANN kernel launch。
+
+因此profiler把约263ms记在torch_npu `Dequeue`名下，只说明耗时发生在队列callback内部，不能推导为
+`RunOpApiV2`出队或`.stream(false)`本身慢。目标profile的3次warmup和1次capture使用同一组预分配tensor，
+地址、shape、stride、dtype和scalar都没有变化，重复build没有增加语义价值。
+
+##### 10.70.2 cache边界
+
+新增`src/common/worker/hbg_graph_plan_cache.h`，每个L1 HBG `CallableState`拥有一个
+`HbgGraphPlanCache`。设计刻意是单条而不是map/LRU：
+
+- lookup先比较`hbg_argument_snapshot_hash()`，再用`hbg_argument_snapshots_equal()`逐字段比较完整语义；
+- 快照覆盖tensor count、device address、buffer size、owner、offset、version、ndims、dtype、manual dep、
+  contiguous、address space、有效shape/stride、extent，以及每个scalar的原始64-bit值；
+- padding和`ndims`之外的数组槽不参与identity；它们改变不会制造伪miss；
+- hash碰撞不能制造伪hit，因为最终必须逐字段相等；
+- 新参数miss时先构建`unique_ptr<const HbgGraphPlan>`候选，再复制快照和direct package，全部成功后才替换
+  entry；allocation/validation失败保留上一entry；
+- 新地址/layout/scalar成功build后替换旧entry，所以Host内存不会随不同调用地址无界增长；
+- cache归callable/context所有，不进入resident global，也不跨context共享。
+
+这不是忽略动态参数的template cache。当前HBG package仍内嵌tensor地址和scalar，任何这些语义变化都必须
+miss并重建。它首先解决ACLGraph的标准流程：同一批graph-bound tensor先ordinary warmup，再在capture中
+重复相同地址。
+
+##### 10.70.3 lifecycle为什么没有被性能优化破坏
+
+cache只复用Layer 1 immutable canonical plan，不复用另外四层：
+
+```text
+callable-local one-entry HbgGraphPlan cache
+  -> 每次generic launch重新serialize fresh writable HostArgs
+  -> 每次direct-AIV launch重新构造fresh [prefix | inline package]
+  -> CANN为本次eager task/captured node持有独立device args snapshot
+  -> AICPU leader每次invocation/replay完整restore context-owned working slot
+```
+
+所以：
+
+1. CANN可能原地patch writable HostArgs，不会污染cache中的canonical bytes；
+2. 不同captured node不会共享同一份mutable HostArgs；
+3. plan里记录的tensor/scalar快照不能被下一次Host调用覆盖；
+4. execution slot里的queue/completion/runtime state仍每次恢复，cache hit不等于跳过restore；
+5. direct package本身没有会被device执行原地消费的scheduler image，但仍按每个task生成新的CANN-facing
+   HostArgs owner；
+6. `plan_generation`是package/restore identity，不是Host launch counter。ACLGraph replay本来就重复同一
+   generation；ordinary eager重复提交完全相同plan也由同一完整restore协议保证正确。
+
+callable function binding、execution-slot binding和runtime ring配置在prepare/seal后冻结，且cache是
+per-callable，因此它们不需要重复进入key。若将来允许prepare后改变这些字段，必须先显式失效cache，不能
+继续依赖当前冻结不变量。
+
+##### 10.70.4 测试先行与回归覆盖
+
+在实现header前先让`test_hbg_launch_blob`引用`hbg_graph_plan_cache.h`，构建按预期因文件不存在失败；随后
+实现cache并补齐三组反例：
+
+1. 完整语义相同但padding/unused dimension不同仍命中；地址或scalar变化即miss；
+2. null/失败候选不替换原有可用plan；
+3. 新参数成功replace后旧参数不再命中、新参数命中新generation，证明单条有界替换。
+
+最终验证：
+
+```text
+test_hbg_launch_blob                         1/1 passed
+C++ ctest -LE requires_hardware             122/122 passed
+L1 Python/JIT定向测试                        66/66 passed
+A2/A3 host_build_graph RuntimeBuilder       host/AICPU/AICore staged build passed
+git diff --check                            passed
+```
+
+本阶段只修改、构建和上板验证A2/A3路径；没有把结果外推为A5/A5sim结论。
+
+##### 10.70.5 device0最终复跑
+
+最终使用正式源码、Torch `2.12.0+cpu`、Torch-NPU `2.12.0+git5462a1b`，在device0原profile脚本上重建
+HBG JIT artifact并运行：
+
+```text
+PROFILE_MODE=aclgraph
+PYPTO_ENTRY=pl.jit(execution=l1,runtime=host_build_graph)
+DIRECT_AIV_REQUIRED=1
+EAGER_WARMUP_REPLAYS=3
+ACTIVE_REPLAYS=8
+NUMERICS=PASS
+```
+
+最终trace中的dequeue：
+
+| callback | 优化前 | 优化后 | 说明 |
+| --- | ---: | ---: | --- |
+| prepare | 13794.09us | 17669.66us | 非本次优化对象，单次发生 |
+| launch 0 | 264644.73us | 261455.55us | 首次参数identity，cache miss并build |
+| launch 1 | 261144.46us | 42.24us | cache hit |
+| launch 2 | 261701.17us | 31.40us | cache hit |
+| capture launch | 263377.18us | 66.36us | cache hit，进入ACLGraph |
+
+三次hot hit均值46.67us，相对原4次262716.89us均值约缩短5629倍；capture launch约缩短3969倍。
+四次launch总耗时从1050867.54us降至261595.55us，因保留一次正确的动态build而总体约缩短4.02倍。
+
+首次调用约261ms仍然存在，这是动态Host orchestration和GraphPlan build的真实成本。下一阶段若需要优化
+“每次调用tensor地址都变化”的eager，需要新增不含地址的structural template，再用受验证的per-call patch
+生成task snapshot；不能把当前exact-address key放宽，否则会把旧device pointer封进新task/captured node。
