@@ -6982,3 +6982,154 @@ replay继承上一轮的queue/completion/runtime pointer。因此本轮没有在
 放宽 `hbg_launch_blob` 的“full SM + full runtime arena”校验。
 
 本轮按用户要求只修改和验收A2/A3，没有修改A5/A5sim实现。只做阶段性本地commit，不默认push。
+
+#### 10.69 A2/A3同构无依赖HBG的direct-AIV调度路径
+
+2026-08-19继续分析上一节剩余的毫秒级开销。compact arena已经把HBG replay从约305ms降到约
+3.8ms，但对一个2us级pointwise child kernel来说，AICPU restore、scheduler启动、AICore握手和
+shutdown仍远大于真实计算。用户指出`nalinaly/fdwic-swimlane-deps`分支已经尝试用AICore的Scalar
+控制路径完成分布式多task调度，并要求研究它对“同构、无依赖task”子集的借鉴价值。
+
+##### 10.69.1 首先收紧平台边界：不能把A5实现移植到A3
+
+该参考分支的当前tip为`6a0378b2`，它不是一份跨平台scheduler库，而是一整套A5
+`fully_distributed_within_core`实验：
+
+- 固定拓扑是96个worker，即32 AIC + 64 AIV；
+- 使用A5专属Scalar/SIMT执行模型、跨核atomic、claim tournament、shared TensorMap、heap frontier、
+  completion和fatal协议；
+- state、cache、intrinsic、地址空间、worker编号和PMU/swimlane schema都与A5 ABI耦合；
+- 它解决的是通用跨核建图/依赖/输出分配问题，不是一个可直接在A3编译的轻量work queue。
+
+因此本次没有复制该分支的源码、A5 atomic primitive、96-worker常量或wire ABI，也没有修改或构建
+A5/A5sim。真正吸收的只有一个架构思想：当Host已经证明任务是同一child kernel、无依赖且task数静态
+可知时，不必为了分配这些work而启动AICPU scheduler；可以让AICore kernel中的Scalar控制流自行选择
+逻辑work。
+
+A2/A3首版采用比全局atomic cursor更窄、更可证明的确定性grid-stride：
+
+```text
+physical_lane = get_block_idx()
+physical_lane_count = get_block_num()       # 当前A3为48个AIV block
+
+for work_id = physical_lane;
+    work_id < work_count;
+    work_id += physical_lane_count:
+        task_id = work_id / logical_block_num
+        block_idx = work_id % logical_block_num
+        call same_child(task[task_id].args, block_idx)
+```
+
+它不要求task数恰好等于核数。对于50个逻辑work和48个AIV block，block 0、1各执行两个work，
+其余block各执行一个；96、97、145等数量也按同一规则自然展开。因为首版只接受同构且无依赖的work，
+确定性映射不需要跨核atomic、claim loser、完成队列或AICPU仲裁。若未来task代价明显不均匀，再单独设计
+A2/A3可证明的dynamic cursor；不能以A5分支存在为由直接引入其协议。
+
+##### 10.69.2 严格eligibility与普通HBG fallback
+
+Host orchestration仍先执行一次，用生成后的真实HBG ring image判断是否可以降级成direct package。
+只有全部task同时满足下列条件才选择fast path：
+
+1. 全部task使用同一个AIV0 child kernel；AIC与AIV1为空。
+2. 全部task的tensor/scalar数量相同。
+3. `fanin_count == 0`，没有dispatch predicate。
+4. 没有task attrs、dump metadata、PMU、scope stats或chip swimlane。
+5. `logical_block_num`为正且所有task相同，`total_required_subtasks == logical_block_num`。
+6. callable-local `func_id`存在，且能从device `CoreCallable`基址按稳定wire offset推导child code地址。
+
+任何普通但不满足该子集的graph返回`NotEligible`并继续原有AICPU HBG scheduler，不能因为优化识别失败
+改变功能。结构损坏、地址/容量溢出或Host分配失败才作为真实错误返回。内部测试环境变量
+`SIMPLER_INTERNAL_HBG_L1_REQUIRE_DIRECT_AIV=1`可以把fallback变成明确失败，只用于证明ST确实走了
+direct path，不作为用户API。
+
+##### 10.69.3 direct package与ACLGraph生命周期
+
+每次Host build生成一个immutable `HbgL1DirectAivPackage`：
+
+- 128-byte versioned header记录task/work/lane数量、record stride、child code地址和scratch地址；
+- 每个HBG task保存一份`ChipTensor[] + scalar[]`参数快照；
+- package不包含会被执行过程消费的scheduler queue/SM/runtime image；
+- `HbgGraphPlan`在Host侧深拷贝canonical package，每次launch再产生独立可写serialization。
+
+专用入口`hbg_l1_direct_aiv_kernel_1_mix_aiv`只声明一个native pointer参数。Host通过
+`aclrtLaunchKernelWithHostArgs`传入`[64B prefix | inline package]`，placeholder把pointer patch到CANN
+为该task/captured node管理的device args blob。这样tensor地址、scalar和逻辑work表的生命周期与普通
+AscendC tiling_data相同：临时Host vector在launch返回后可销毁，graph replay继续使用CANN为该node保留的
+snapshot。不同captured node不会共享一份Host package。
+
+每个AIV block仍需要可写的`ChipTensor`副本、child args、`LocalContext/GlobalContext`。首版从已经pin住的
+HBG execution-slot runtime arena尾部划出`48 * 8192` bytes、64B对齐的per-lane scratch；package只保存
+该context-owned地址。每次child返回后执行`pipe_barrier(PIPE_ALL)`，保证同一lane执行下一个grid-stride
+work前不会复用仍在pipeline中的UB和args。当前单context、禁止并发契约下该scratch安全；后续若开放并发，
+必须把它提升为显式slot reservation，不能继续让两个graph同时写同一span。
+
+direct entry从已经生成的HBG AICore binary中用`aclrtBinaryGetFunction`解析。为避免captured graph引用
+失效，新`aclrtBinaryLoadFromData` handle与已有L1 binary一样按进程pin，任何新代码路径都不调用
+`aclrtBinaryUnLoad`。direct launch只在caller stream提交一个48-block AIV kernel并record完整operator tail；
+没有AICPU scheduler、hidden AICore stream、内部stream sync、capture query或model attach。
+
+##### 10.69.4 实现中排除的错误方向
+
+从独立A3 probe迁入production时依次排除了四个容易误判的方案：
+
+1. **normal mixed entry中的weak hook。** 同一源码同时编译AIC/AIV，最终relocatable link可能为两边都选择
+   AIC版本的weak实现，导致AIV入口实际不执行direct逻辑。最终改成独立AIV-only function entry。
+2. **64-bit magic pointer tag。** 最初试图用`"HBGDIREC"`样式高位tag复用普通kernel参数，但A3 GM地址
+   只有有效低位范围，入口解引用前已触发地址异常。独立entry不再需要tag或入口复用。
+3. **猜测普通hidden kernel的私有launch ABI。** 实际ELF显示普通entry为16-byte native args，新的direct
+   entry为8-byte单pointer args。最终使用公开`aclrtLaunchKernelWithHostArgs`和独立function handle，
+   不复刻内部ffts/workspace ABI。
+4. **把`CoreCallable*`当作code PC。** callable-local table保存的是device `CoreCallable`对象地址；generic
+   scheduler会读取其中已修正的`resolved_addr_`。direct Host builder无法解引用device对象，最终按上传时
+   invariant使用`object_base + CoreCallable::binary_data_offset()`得到相同child binary地址。
+
+独立probe完成这些平台实验后没有保留进正式提交；最终ST直接通过PyPTO HBG L1 API验证产品路径，避免维护
+一套使用private runtime launch API的重复测试框架。
+
+##### 10.69.5 单测与device0 A3证据
+
+新增无硬件测试覆盖：
+
+- 2个HBG task × 25 logical block = 50 work，在48 lane header中保持精确计数；
+- per-task `ChipTensor`与scalar逐byte进入immutable package；
+- child code地址等于callable device base加`CoreCallable::binary_data_offset()`；
+- fanin、不同kernel、predicate、task attrs、零lane和未对齐scratch都拒绝，失败不覆盖已有output owner；
+- `HbgGraphPlan`深拷贝direct package，每次serialization独立，修改一个CANN-facing snapshot不会污染下一次。
+
+结果：`test_hbg_launch_blob` 21/21通过，`test_hbg_l1_direct_aiv_package` 3/3通过；L1 Python定向测试
+59/59通过。A2/A3 onboard HBG host、AICPU、AICore目标均构建通过。
+
+device0使用当前正式源码、Torch `2.12.0+cpu`、Torch-NPU `2.12.0+git5462a1b`和PTOAS 0.57执行
+`tests/st/runtime/l1/test_l1_hbg_direct_aiv.py`：
+
+```text
+one @pl.jit HBG task
+logical_block_num = 50
+physical AIV launch blocks = 48
+eager result: passed
+ACLGraph: direct L1 -> torch.mul
+three replay values: passed
+first replay run latency(us): 971.1, 229.4, 72.2
+post-format/rebuild rerun latency(us): 985.6, 266.1, 61.4
+```
+
+最后一次约61.4us包含`graph.replay()`、图内`torch.mul`后继和capture-stream synchronize，不能直接解释为
+纯child kernel时间，但已经从普通HBG scheduler的毫秒级链路降到普通单算子量级。原有A2/A3 L1回归也在
+同一2.12环境下3/3通过：TRB基本图、普通HBG基本图、HBG两个callable各自package/capture/replay均未回归。
+
+复验初期曾机械沿用过程记录中的旧`PYTHONNOUSERSITE=1`命令，导致运行环境从当前user-site Torch 2.12
+退回venv/system Torch 2.7；第一次因此得到compile-only artifact，第二次因旧adapter ABI在import阶段失败。
+两次都在native L1 init/launch前终止，没有执行2.7版本的L1 kernel。随后终止错误构建进程，明确以正常
+user-site 2.12重建editable adapter，并逐项核对adapter build/runtime版本完全一致后才得到上述真机结果。
+
+##### 10.69.6 当前边界与后续优化
+
+1. 这不是A5 FDWIC Scalar scheduler的A3移植，也不支持有依赖、异构child、predicate、动态建图或输出分配。
+2. grid-stride适合task代价相近的严格子集；task代价高度不均匀时会有tail imbalance。
+3. scratch借用frozen runtime arena尾部依赖当前no-concurrency契约；开放多graph并发前必须显式reserve并按
+   execution slot隔离。
+4. Host每次仍要执行orchestration来证明eligibility并构造package；可在specialization identity稳定后研究
+   template化，但不能跳过tensor/scalar地址快照。
+5. binary与function handle继续append/pin，不做unload；这是ACLGraph graph-aware release缺失下的正确取舍。
+6. A5/A5sim没有被修改、编译或宣称支持；未来若做A5，必须在A5平台上独立选择复用原FDWIC协议还是实现
+   更窄的direct路径，不能从本次A3结果外推。

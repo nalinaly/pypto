@@ -3495,3 +3495,40 @@ device0 A2/A3真机使用两个独立进程验证TRB和HBG，两者都覆盖：
 - 首次调用必须是ordinary eager；PyPTO不query capture，原始native/CANN错误会被增补warmup指引。
 - capture内省略out不属于v1契约，即使torch allocator在某个版本上偶然允许也不宣传为supported。
 - `shutdown()` 不会sync，不能从一张graph的销毁推导为device级可关闭。
+
+#### 25.10 A2/A3 HBG同构无依赖direct-AIV fast path
+
+普通HBG必须恢复pristine scheduler image、启动AICPU participant、完成AICore握手与调度，再在结束时汇合并
+销毁本轮runtime。该路径是通用DAG语义的正确实现，但对“一个AIV child + 静态数量同构work + 无任何依赖”
+的pointwise子集，调度控制可能比child计算高三个数量级。
+
+当前A2/A3实现因此增加一个严格、可回退的fast path：Host orchestration先生成真实graph；只有确认所有task
+使用同一个AIV0 kernel、相同tensor/scalar arity、无fanin/predicate/task attrs/DFX，且静态block数一致时，
+才把graph压平为immutable direct package。普通graph不满足条件时继续走既有AICPU scheduler，语义不变。
+
+direct AIV entry启动当前平台的全部AIV block，并用确定性grid-stride消费逻辑work：
+
+```text
+for work_id = block_idx; work_id < work_count; work_id += block_num:
+    invoke_same_child(task_args[work_id / logical_block_num],
+                      work_id % logical_block_num)
+```
+
+所以物理48个AIV block既能执行47/48个work，也能执行50、96、97或更多work；不要求task数等于核数。
+该严格子集无需跨核atomic cursor，避免引入不必要的claim/contention协议。task成本不均匀时可能出现tail
+imbalance，未来若需要动态均衡，应设计和验证A2/A3自己的atomic协议。
+
+package生命周期仍遵守HBG的tiling原则：`HbgGraphPlan`拥有canonical tensor/scalar/task snapshot，每次launch
+复制一份可写HostArgs；`aclrtLaunchKernelWithHostArgs`的placeholder把单pointer参数patch到CANN为eager task
+或captured node保有的inline package。context只拥有per-lane mutable scratch和child code；package不引用Host
+临时vector。binary/function handle按process pin，禁止`BinaryUnLoad`。
+
+这个设计只借鉴A5 `fdwic-swimlane-deps`“AICore Scalar控制流可以承担task选择”的思想，没有复制其实现。
+参考分支固定96 worker（32 AIC + 64 AIV），并依赖A5 Scalar/SIMT、cross-core atomic、claim tournament、
+shared TensorMap和完成协议；这些ABI与拓扑不能在A3直接使用。本次实现和完成门槛仅覆盖A2/A3，不对A5或
+A5sim作支持声明。
+
+当前A3 device0已验证一个`@pl.jit` HBG task产生50个逻辑work、由48个AIV block完成，eager与
+`direct L1 -> torch.mul` ACLGraph三次replay均验数通过；最终重建复跑的热replay（含successor和
+stream sync）约61.4us。
+完整调试证据、拒绝矩阵和所有权单测见实现过程记录10.69。
