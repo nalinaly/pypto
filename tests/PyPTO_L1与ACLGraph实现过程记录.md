@@ -6859,3 +6859,126 @@ hidden owner、specialization late append、输出分配、可选shutdown、拒�
 
 本节只记录文档合并与规范收口，没有改动PyPTO或Simpler运行时代码，也没有触碰未跟踪的
 `examples/runtime/l1_tiled_add_then_mul.py`。
+
+#### 10.68 Inductor HBG L1 profiling根因与第一轮性能收口
+
+2026-08-19检查 `inductor_pto/build_output/profiles/inductor_pto_hbg_aclgraph_summary.json`时，
+`torch.add -> HBG L1 add -> torch.mul` 的功能、TaskQueue顺序和ACLGraph replay验数都正确，但一个
+64x128 FP32 add的device chain竟长达约304ms。前后Torch kernel各约2us，Host submit仅约100us；
+HBG AICPU task和PyPTO AICore task重叠占据了几乎全部时间。独立的no-profiler replay也约305ms，
+所以这不是profiler打点或flow-arrow解析产生的假象。
+
+##### 10.68.1 被排除的第一个假设
+
+最初怀疑HBG scheduler shutdown对每个AICore串行关闭寄存器窗口，因此曾将normal/emergency
+shutdown改为先广播EXIT，再在共享deadline下join。这个改动的实机A/B完全无改善：
+
+```text
+before: eager median 843.895 ms, replay median 305.132 ms
+trial:  eager median 843.984 ms, replay median 305.300 ms
+```
+
+因此该试验代码已完整撤回，没有把无效复杂度留在runtime中。
+
+##### 10.68.2 真实根因：把L2最大容量整份当作每次L1 tiling data
+
+CANN runtime INFO log给出了直接证据：每个 `aclrtLaunchKernelWithHostArgs` HBG task都携带
+`92,936,560` bytes。当时的HBG L1 package包含：
+
+1. 默认 `PTO2_TASK_WINDOW_SIZE=16384` 对应的整份shared-memory graph image；
+2. HBG L2规格的 `PTO2_READY_QUEUE_SIZE=8192` 多组scheduler queue；
+3. HBG L2规格的65536-entry / 4096-bucket TensorMap和其他runtime-arena状态。
+
+CANN正确地把这份HostArgs当作每个task/captured node自有的tiling snapshot管理；问题不在
+CANN ownership，而在PyPTO把“working slot最大容量”误当成了“这个小算子的实际tiling数据量”。
+AICPU leader每次eager/replay要把全部pristine image恢复到context-owned working slot，其他AICPU线程
+还要invalidate整段SM和arena，因而时间与package size直接相关。
+
+只设 `PTO2_RING_TASK_WINDOW=16`、尚未改arena时已经能将HostArgs缩到 `11,276,656` bytes，并将
+replay从约305ms降到约37.20ms。这个受控实验确认了size-scaling根因，但也说明仅调task
+window不够：剩下的11MB几乎全是沿用L2规格的runtime arena。
+
+##### 10.68.3 实现：显式L1 compact arena profile
+
+A2/A3 HBG runtime新增了值类型 `PTO2RuntimeArenaSizing`，并保留两条彻底分离的路径：
+
+- 原有 `runtime_reserve_layout(...)` 继续使用8192 ready slots、65536 TensorMap entries和4096 buckets，
+  HBG L2的布局与容量不变。
+- 仅 `prepare_l1_runtime_impl` 和 `build_l1_hbg_graph_plan_impl` 显式传入
+  `pto2_hbg_l1_runtime_arena_sizing(task_window)`。prepare和每callable graph build都从同一个纯值函数得到
+  完全相同的frozen layout，不依赖进程全局开关。
+
+compact profile的规则是：
+
+1. Ready queue容量表示“某一队列的峰值并发occupancy”，不是graph总节点数。首版使用
+   `max(task_window, 64)`，但不超过历史8192上限。不寻常的宽并行nested graph如果真超过容量，
+   现有runtime会以 `READY_QUEUE_OVERFLOW` fail closed，用户可显式放大task window；不会静默丢task。
+2. TensorMap只服务Host建图的top-level task依赖发现，每个live task最多注册
+   `CORE_MAX_TENSOR_ARGS=32` 个producer entries。pool因此使用
+   `clamp(task_window * 32, 256, 65536)`，bucket数按4:1目标load factor取幂级，并保留64/4096下上限。
+3. 容量全部写入 `PTO2RuntimeArenaLayout`，AICPU仍按package中的布局恢复和wire pointer；
+   launch阶段没有新增H2D、allocation、stream sync或capture query。
+
+Grok历史分支中也有过“64 ready slots + 256 TensorMap entries”的compact尝试，它用的是
+`g_l1_hbg_graph_blob != nullptr` 加weak symbol的进程全局切换。本次吸收了其“L1不应携带L2最大池”的
+经验，但改成显式layout value，并使TensorMap容量随task window有可证明的上界，避免L1/L2同进程
+或多callable prepare时被全局时序污染。
+
+##### 10.68.4 Inductor默认容量策略
+
+PyPTO原生API仍允许用 `RunConfig.ring_task_window` 或 `PTO2_RING_TASK_WINDOW` 选择容量。
+Inductor PTO对A2/A3 onboard + HBG L1设置64的性能默认值，并把它写入 `RunConfig`，所以也进入
+compile/artifact cache identity。如果环境显式给出 `PTO2_RING_TASK_WINDOW`，则使用该power-of-two整数。
+TRB、simulator和A5路径不套用这个Inductor默认值。
+
+64不是callable registry限制，也不是CANN可以保有的captured graph数量限制；它仅是一个HBG单次
+host-built graph的resident task-slot容量。超出时warmup/prepare明确失败，调大该值后重新specialize即可。
+
+##### 10.68.5 device0 A2/A3结果
+
+同一个64x128 FP32 add，同一套 `runner -> external synchronize` 与ACLGraph replay量测得到：
+
+| 阶段 | HBG HostArgs | eager median | ACLGraph replay median |
+|---|---:|---:|---:|
+| 原始默认（16384 window + L2 arena） | 92,936,560 B | 843.895 ms | 305.132 ms |
+| 只设window=16，未compact arena | 11,276,656 B | 102.232 ms | 37.202 ms |
+| compact arena首轮（1024 ready floor）+ window=16 | 未单独记录 | 7.963 ms | 3.059 ms |
+| 最终compact arena（64 ready floor）+ window=16 | 未单独记录 | 未单独记录 | 2.371 ms |
+| 最终Inductor默认：compact arena + window=64 | 1,097,392 B | 10.047 ms | 3.790 ms |
+| compact arena + window=256对照 | 未单独记录 | 未单独记录 | 10.503 ms |
+
+最终默认相对原始默认：HostArgs减少约84.7倍，eager约84.0倍，ACLGraph replay约80.5倍。
+数值正确性在每次量测后都用 `torch.testing.assert_close` 检查。
+
+正式的device0验收 `tests/inductor/static/test_l1_hbg_aclgraph.py` 也在最终默认下2/2通过，覆盖：
+
+1. TaskQueue中 `torch op -> HBG L1 -> torch op` 的eager顺序和后续调用新tensor地址；
+2. capture前warmup，独立capture stream，图再串接Torch predecessor/successor；
+3. 三组输入replay、逐次验数，最后external quiesce -> graph reset -> optional shutdown。
+
+无硬件验证为：
+
+```text
+new HBG arena sizing UT:       3/3 passed
+simpler C++ non-hardware:      121/121 passed
+Inductor runtime config tests: 13/13 passed
+A2/A3 HBG staged runtime:      RuntimeBuilder build passed
+clang-format / diff-check:     passed
+```
+
+##### 10.68.6 仍需继续的性能问题
+
+约3.8ms对一个2us级别pointwise kernel仍然偏大，本轮只解决了最大且证据最硬的数量级问题。
+最终package仍有1,097,392B，且非leader AICPU线程在leader restore后仍对整个working SM/runtime arena
+执行cache invalidate。下一轮优化应在保持CANN task-owned snapshot的前提下，研究：
+
+1. 按 `host_total_tasks` 将SM的descriptor/payload/slot-state/completion-flag前缀序列化为sparse regions，
+   working slot仍可保留较大容量；
+2. 不把Host-only TensorMap/scope scratch放入device restore package；
+3. 让follower仅invalidate本次restore且它实际会读的region/cache line，而不是粗粒度扫完整capacity。
+
+这三项要同时保证每次replay必然重置所有会被scheduler原地修改的状态，不能为了缩包而让第二次
+replay继承上一轮的queue/completion/runtime pointer。因此本轮没有在无完整mutable-region证明时直接
+放宽 `hbg_launch_blob` 的“full SM + full runtime arena”校验。
+
+本轮按用户要求只修改和验收A2/A3，没有修改A5/A5sim实现。只做阶段性本地commit，不默认push。
