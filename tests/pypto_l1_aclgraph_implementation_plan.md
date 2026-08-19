@@ -6,7 +6,7 @@
 > `pypto_init/L1Context/L1Operator` 为中心的底层实现推导、阶段记录和历史结论，供
 > native 协议审计使用；它不再代表推荐的用户接口。最终公开入口、A2/A3 验收范围、
 > 动态 callable admission、HBG/TRB 生命周期和零 binary-unload 规则，以
-> `PyPTO_Triton风格L1_JIT调用接口设计.md` 及当前中英文用户文档为准。具体而言：普通
+> 已合并产品层接口设计的 `PyPTO_L1与ACLGraph完整设计文档.md` 及当前中英文用户文档为准。具体而言：普通
 > 用户直接调用 `@pl.jit(execution="l1", runtime=...)`；HBG package 随 launch/captured
 > node 自包含；TRB code registry 动态 append 且不复用；不存在公开 64-callable
 > 上限；新增 L1 路径永不调用 `aclrtBinaryUnLoad`/`rtsBinaryUnload`。本文后续出现的

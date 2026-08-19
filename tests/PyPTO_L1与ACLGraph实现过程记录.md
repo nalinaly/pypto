@@ -6826,3 +6826,36 @@ ACLGraph replay验数和严格quiesce→graph reset→optional shutdown顺序。
 headers匹配的LLVM/Clang 18；系统PATH优先的独立Clang 21可执行文件没有配套的
 Clang 21 resource headers，其`stddef.h`/C++ standard library失败是lint环境问题，不是代码
 诊断或被跳过的检查。
+
+#### 10.67 完整设计文档与Triton风格接口设计合并
+
+2026-08-19按用户要求，将原来的两份设计文档收敛为唯一规范入口：
+
+- `tests/PyPTO_L1与ACLGraph完整设计文档.md`继续作为canonical文档；
+- `tests/PyPTO_Triton风格L1_JIT调用接口设计.md`的正文被完整并入canonical文档，随后删除独立文件；
+- `tests/pypto_l1_aclgraph_implementation_plan.md`中的最终规范引用改指向合并后的canonical文档；
+- English-only lint的例外项同步由已删除文件迁移到canonical中文设计文档。
+
+本次合并没有把接口文档压缩成摘要。canonical文档前篇保留native执行协议、stream/event时序、
+taskQueue、TRB/HBG、错误闭包、pto2对比和实机证据；后篇完整保留Triton风格公开API的设计推导、
+hidden owner、specialization late append、输出分配、可选shutdown、拒绝方案、实现步骤和测试矩阵。
+两篇之间有意保留少量从不同视角重复建立的推导链，以便下游分别按native协议或产品API进行评审。
+
+合并时同时消除了两份文档之间的最终态冲突：
+
+1. 普通用户入口统一为`@pl.jit(execution="l1", runtime=...)`；
+   `pypto_init/L1Context/L1Operator`只保留为advanced/debug控制面。
+2. 首次ordinary eager隐式完成specialize/init/prepare/真实warmup；首次调用发生在capture内时明确失败，
+   capture前仍由caller做外部sync并预分配输出。
+3. HBG callable identity、参数快照、callable-local function table与pristine graph由每个CANN-owned
+   launch package自包含；ContextRegistry只拥有mutable execution slot。
+4. TRB L1 registry改为动态append-only、旧entry不复用，不再公开64-callable上限；其O(N)和无界增长风险
+   继续明确记录，不伪装成无限资源。
+5. 新L1路径中的binary与graph-visible code handle按进程pin，init rollback、prepare rollback、
+   可选shutdown和析构均不调用`BinaryUnLoad`。
+6. `pypto.l1.shutdown(device=...)`完全可选。GC和`atexit`不调用runtime close；不调用shutdown时资源
+   安静保留到进程结束。销毁一张ACLGraph不意味着device上不存在其他graph，也不会触发设备级shutdown。
+7. 当前验收范围只声明A2/A3 onboard；A5和A5sim不作为本次完成条件。
+
+本节只记录文档合并与规范收口，没有改动PyPTO或Simpler运行时代码，也没有触碰未跟踪的
+`examples/runtime/l1_tiled_add_then_mul.py`。
