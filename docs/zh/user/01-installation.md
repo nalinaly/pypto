@@ -2,6 +2,9 @@
 
 从源码安装 PyPTO、验证安装，并了解 examples 目录的组织。
 
+本地 A5 真机和 `nalinaly/pypto` fork 的工作区配置见
+[A5 本地运行环境](../dev/a5-local-environment.md)。
+
 ## Concept
 
 PyPTO 是一个带 C++ 编译核心的 Python 包。安装即构建：除 Python 外还需要 C++17 工具链与

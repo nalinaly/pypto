@@ -17,10 +17,13 @@ It must:
 - delegate a host ``torch.Tensor`` to simpler's worker-aware wire helper.
 """
 
+import ctypes
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from pypto import DataType, ir
+from pypto.ir.compiled_program import CompiledProgram
 from pypto.runtime import DeviceTensor
 
 # ``task_interface`` eagerly imports the optional ``simpler`` runtime package;
@@ -154,6 +157,46 @@ def test_host_tensor_delegates_to_simpler():
 
     impl.assert_called_once_with(worker, host)
     assert result is sentinel
+
+
+@pytest.fixture
+def direct_chip_program(tmp_path):
+    span = ir.Span.unknown()
+    tensor_type = ir.TensorType([8, 16], DataType.FP32)
+    params = [
+        (ir.Var("a", tensor_type, span), ir.ParamDirection.In),
+        (ir.Var("n", ir.ScalarType(DataType.INT64), span), ir.ParamDirection.In),
+        (ir.Var("out", tensor_type, span), ir.ParamDirection.Out),
+    ]
+    orch = ir.Function("main", params, [], ir.SeqStmts([], span), span, ir.FunctionType.Orchestration)
+    return CompiledProgram(ir.Program([orch], "DirectChipArgs", span), str(tmp_path))
+
+
+def test_build_chip_args_preserves_addresses_and_scalar_pools(direct_chip_program):
+    a = DeviceTensor(0x1000, (8, 16), torch.float32)
+    out = DeviceTensor(0x2000, (8, 16), torch.float32)
+    packed, owners, return_style = direct_chip_program.build_chip_args(a, 42, out)
+
+    assert packed.tensor_count() == 2
+    assert packed.scalar_count() == 1
+    assert packed.scalar(0) == 42
+    assert packed.tensor(0).data == a.data_ptr
+    assert packed.tensor(1).data == out.data_ptr
+    assert packed.tensor(0).child_memory and packed.tensor(1).child_memory
+    assert owners[0] is a and owners[2] is out
+    assert isinstance(owners[1], ctypes.c_int64)
+    assert not return_style
+
+
+def test_build_chip_args_rejects_invalid_tensor_before_packing(direct_chip_program):
+    wrong_shape = DeviceTensor(0x1000, (4, 16), torch.float32)
+    out = DeviceTensor(0x2000, (8, 16), torch.float32)
+    with (
+        patch("pypto.runtime.runner._coerced_to_chip_args") as pack,
+        pytest.raises(TypeError, match="shape"),
+    ):
+        direct_chip_program.build_chip_args(wrong_shape, 42, out)
+    pack.assert_not_called()
 
 
 if __name__ == "__main__":
