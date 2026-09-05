@@ -13,7 +13,7 @@ reference material only and is excluded from imports, libraries and build caches
 
 | Component | Workspace-relative path | Revision |
 | --- | --- | --- |
-| Simpler | `pto_qcy/pypto/runtime` | Original `b6f905f63277597bd2547d672fd9d57b6013fca9`; A5 L1 HBG `74a0d791796a4d08ac837a6651c1e6308a59a8eb` |
+| Simpler | `pto_qcy/pypto/runtime` | Fork baseline `06c8b29698c547e339ed78b0acaefa6ca52e0d49`; A5 L1 HBG with header dependencies `9d53975cf65ab67975230a6c70d5c48d6220e25c` |
 | PTOAS sources | `pto_qcy/PTOAS` | v0.57, `307d0484a9e7d5e36f01b253d2bebe4d2f45fe81` |
 | PTOAS executable | `pto_qcy/.venv/bin/ptoas` | Official v0.57 CPython 3.12 x86_64 wheel |
 | PTO-ISA sources | `pto_qcy/pto-isa` | `f51c92f610827daad0ddfb383072e03d514b4ae9` |
@@ -152,6 +152,14 @@ PyTorch/add/mul/PyTorch captured chain; both frontends' guarded L1 transport;
 Helion 64x64 matmul; explicit Inductor L2/TRB. The two JIT CPU checks retain the
 A2/A3 default and allow explicit A5 lowering. Logs are under
 `pto_qcy/logs/a5-l1-*` and `a5-l2-trb-regression.json`.
+
+The runtime pin retains the fork's A2/A3 post-close worker retirement fix
+(`06c8b29`). Its shared L1 report layout is 128 bytes. A5 AIC/AIV custom
+build commands now track runtime and platform headers so an incremental build
+cannot reuse objects compiled against the old 64-byte layout. After this merge
+and rebuild, the public JIT eager allocator and ACLGraph replay check passed
+again in 8.94 seconds; see `pto_qcy/logs/pypto-push-header-a5.log`.
+The runtime commit is on `nalinaly/simpler` branch `a5-l1-hbg`.
 
 Reproduce the public JIT hardware check on an idle physical card 1:
 

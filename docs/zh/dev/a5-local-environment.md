@@ -12,7 +12,7 @@
 | 组件 | 本地位置（相对工作区） | 版本或源码依据 |
 | --- | --- | --- |
 | PyPTO | `pto_qcy/pypto` | `https://github.com/nalinaly/pypto`，基础提交 `9cece0b730a96fe1a52c2637537132f524ffe1ea` |
-| Simpler | `pto_qcy/pypto/runtime` | 原 submodule 为 `b6f905f63277597bd2547d672fd9d57b6013fca9`；A5 L1 HBG 提交 `74a0d791796a4d08ac837a6651c1e6308a59a8eb` |
+| Simpler | `pto_qcy/pypto/runtime` | fork 基线 `06c8b29698c547e339ed78b0acaefa6ca52e0d49`；A5 L1 HBG 与头文件依赖修复 `9d53975cf65ab67975230a6c70d5c48d6220e25c` |
 | PTOAS 源码 | `pto_qcy/PTOAS` | v0.57，`307d0484a9e7d5e36f01b253d2bebe4d2f45fe81` |
 | PTOAS 可执行文件 | `pto_qcy/.venv/bin/ptoas` | v0.57 官方 CPython 3.12 x86_64 wheel |
 | PTO-ISA 源码 | `pto_qcy/pto-isa` | `f51c92f610827daad0ddfb383072e03d514b4ae9` |
@@ -157,6 +157,13 @@ warmup 后追加第二个 callable、PyTorch/add/mul/PyTorch 串联 capture/repl
 双前端禁止 L2 worker/张量包装/前端同步的 L1 transport 检查；Helion 64×64 matmul；
 显式 Inductor L2/TRB。另有两个 JIT CPU 检查覆盖保留 A2/A3 默认和 A5 显式 lowering。
 日志在 `pto_qcy/logs/a5-l1-*` 和 `a5-l2-trb-regression.json`。
+
+当前 runtime 同时保留 fork 的 A2/A3 close 后 worker 退出修复（`06c8b29`），
+公共 L1 report 布局为 128 字节。A5 AIC/AIV 自定义编译命令已补齐 runtime 与
+平台头文件依赖，增量构建不会继续复用按旧 64 字节布局编译的对象文件。
+合并并重建后，公共 JIT eager allocator 与 ACLGraph replay 再次通过，耗时
+8.94 秒，日志为 `pto_qcy/logs/pypto-push-header-a5.log`。
+runtime 提交位于 `nalinaly/simpler` 的 `a5-l1-hbg` 分支。
 
 选择空闲物理卡 1 后，可复现公共 JIT 验证：
 
