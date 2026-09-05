@@ -12,7 +12,7 @@
 | 组件 | 本地位置（相对工作区） | 版本或源码依据 |
 | --- | --- | --- |
 | PyPTO | `pto_qcy/pypto` | `https://github.com/nalinaly/pypto`，基础提交 `9cece0b730a96fe1a52c2637537132f524ffe1ea` |
-| Simpler | `pto_qcy/pypto/runtime` | 原 submodule 为 `b6f905f63277597bd2547d672fd9d57b6013fca9`；A5 修复提交 `698ac205060ed1bf442f8ed3f50739e287ee6149` |
+| Simpler | `pto_qcy/pypto/runtime` | 原 submodule 为 `b6f905f63277597bd2547d672fd9d57b6013fca9`；A5 L1 HBG 提交 `74a0d791796a4d08ac837a6651c1e6308a59a8eb` |
 | PTOAS 源码 | `pto_qcy/PTOAS` | v0.57，`307d0484a9e7d5e36f01b253d2bebe4d2f45fe81` |
 | PTOAS 可执行文件 | `pto_qcy/.venv/bin/ptoas` | v0.57 官方 CPython 3.12 x86_64 wheel |
 | PTO-ISA 源码 | `pto_qcy/pto-isa` | `f51c92f610827daad0ddfb383072e03d514b4ae9` |
@@ -115,8 +115,8 @@ PY
 ```
 
 结果：三个算子均通过数值校验，进程正常退出。日志在 `pto_qcy/logs/pypto-a5-smoke.log`。
-A5 的 TRB 和 HBG 均构建成功；本次真机执行验证的是 TRB，HBG 未做真机验收。
-CANN CPU_TOPO 查询暂不可用时，运行时使用此版本自带的 A5 JSON 拓扑配置。
+A5 的 TRB 和 HBG 均已构建并通过代表真机验证。CANN CPU_TOPO 查询暂不可用时，
+运行时结合设备侧 OCCUPY 与自带的 A5 拓扑配置推导可用线程。
 
 ## 同进程设备指针接口
 
@@ -138,4 +138,38 @@ chip_args, owners, return_style = compiled.build_chip_args(*args)
 
 此接口补了两个针对性单测：设备地址/标量分池正确，错误 shape 在打包前被拒绝。
 Inductor 的接入和六个代表用例结果见 `inductor_pto/docs/a5-fork-runtime.md`。
-A5 L1 仍不支持；本记录不声明全量算子、仿真、Helion 或性能回归通过。
+以上为 L2 路径的接入记录；当前 L1 与双前端能力见下节。
+
+## A5 HBG L1 与双前端
+
+runtime gitlink 已包含 HBG 借用流生命周期、不可变图恢复与 A5 平台启动 ABI。
+公共 `@pl.jit(execution="l1", runtime="host_build_graph")` 现在接受
+`RunConfig(platform="a5", device_id=0, runtime="host_build_graph")`。
+直接写 PyPTO 时每次调用显式传 config；不传 config 的 JIT 仍默认 A2/A3。
+用法与 capture 生命周期见 [L1 指南](../user/04-l1-aclgraph.md)。
+
+Inductor 和官方 `pytorch/helion` 的适配器在 A5 上共用 HBG L1/TaskQueue 默认路径；
+`PTO_RUNTIME=tensormap_and_ringbuffer` 显式选择 L2。Helion 本体在
+`/home/q00473782/inductor/helion`；没有使用 `pto/` 作为运行依据，也未新建 LLVM 工具链。
+
+少量代表检查均通过：底层 L1 eager 与三次图回放；公共 JIT eager 自动输出分配、
+warmup 后追加第二个 callable、PyTorch/add/mul/PyTorch 串联 capture/replay；
+双前端禁止 L2 worker/张量包装/前端同步的 L1 transport 检查；Helion 64×64 matmul；
+显式 Inductor L2/TRB。另有两个 JIT CPU 检查覆盖保留 A2/A3 默认和 A5 显式 lowering。
+日志在 `pto_qcy/logs/a5-l1-*` 和 `a5-l2-trb-regression.json`。
+
+选择空闲物理卡 1 后，可复现公共 JIT 验证：
+
+```bash
+cd /home/q00473782/inductor/pto_qcy/pypto
+source ../env.sh
+source .claude/skills/testing/load-env.sh
+export ASCEND_PROCESS_LOG_PATH="$PWD/../logs/a5-l1-public-jit-device"
+mkdir -p "$ASCEND_PROCESS_LOG_PATH"
+ASCEND_RT_VISIBLE_DEVICES=1 PYPTO_L1_JIT_TEST_RUNTIME=host_build_graph \
+  python -m pytest tests/st/runtime/l1/test_l1_jit_aclgraph.py \
+  --platform=a5 --device=0 -q
+```
+
+A5 L1 当前使用 HBG scheduler。direct-AIV 优化、A5 TRB L1、并发 replay、SDMA、
+分布式和 DFX 不属于本次支持范围，也没有宣称全量算子、仿真或性能回归通过。

@@ -8,12 +8,12 @@ PyTorch 拥有 current device、caller stream 和外部 tensor storage；PyPTO �
 workspace、常驻 runtime 状态和一条隐藏 AICore stream。一次 launch 不同步 stream、
 不查询 capture 状态、不 reset device，也不向用户暴露内部 AICPU/AICore fork/join。
 
-当前 L1 只支持 A2/A3 onboard，并提供两种 runtime：
+L1 支持 A2/A3 onboard 的 TRB/HBG，以及 A5 onboard 的 HBG：
 
-| Runtime | 装饰器取值 | 执行模型 |
-| ------- | ---------- | -------- |
-| TensorMap 与 ring buffer（TRB） | `"tensormap_and_ringbuffer"` | AICPU 在执行时构建并派发 task |
-| Host-built graph（HBG） | `"host_build_graph"` | Host 构建自包含 graph package；每次调用先恢复再派发 |
+| Runtime | 装饰器取值 | 平台 | 执行模型 |
+| ------- | ---------- | ---- | -------- |
+| TensorMap 与 ring buffer（TRB） | `"tensormap_and_ringbuffer"` | A2/A3 | AICPU 在执行时构建并派发 task |
+| Host-built graph（HBG） | `"host_build_graph"` | A2/A3、A5 | Host 构建自包含 graph package；每次调用先恢复再派发 |
 
 ## 定义并调用 L1 算子
 
@@ -43,6 +43,21 @@ result = add(lhs, rhs)
 省略 `runtime` 时默认选择 `"tensormap_and_ringbuffer"`。runtime 属于 JIT cache key
 和生成产物，不是 launch 时的动态开关。第一次 tensor 调用推断 device；该 device
 必须已经是 torch_npu current device，PyPTO 不替调用方切换。
+
+不传 config 时 JIT 仍默认 A2/A3，不会根据输入的 device ordinal 推断芯片。
+在 A5 上选择 HBG，并在每次调用（包括 warmup 和 capture）传入显式配置：
+
+```python
+from pypto.runtime import RunConfig
+
+a5_config = RunConfig(platform="a5", device_id=device, runtime="host_build_graph")
+result = add(lhs, rhs, config=a5_config)
+# capture 内：add(lhs, rhs, out=graph_output, config=a5_config)
+```
+
+A5 仅在 prepare 时查询一次设备侧 AICPU 拓扑：event 将 caller stream 的 SO bootstrap
+与 PyPTO 自有辅助 stream 上的查询排序，prepare 等待查询完成。后续 dispatch/replay
+不在内部同步；进入 ACLGraph capture 前应先完成普通 eager warmup。
 
 scalar 沿用现有 PyPTO 表达，例如 `pl.Scalar[pl.FP32]`，L1 不引入第二套语法。
 不同调用可以改变 tensor address 和 scalar value；第一次成功入队后，shape、dtype、
@@ -149,7 +164,7 @@ unload 后 runtime 会替用户保活。因此 L1 路径在任何阶段（包括
 
 ## 支持边界
 
-- 只支持 A2/A3 onboard；A5 与 simulator 不属于当前已验证范围。
+- A2/A3 onboard 支持 TRB/HBG；A5 onboard 支持 HBG。A5 TRB L1 和 simulator L1 尚未实现。
 - shape、dtype、stride 与参数布局静态；tensor address 与 scalar value 可以变化。
 - eager 支持省略纯输出并由 PyTorch 分配；capture 要求显式传入预分配输出。
 - 仅 inference：不支持 autograd、distributed/`CommCtx`、SDMA 或 DFX。

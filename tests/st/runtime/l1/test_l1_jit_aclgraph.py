@@ -61,8 +61,11 @@ def _expected(value: float) -> torch.Tensor:
 
 def test_l1_jit_eager_allocator_and_aclgraph_replay(test_config: RunConfig) -> None:
     """Use only the public JIT call shape for eager and captured execution."""
-    assert test_config.platform == "a2a3"
+    assert test_config.platform in ("a2a3", "a5")
+    if test_config.platform == "a5" and _RUNTIME != "host_build_graph":
+        pytest.skip("A5 borrowed L1 requires host_build_graph")
     device_id = test_config.device_id
+    config = RunConfig(platform=test_config.platform, device_id=device_id, runtime=_RUNTIME)
     torch_npu.npu.set_device(device_id)
     device = torch.device(f"npu:{device_id}")
 
@@ -79,13 +82,13 @@ def test_l1_jit_eager_allocator_and_aclgraph_replay(test_config: RunConfig) -> N
     try:
         # First ordinary call implicitly initializes/prepares and lets the
         # PyTorch wrapper allocate the pure output through torch.empty().
-        eager_output = _jit_add(source, rhs)
+        eager_output = _jit_add(source, rhs, config=config)
         torch_npu.npu.synchronize(device_id)
         torch.testing.assert_close(eager_output.cpu(), torch.full_like(_expected(0.0), 5.0))
 
         # Discover a second callable only after the first one has executed.
         # This exercises append-after-warmup instead of a batch-prepared table.
-        eager_mul = _jit_mul(eager_output, factor)
+        eager_mul = _jit_mul(eager_output, factor, config=config)
         torch_npu.npu.synchronize(device_id)
         torch.testing.assert_close(eager_mul.cpu(), torch.full_like(_expected(0.0), 10.0))
 
@@ -94,8 +97,8 @@ def test_l1_jit_eager_allocator_and_aclgraph_replay(test_config: RunConfig) -> N
         graph = torch_npu.npu.NPUGraph()
         with torch_npu.npu.graph(graph, stream=capture_stream):
             torch.add(source, bias, out=pre_l1)
-            captured_add = _jit_add(pre_l1, rhs, out=add_output)
-            captured_mul = _jit_mul(captured_add, factor, out=mul_output)
+            captured_add = _jit_add(pre_l1, rhs, out=add_output, config=config)
+            captured_mul = _jit_mul(captured_add, factor, out=mul_output, config=config)
             torch.add(captured_mul, 1.0, out=final_output)
         assert captured_add is add_output
         assert captured_mul is mul_output

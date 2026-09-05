@@ -10,12 +10,12 @@ PyPTO owns its internal workspace, persistent runtime state, and one hidden
 AICore stream. A launch never synchronizes streams, queries capture state,
 resets the device, or exposes the hidden AICPU/AICore fork-and-join.
 
-The supported L1 target is A2/A3 onboard. Two runtimes are available:
+L1 supports A2/A3 onboard with TRB or HBG, and A5 onboard with HBG:
 
-| Runtime | Decorator value | Execution model |
-| ------- | --------------- | --------------- |
-| TensorMap and ring buffer (TRB) | `"tensormap_and_ringbuffer"` | AICPU builds and dispatches tasks at execution time |
-| Host-built graph (HBG) | `"host_build_graph"` | Host builds a self-contained graph package; every invocation restores it before dispatch |
+| Runtime | Decorator value | Platforms | Execution model |
+| ------- | --------------- | --------- | --------------- |
+| TensorMap and ring buffer (TRB) | `"tensormap_and_ringbuffer"` | A2/A3 | AICPU builds and dispatches tasks at execution time |
+| Host-built graph (HBG) | `"host_build_graph"` | A2/A3, A5 | Host builds a self-contained graph package; every invocation restores it before dispatch |
 
 ## Define and call an L1 operator
 
@@ -46,6 +46,23 @@ Omitting `runtime` selects `"tensormap_and_ringbuffer"`. Runtime selection is
 part of the JIT cache key and generated artifact; it is not a launch-time
 switch. The first tensor call infers the device, which must already be the
 current torch_npu device. PyPTO never changes it.
+
+The no-config JIT default remains A2/A3; it does not infer the chip from the
+input device ordinal. On A5, use HBG and pass an explicit configuration on every
+call, including warmup and capture:
+
+```python
+from pypto.runtime import RunConfig
+
+a5_config = RunConfig(platform="a5", device_id=device, runtime="host_build_graph")
+result = add(lhs, rhs, config=a5_config)
+# During capture: add(lhs, rhs, out=graph_output, config=a5_config)
+```
+
+A5 resolves device-side AICPU topology once during prepare. An event orders the
+caller-stream bootstrap before the query on PyPTO's auxiliary stream; prepare
+waits for that query. Subsequent dispatch and replay do not synchronize. Warm
+up outside capture before using the operator in an ACLGraph.
 
 Use existing PyPTO scalar annotations such as `pl.Scalar[pl.FP32]`; L1 does not
 introduce a second scalar syntax. Tensor addresses and scalar values may change
@@ -165,8 +182,8 @@ other graphs may still reference it.
 
 ## Supported boundary
 
-- A2/A3 onboard only; A5 and simulator execution are outside the current
-  verified scope.
+- A2/A3 onboard supports TRB/HBG; A5 onboard supports HBG. A5 TRB L1 and
+  simulator L1 are not implemented.
 - Static shape, dtype, stride, and argument layout; tensor addresses and scalar
   values may vary.
 - Eager pure-output allocation is supported; capture requires preallocated

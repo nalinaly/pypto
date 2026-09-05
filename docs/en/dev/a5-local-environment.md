@@ -13,7 +13,7 @@ reference material only and is excluded from imports, libraries and build caches
 
 | Component | Workspace-relative path | Revision |
 | --- | --- | --- |
-| Simpler | `pto_qcy/pypto/runtime` | Original `b6f905f63277597bd2547d672fd9d57b6013fca9`; local A5 fix `698ac205060ed1bf442f8ed3f50739e287ee6149` |
+| Simpler | `pto_qcy/pypto/runtime` | Original `b6f905f63277597bd2547d672fd9d57b6013fca9`; A5 L1 HBG `74a0d791796a4d08ac837a6651c1e6308a59a8eb` |
 | PTOAS sources | `pto_qcy/PTOAS` | v0.57, `307d0484a9e7d5e36f01b253d2bebe4d2f45fe81` |
 | PTOAS executable | `pto_qcy/.venv/bin/ptoas` | Official v0.57 CPython 3.12 x86_64 wheel |
 | PTO-ISA sources | `pto_qcy/pto-isa` | `f51c92f610827daad0ddfb383072e03d514b4ae9` |
@@ -111,8 +111,8 @@ for module, name, size, golden, tolerance in cases:
 PY
 ```
 
-TRB and HBG both build; HBG was not validated on hardware. Unavailable CANN
-CPU_TOPO queries use the runtime's shipped A5 JSON topology fallback.
+TRB and HBG both build and have representative hardware checks. Unavailable
+CANN CPU_TOPO queries use device-side OCCUPY and the shipped A5 topology fallback.
 
 ## Same-process device argument ABI
 
@@ -131,5 +131,41 @@ remain enforced. Two focused unit checks cover pointer/scalar packing and shape
 rejection before packing.
 
 See `inductor_pto/docs/a5-fork-runtime.md` for the integration and six representative
-Inductor checks. A5 L1 remains unsupported. Full suites, simulators, Helion and
-performance were not validated.
+Inductor checks on the L2 path. Current L1 integration is described below.
+
+## A5 HBG L1 and both frontends
+
+The runtime gitlink includes the native HBG borrowed-stream lifecycle, immutable
+graph restore and A5 platform launch ABI. The public `@pl.jit(execution="l1",
+runtime="host_build_graph")` accepts `RunConfig(platform="a5", device_id=0,
+runtime="host_build_graph")`. Specify that config on every direct PyPTO call;
+the no-config PyPTO JIT default remains A2/A3. See the [L1 guide](../user/04-l1-aclgraph.md).
+
+Inductor and the adapter for official `pytorch/helion` share HBG L1/TaskQueue as
+the A5 default. `PTO_RUNTIME=tensormap_and_ringbuffer` explicitly selects L2.
+The official Helion checkout is `/home/q00473782/inductor/helion`; no upstream
+`pto/` runtime or separate LLVM build is used.
+
+Focused A5 checks passed: low-level L1 eager plus three graph replays; public
+JIT eager output allocation, appending a second callable after warmup, and a
+PyTorch/add/mul/PyTorch captured chain; both frontends' guarded L1 transport;
+Helion 64x64 matmul; explicit Inductor L2/TRB. The two JIT CPU checks retain the
+A2/A3 default and allow explicit A5 lowering. Logs are under
+`pto_qcy/logs/a5-l1-*` and `a5-l2-trb-regression.json`.
+
+Reproduce the public JIT hardware check on an idle physical card 1:
+
+```bash
+cd /home/q00473782/inductor/pto_qcy/pypto
+source ../env.sh
+source .claude/skills/testing/load-env.sh
+export ASCEND_PROCESS_LOG_PATH="$PWD/../logs/a5-l1-public-jit-device"
+mkdir -p "$ASCEND_PROCESS_LOG_PATH"
+ASCEND_RT_VISIBLE_DEVICES=1 PYPTO_L1_JIT_TEST_RUNTIME=host_build_graph \
+  python -m pytest tests/st/runtime/l1/test_l1_jit_aclgraph.py \
+  --platform=a5 --device=0 -q
+```
+
+A5 L1 currently uses HBG's scheduler path. Direct-AIV optimization, A5 TRB L1,
+concurrent replay, SDMA, distributed execution and DFX are not included. These
+checks do not claim full coverage, simulator regression or performance results.
