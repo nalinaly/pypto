@@ -1,15 +1,15 @@
-# NPU / GPU 七种编程与编译执行路径：分层解剖、用户表达与技术相似性
+# NPU / GPU 九种编程与编译执行路径：分层解剖、用户表达与技术相似性
 
 核对日期：2026-09-07。本文以编程模型、编译执行分层、megaKernel 性能机会及工程代价的分析为主体；A5 实测用于给这些分析提供具体的验证对象与边界。源码来源固定到 GitHub/GitCode commit，CANNBot DSL 继续引用本地代码。已有 GPU profiling 保留为历史实验记录，本次 A5 的环境、PA 结果和复跑入口补充在第 12 章。
 
 本文面向项目经理、技术主管、开发者、客户和测试人员，目的在于建立可用于技术分析及后续管理讨论的共同事实基础，而不是选择“获胜团队”。关注顺序为：技术相似性、megaKernel 可达成性、用户感知、表达能力、优化空间、动态能力、开发成本。
 
-**范围约定：**原称 PyPTO（Simpler）的路线，全文改称 **PyPTO3（Simpler）**；这是本文命名，当前对应工作区的 `pypto3/pypto`。graph-autofusion **只纳入 AutoFuse，排除 SuperKernel**，后者的静态多 kernel 重组能力不计入本文任何能力判断。`pypto-lib` 是 PyPTO3 的算子 / 模型库，不另算第八条路线。
+**范围约定：**原称 PyPTO（Simpler）的路线，全文改称 **PyPTO3（Simpler）**；这是本文命名，当前对应工作区的 `pypto3/pypto`。graph-autofusion **只纳入 AutoFuse，排除 SuperKernel**，后者的静态多 kernel 重组能力不计入本文任何能力判断。`pypto-lib` 是 PyPTO3 的算子 / 模型库，不单列路线。新增 **H（CATLASS DSL）** 与 **I（CuTe DSL）**，原 A—G 的编号、讨论和实验保留；部分宽表继续列 A—G，紧接的 H/I 补充使用相同维度。H 特指 CATLASS 的 Python TLA DSL，不能将整个 CATLASS C++ 库的能力计入；I 特指 NVIDIA CuTe DSL，不能与 E 的 TensorIR / CUDA Tile IR 路径混同。H 的本机验证见第 12 章；I 本次仅核对源码，未在 NVIDIA GPU 执行。
 
 阅读导航：[主结论](#conclusions) → [softmax / paged decode 用户示例](#examples) → [Python 前端与 API 能力边界](#frontend-capabilities) → [分层架构](#layers) → [两组重点架构对比](#focused-comparisons) → [MLIR 专章](#mlir) → [megaKernel：性能、代价与差距](#megakernel) → [动态 scheduler 的真实收益边界](#scheduler-performance) → [动态 shape：谁写 tiling、具体怎么写](#dynamic-tiling) → [用户怎样实现核内融合与片上复用](#intra-kernel-fusion) → [GPU launch](#gpu-launch) → [替代及共用边界](#replacement) → 验证与源码 → [最后的逐项“最相似者”](#nearest)。
 
 <a id="conclusions"></a>
-## 1. 主结论：七个名称，并不对应七套互斥的完整技术栈
+## 1. 主结论：九个名称，并不对应九套互斥的完整技术栈
 
 ### 1.1 比较对象及架构归类
 
@@ -22,10 +22,14 @@
 | E（PyPTO on GPU） | `PyPTO-LOVE-TensorIR` 集成层及 source lock 固定的 PyPTO 源码 bundle | PyPTO 前端 / 自有 IR → 受支持模式 → NVIDIA TensorIR / CUDA Tile IR | PyPTO GPU runtime 直接 CUDA launch；硬件安排 CTA |
 | F（Triton-Ascend） | `triton-ascend/triton-ascend` + `triton-ascend/triton-ascend-kernels`；Inductor 入口 `torch_npu/torch_npu/_inductor` | Triton kernel DSL，也可接受 Inductor 生成的 kernel | 编译器映射逻辑 program 到 NPU；CANN launch |
 | G（AutoFuse + Inductor） | `graph-autofusion/autofuse` + `torchair/experimental/_inductor_npu_ext` | 融合图编译 / 自动 tiling / kernel 生成组件；客户通过 PyTorch 使用 | Inductor 分组及 Host wrapper；生成的多核融合 kernel |
+| H（CATLASS DSL） | `catlass/python/tla_dsl/catlass/catlass_dsl`，公共 API 为 `catlass.tla`；示例 `python/tla_dsl/examples` | Python 显式 tile / 物理 layout / Cube / Vector 编程；TLA MLIR → AscendNPU-IR → CANN | 编译 kernel 后由 Host 调用产物；支持 AIC/AIV mixed kernel，例子自行安排工作与同步 |
+| I（CuTe DSL） | `cutlass/python/CuTeDSL`；示例 `examples/python/CuTeDSL` | Python layout 代数、线程/值分区、Copy/MMA atom、异步流水；CuTe MLIR → NVVM / cubin | Host JIT / CUDA launch；CTA/cluster 内合作，另有 persistent tile scheduler 与实验性 Task Scheduling |
 
 前三个“PyPTO”必须按上述代码位置识别：A（PyPTO2-普通版）/B（PyPTO2-Pro） 同仓共享基础设施；C（PyPTO3（Simpler）） 不等于 A（PyPTO2-普通版）；E（PyPTO on GPU） 使用的是另一份 PyPTO checkout，不能把 C（PyPTO3（Simpler）） 的所有新能力直接投射到 E（PyPTO on GPU）。
 
 ### 1.2 十项最重要的判断
+
+以下十项保留原 A—G 的结论及适用范围；纳入 H/I 后的增量判断见第 1.5 节。这里的“最接近”并非排除新增路线在某个局部维度上更接近。
 
 1. **A（PyPTO2-普通版） 与 C（PyPTO3（Simpler）） 最接近的是“程序 / 任务系统”层。** 两者可用设备侧执行体系组织多个计算阶段，但 A（PyPTO2-普通版） 的 TileFwk runtime 不是 C（PyPTO3（Simpler）） 的 Simpler。
 2. **B（PyPTO2-Pro） 与 D（CANNBot DSL） 最接近的是“显式核内工程”层。** 用户较直接地承担物理 tile、核间分工、尾块、流水及局部资源选择；二者并不共享同一个 IR 或后端。
@@ -59,6 +63,14 @@
 - **Pro、PyPTO3 与 CANNBot 哪里相近？** Pro 与 CANNBot 更接近显式核内工程；与 PyPTO3 相近的是核内子域，不是完整任务体系。TileGroup/Channel、前端及后端差异见第 4.9—4.10 节。
 - **Python 前端与 API 是否完整？** 七条路线都有 Python 使用入口，但 DSL/构图层次不同；不能据此宣称覆盖全部 Vector/Cube/Tensor Core 指令组合。第 2.9—2.12 节按 API、lowering、目标支持和验证分层。
 - **怎样让连续 Vector 计算不经中间 GM？** 七条路线在各自支持域内均有路径，用户写法见第 8 章；同一核内区域、消除显式中间 GM、进一步减少 UB/片上读写须分别验收。
+
+### 1.5 纳入 CATLASS DSL / CuTe DSL 后，哪些判断需要扩展
+
+1. **显式核内工程增加了 H/I 两个具体对象。** H 与 B/D 在 NPU 的物理 tile、搬运、混合核与同步责任上相近；H 与 I 则在 Python 元编程、显式 layout/tensor 和编译产物调用的思路上形成新的比较组。H 的 layout tag / `origin_shape` 与 I 的通用 layout 组合、线程—值分区不能按 API 名字一一替换。[H-api-layout] [I-layout]
+2. **“有设备 scheduler”必须注明调度粒度。** H 的 FA 用 `block_idx/block_num` 做固定步长任务循环，StreamK 另有工作切分及归并；I 有静态 persistent、CLC 动态 tile 分配以及 warp 级 Task Scheduling。它们为第 6 章提供了有用的中间形态，但都不能直接当成 A/C 的整层任务 runtime。[H-fa] [H-streamk] [I-static] [I-dynamic] [I-task]
+3. **MLIR 前后端的比较增加两条独立实链。** H 有可定位的 TLA passes，并依赖 CATLASS 固定的 AscendNPU-IR 子模块；I 的 Python 源码明确调用 `cute-to-nvvm`，使用独立配套编译组件。H 不走 PTOAS，I 不走 E 的 TensorIR emitter；同用 MLIR 不说明后端、ABI 或 pass 已兼容。[H-passes] [H-ir-build] [I-dsl] [I-requirements]
+4. **Attention 示例分别证明不同组合。** H 是连续 KV 的 online-softmax FlashAttention；I 找到分页 MLA decode，以及另一套连续 GQA decode。后者的 simple 版本在同一个 JIT 入口中 launch decode 和 reduction 两个 kernel。标准 GQA PA、分页 MLA、连续 FA 的能力不能互相冒充。[H-fa] [I-mla] [I-gqa]
+5. **原有理论目标不变，证据对象更丰富。** 片上预算、全局归约、重分片、负载均衡和调度开销仍按第 6—8 章分析；新增源码使“可能怎样实现”更具体。本轮没有九条路线的同口径性能实验，也没有据此证明整层单物理 kernel 已完成。
 
 <a id="examples"></a>
 ## 2. 用户表达：先用相同计算问题比较
@@ -130,7 +142,7 @@ y_j = exp(x_j - m) / l
 
 归并需要依赖与数据可见性：可以是多 kernel，也可以是任务图，也可以是满足进展条件的单 kernel 协作。**“整行放不下”不等于“必然跨核”，也不等于“必然多次 Host launch”。**
 
-### 2.3 七条路径写 softmax 时，用户到底承担什么
+### 2.3 九条路径写 softmax 时，用户到底承担什么
 
 | 路径 | 实际用户表达 | 尾轴 / 尾块 | 超长 reduce 的工程动作 |
 | --- | --- | --- | --- |
@@ -640,6 +652,50 @@ def verify_softmax(path):
 ```
 
 `fullgraph=True` 约束图捕获，不承诺一个物理 kernel；`dynamic=True` 不承诺没有 guard、specialization、fallback 或编译失败。切换后端建议独立进程验证，避免全局注册和缓存干扰。
+
+#### H（CATLASS DSL）：从真实 FA 的 softmax 子过程看用户责任
+
+所选 `examples` 中未找到与第 2.2 节同 ABI 的独立、完整尾轴 softmax 用例。可以具体核对的是 `flash_attention_infer.py` 中已经写出的 softmax：Cube 产出 QK，Vector 从 UB 加载，显式建立 full/tail mask，做 MAX、减最大值、exp、ADD 归约、精度转换，并维护跨 KV tile 的最大值、分母和输出修正。它是 **FA 内的 online-softmax 实现证据**，不能单列为 `X[777,300]` 或超长行测试通过。[H-fa]
+
+与 B/D 相比，H 同样把局部容量、buffer 槽、跨 Cube/Vector 通知交给作者；更具体的表达是 `tla.make_tensor` / `tile_view` / `allocate`，以及 `with tla.vec.func(mode="simd")` 内的寄存器 load/store、`ReductionOp.MAX/ADD`、`create_mask/update_mask`。数学上仍使用第 2.2/2.5 节的在线归约公式，语言变化不会免去跨分段状态合并。[H-api-layout] [H-api-allocate] [H-fa]
+
+例如下列归约核心摘录发生在 `vec.func` 内；两个寄存器片段此前已经完成 load、缩放和尾部处理，mask 与 UB 状态的声明仍在完整源文件中。这不是一个可独立调用的 softmax：[H-fa]
+
+```python
+tmp_reg_p1 = tla.max(ub_s_reg0_p1, ub_s_reg1_p1, mask=pregFull)
+max_reg_p1 = tmp_reg_p1.reduce(tla.ReductionOp.MAX, mask=pregFull)
+```
+
+若要补独立 softmax，下一步应抽取已有 Vector 原语，单独给出输入输出、分段遍历和 golden；此次保留现有 kernel 的验证边界，不用临时新实现填成仓库原生用例。
+
+#### I（CuTe DSL）：同一份 softmax 教程给出了八种工作分解
+
+`experimental/primitives/tutorial/06_softmax.py` 包含逐线程串行、一行一 CTA、warp shuffle、warp + shared memory、online 等八种写法，以及 Host launcher。它使第 2.2 节关于“长行不必整体驻留片上”的理论有了另一组完整源文件，但本次未运行这些 CUDA kernel。[I-softmax]
+
+| 源码中的策略 | 用户要安排什么 | 与原文分析的联系 |
+| --- | --- | --- |
+| 一线程处理一行 | 线程/行索引，列遍历，max/sum/normalize | 容量可以小，行数不足时并行度可能不足 |
+| 一 CTA 处理一行 | 每线程列子集、shared partial、CTA barrier | 行内并行与跨行并行分开；单 CTA 归约不需要跨 CTA 全局 barrier |
+| online + warp + shared（kernel 8） | 每线程维护 `(max,sum)`，shuffle 合并，再经 shared 合并各 warp，最后再次遍历输出 | 在线合并节约暂存需求；不同 warp 的 sum 必须按共同最大值修正，不能直接相加 |
+
+这里还有值得保留的反例：教程前面的某些实现把 exp 中间值写入输出 GM 后再读取；kernel 8 主要保留归约状态，最后重读输入产生结果。因此 **“都在一个 `@cute.kernel` 里”不等于具有相同 GM 流量**。此外，不同实现把 N/C 作为运行时元数据或 `Constexpr` 的方式不同，不能对八个变体统一宣称动态 shape。教程开头的限制性注释也只作为该教程上下文，完整语言能力仍以当前 DSL 实现为准。[I-softmax] [I-dsl]
+
+kernel 8 具体把 C 作为 `Constexpr` 并使用 `range_constexpr` 遍历列。它说明有限归约状态的算法能够表达，不能直接证明超长行时编译成本和代码体积也理想；分段循环是否展开，是第 7 章动态与特化分析需要继续控制的另一项成本。[I-softmax]
+
+对应的 warp 内合并源码片段如下，`maxval/sumval` 是每线程此前累积的状态；跨 warp 的 shared-memory 归并与最后写回仍见完整函数。对比 H 的寄存器向量 API，这里直接暴露 warp shuffle 和每线程标量状态。[I-softmax]
+
+```python
+for offset in [16, 8, 4, 2, 1]:
+    other_max = cute.arch.shuffle_sync_down(maxval, offset)
+    other_sum = cute.arch.shuffle_sync_down(sumval, offset)
+    if other_max > maxval:
+        scale = cute.math.exp(maxval - other_max, fastmath=True)
+        sumval = other_sum + sumval * scale
+        maxval = other_max
+    else:
+        scale = cute.math.exp(other_max - maxval, fastmath=True)
+        sumval = sumval + other_sum * scale
+```
 
 ### 2.4 完整 paged decode 语义参考：actual_seq_len 与 shape 分开
 
@@ -1774,6 +1830,28 @@ def fa_compiled(q, k, v, qlen, kvlen):
 
 **A5 补充给出了这条边界的实际对象：** 本文 `paged_decode_padded` 图表达经源码版 `inductor_npu_ext`、`torch.compile(fullgraph=True, dynamic=False)` 执行，固定 shape、两组 L 内容均通过。生成 wrapper 内有7个不同 AutoFuse 函数、9个调用点，同时保留 `aten.index_select`、`aten.bmm`、`repeat_interleave` 等外部算子。因此“客户可以保留完整 PyTorch 表达”已有执行证据，“全部 PA 被降成一个原生融合 kernel”仍未证明。静态调用点计数不是设备 launch 计数，具体误差、外部调用及证据见第 12.1.1 节。[RUN-G-lowering] [RUN-results]
 
+#### H（CATLASS DSL）：连续 FlashAttention 已有实现，分页和设备异长尚未在这个例子落地
+
+完整入口是 `examples/end_to_end/flash_attention_infer/flash_attention_infer.py`，辅助 tiler 在同目录 `fa_tiling.py`。输入为 `Q[B,Sq,Hq,D]`、连续 `K/V[B,Skv,Hkv,D]`，输出与 Q 同布局；默认 `B=1,Sq=117,Skv=512,Hq=8,Hkv=1,D=128`，输入 f16/bf16，使用 online softmax。QK、softmax、PV、rescale 之间有显式跨核 flag 和多缓冲传递。源码及 README 均将此限定为连续 KV，mask 当前只能全零，**没有 page table 查询和 paged cache ABI**。[H-fa] [H-fa-readme] [H-fa-tiling]
+
+必须继续看参数是否被消费：kernel 签名有 `tiling_data`、`actual_q_seqlen` 和 `actual_kv_seqlen`，但当前函数体没有读取这三个 tensor 的内容。实际 task 数、Q/KV 上界和 batch 偏移来自 `HEAD_NUM/Q_SEQ/KV_SEQ/TOTAL_TASKS` 等 Python 全局量；Host `apply_shape_args()` 在编译前改写这些量。`fa_tiling.py` 能构造长度数组，并不足以证明这个 kernel 支持同一产物下每请求异长。[H-fa]
+
+这不削弱它在理论比较中的价值：它展示了 A5 上 **Cube↔Vector 交接、KV 分段、在线状态与物理 layout 转换** 的完整用户实现；缺分页只是特定算子的实现差距。若扩成原文 PA，至少还需页表间接寻址、每请求有效长度真正下沉设备、尾页 mask、页内跨界搬运及对应验证。把 Q 长度改为 1 只能得到连续 decode 场景，不能因此改名为 PagedAttention。本轮连续多 query、BF16 及 KV 尾块用例通过；Q=1 用例实际精度失败，且复跑仍失败，详见第 12.1.3 节。
+
+#### I（CuTe DSL）：找到的是分页 MLA decode，另有连续 GQA decode
+
+| 源文件 | 直接可确认的能力 | 与第 2.4 节统一 PA 口径的差别 |
+| --- | --- | --- |
+| `cute/blackwell/kernel/attention/mla/mla_decode_fp16.py` | 真正接收 page table；paged TMA、page-table pipeline、online softmax、split-KV、可选 persistent / var-seq | MLA latent/rope 表达；并非独立 K/V head cache 的标准 GQA PA |
+| 同目录 `mla_decode_fp8.py` | 另一条含 page table 的 FP8 MLA 实现 | dtype、量化及 tile 约束须独立核对，不能沿用 FP16 的全部边界 |
+| `cute_ext/blackwell/attention/gqa_decode_simple.py` | 连续 GQA；decode 内 QK→softmax→PV→partial，第二个 kernel 合并 split | 直接索引连续 K/V，没有 page table；一个 Host JIT 入口含两处 `.launch()` |
+
+来源：[I-mla] [I-mla-fp8] [I-gqa]。搜索范围为这份固定 CUTLASS checkout 的 `examples/python/CuTeDSL` 与 `python/CuTeDSL`；不是对外部整个 CuTe 生态作“只有这些 PA”的断言。
+
+FP16 MLA 的 `can_implement()` 给出具体约束：latent 维 512、rope 维 64，输入/输出 f16，累加/LSE f32；Q 长度 1—4，head 数不超过 128；head 数小于 128 时 split-KV 必须为 1；page size 不能为 1 且须整除 QK 的 N tile；可变 split-KV 依赖 var-seq。上述是源码检查，仍不等价于所有通过检查的组合均已验证。[I-mla]
+
+它的测试页表先构造成 `[B,page_count]`，填入 `b+j*B` 使不同请求的物理页交错，再转为设备视图 `[page_count,B]` 并标记动态 layout；参考计算按页表 gather latent/rope 数据。因此它确实能为“间接页访问怎样进入 TMA、流水和在线计算”提供代码参照。若与原文 `Hq=40,Hkv=8,D=128,S=128` 比性能，应另找或适配标准 GQA PA；不能靠转置页表消除 MLA 与 GQA 的数学差异。[I-mla]
+
 ### 2.7 实际长度变化，对 tiling 的四种可能影响
 
 | 变化 | 不一定需要做的事 | 可能确实需要做的事 |
@@ -1927,6 +2005,55 @@ API 入口与实现索引：[A17（PyPTO2-普通版）] [A19（PyPTO2-普通版�
 ---
 
 
+### 2.13 H/I 的前端与 API：layout 相似性要具体到映射对象
+
+| 能力族 | H：CATLASS DSL | I：CuTe DSL |
+| --- | --- | --- |
+| 编程入口 | `@tla.kernel` → `tla.compile` → 调用产物；`@tla.jit` 是编译时内联的设备 helper | `@cute.kernel` 定义设备计算，`@cute.jit` 可组织 Host 调用/launch，`cute.compile` 生成可重复调用对象 |
+| tensor / layout | `make_shape/make_stride/make_layout`、`origin_shape`、`make_tensor_like/tile_view`；RowMajor/ColumnMajor/zN/nZ/L0C 等 tag | shape/stride 嵌套 layout，`composition/logical_divide/logical_product/coalesce/local_tile`；还表达 thread/value partition |
+| 搬运与矩阵 | `copy` 按源/目标地址空间和 tag 选择路径，`mmad`；MX scale 在 L1→L0 load 关联 | Copy/MMA atom、TiledCopy/TiledMma、线程切片；架构特定 cp.async/TMA、MMA/TCGen05 等 |
+| 向量与归约 | `vec.func` 中寄存器 load/store、mask、算术、reduce/cast；显式 SIMD/SIMT 区域能力按具体 API/目标核对 | 线程/warp 索引、寄存器片段、shuffle、reduce、shared/CTA 同步；另有实验性 primitives / cute extension |
+| 缓冲与同步 | `allocate`、flag、cross_flag、mutex；`auto_sync="v0"` 有明确局部约束 | shared/TMEM 分配、mbarrier、pipeline；实验性 TS 声明资源与 schedule |
+| 程序组织上界的直接证据 | 完整核内 FA、mixed GEMM、StreamK；未见与 A/C 同定位的通用整层任务 runtime | Host 多 launch、persistent tile 和 warp 专门化 TS；未据这些例子证明整层通用任务 runtime |
+
+来源：[H-dsl] [H-compile] [H-api-layout] [H-api-copy] [H-api-mmad] [I-dsl] [I-layout] [I-mma] [I-copy] [I-task]。这张表是能力族及其责任位置，沿用第 2.10 节的四层验收方法，不表示 ISA 覆盖完整。
+
+H 的 `shape/stride` 描述物理存放，`origin_shape` 描述逻辑有效范围；例如 zN 的嵌套物理 shape 不能随意写成普通二维 shape 后仅改 tag。I 则进一步把 CuTe layout 代数用于线程/值与 MMA/copy 分区。两者都让 layout 成为程序的一部分，但 **“有 layout 对象”并不意味着拥有同样的变换代数或自动线程分配能力**。[H-api-layout] [I-layout]
+
+H 的 `allocate` 当前只接受静态容量和片上地址空间；`auto_sync="v0"` 只生成单 AIC 或 AIV 内的流水同步，跨核 flag、`vec.func` 内线程同步仍须显式写。I 的架构特定 API 及例子也有 target、对齐、dtype 和 CTA/cluster 限制；Blackwell MLA 的约束见第 2.6 节。本次没有因 API 可导入或源文件存在而把它们全部标为“可运行”。[H-api-allocate] [H-dsl] [I-mla]
+
+另外，原文 F 的 Inductor 组合调度中出现的 CATLASS template 路径生成 C++ 模板代码；它与此处 H 的 `catlass.tla` Python DSL 是两个具体入口。不能从 F 能选择 CATLASS 模板，直接推断 H 已接入同一套 Inductor 自动融合。[F10（Triton-Ascend）] [H-inductor-template]
+
+最后看 Host 写法。H 的 basic mixed 示例先桥接好四个 tensor，再显式编译和执行；以下为其 Host 调用摘录，完整输入/golden 在源文件中。[H-mixed]
+
+```python
+artifact = tla.compile(
+    basic_mixed, a_tensor, b_tensor, c_tensor, d_tensor,
+    options="--npu-arch 3510",
+)
+artifact(a_tensor, b_tensor, c_tensor, d_tensor, block_num=block_num)
+torch.npu.synchronize()
+```
+
+I 的 softmax 则可将 kernel 和 block size 作为编译期参数传给 Host JIT launcher。下列保留实际签名与 launch 的整理片段依赖原文件的 imports 和 kernel 定义；一次这个 launcher 调用只启动其所选 kernel，不能推及其他多 launch 的 JIT 函数。[I-softmax]
+
+```python
+@cute.jit
+def softmax_block_per_row(
+    inp_tensor: cute.Tensor,
+    out_tensor: cute.Tensor,
+    N: cutlass.Constexpr,
+    C: cutlass.Constexpr,
+    Kernel: cutlass.Constexpr[Callable],
+    BlockSize: cutlass.Constexpr,
+):
+    Kernel(inp_tensor, out_tensor, N, C).launch(
+        grid=(N, 1, 1), block=(BlockSize, 1, 1),
+    )
+```
+
+这两种写法都可封装成客户的一行调用；差异在编译/调用分界及 kernel 作者能控制的对象，不能只按装饰器和调用行数评价易用性。
+
 <a id="layers"></a>
 ## 3. 把所有层次拆开：名称相似不等于承担相同责任
 
@@ -1987,7 +2114,20 @@ L10 不是最后才执行：它横跨 L1/L2/L4/L5/L8/L9。
 
 “没有默认 ready-queue scheduler”只描述选定主链，不宣称永远无法接入任务系统，也不等于没有 runtime。
 
-## 4. 七条实际调用链与组件边界
+### 3.4 H/I 放回同一责任分层
+
+| 原文层级 | H（CATLASS DSL） | I（CuTe DSL） |
+| --- | --- | --- |
+| L0/L1 客户与框架 | 显式 Python kernel；例子由 torch_npu 分配张量，再桥接 TLA | 显式 Python kernel/Host JIT；例子用 CUDA tensor/DLPack；不能据此宣称自动编译整个 PyTorch 模型 |
+| L2/L3 程序/IR | 作者选定 kernel 边界；Python lowering 生成 TLA/标准 MLIR | 作者选定 Host/device 边界；CuTe、GPU/标准 MLIR，扩展路径另有 LIR/PyIR 选项 |
+| L4 工作分解 | task/block 循环、tile、StreamK 等由例子/策略编写 | CTA/warp/tile、静态或 CLC persistent，TS 安排 warp 内部任务 |
+| L5/L6 局部资源/时序 | 物理空间、layout、容量、flag/mutex；TLA passes 做 lowering 和受限自动同步 | layout 分区、SMEM/TMEM、pipeline/mbarrier；TS 生成已声明资源的同步协议 |
+| L7/L8 代码/launch | TLA passes → AscendNPU-IR dialects → `hivmc-a5` → `kernel.o`；PyACL load/launch | `cute-to-nvvm` → cubin；JIT executor/CUDA runtime 处理参数、装载和 launch |
+| L9/L10 跨任务/全局存储 | 所查路径没有 A/C 式通用设备任务 DAG；workspace 仍由 Host/算子安排 | Host 多 kernel 顺序与片内 task graph 分开；partial/workspace 不因 persistent 自动消失 |
+
+来源：[H-passes] [H-execution] [H-runtime] [H-streamk] [I-dsl] [I-runtime] [I-task] [I-gqa]。特别是 I 的 TS task 主要属于 L4/L6 的单 kernel 协作抽象，不能仅因名字有 task 就直接填进 A/C 的 L9。
+
+## 4. 九条实际调用链与组件边界
 
 ### 4.1 A（PyPTO2-普通版）：新 Python IR 入口，仍接入 TileFwk 执行体系
 
@@ -2347,6 +2487,56 @@ SPMD 不是理论禁令：同一个程序可以按角色分支执行不同阶段
 
 **最终表述应是：PyPTO2-Pro 的主要抽象单位是“一个多核合作 kernel”；PyPTO3（Simpler）的主要架构识别点是“由不同计算程序构成、允许 task 内 SPMD 的设备任务系统”。**选用不同粒度会改变用户责任、调度空间和数据搬运边界，不能仅按是否含 SPMD/MPMD 字样判断完整能力。
 
+### 4.11 H（CATLASS DSL）：TLA 前端、混合核 lowering 与 AscendCL launch
+
+```text
+Python @tla.kernel / @tla.jit helper + 编译期样本参数
+  → BaseDSL lowering，TLA tensor/layout/ptr/copy/mmad/vector 等 MLIR
+  → TLA 自有 passes：函数分类、受限 AutoMutex、片上分配、mixed 拆分、descriptor lowering
+  → Cube/Vector/flag/mutex、HIVM/AVE 及 regbase intrinsic lowering
+  → CANN hivmc-a5
+  → kernel.o + manifest / ABI / workspace 元数据
+  → JitCompiledFunction → PyACL 装载与 launch_kernel_with_config
+```
+
+`@tla.kernel` 本身不能直接作为 Host 函数执行；`tla.compile(kernel, *sample_args, options="--npu-arch 3510")` 的参数用于确定类型与专门化，甚至可用 fake tensor。`block_num/stream` 则传给编译产物。缓存键核对 TLA IR、编译选项、bridge 与 `hivmc-a5` 等信息；“同一个 Python 函数”不是充分的二进制复用条件。[H-dsl] [H-compile] [H-execution]
+
+这里还要区分两个编译器来源：CATLASS 固定的 AscendNPU-IR 提供开发头文件、MLIR 与 HIVM/AVE 等静态库，供 TLA extension 使用；末端 `hivmc-a5` 由运行环境的 CANN 提供。固定子模块 SHA 不自动成为这个 CANN 二进制的源码版本声明，实测应另外记录其版本与文件哈希。[H-ir-build] [H-cmake] [H-execution]
+
+mixed 路径在 TLA 中可以写同一个逻辑 kernel 的 `cube()` 和 `vector()` 区域；`TlaLowerFuncPass` 判别核类型，`TlaSplitMixedFuncPass` 再按角色拆分。一个源函数、AIC/AIV 的机器码实体、一次 ACL 提交属于不同计数口径；是否只有一个设备事件仍需 trace。这个机制提供核内异构合作，不自动提供多个任意算子函数间的设备就绪队列。[H-passes] [H-mixed-pass] [H-runtime]
+
+本轮实际生成的 `basic_mixed` 与 FA `lowered.mlir` 均含 `_mix_aic`、`_mix_aiv` 及 Vector helper；对应 manifest 的 `arch_scope` 仍写 `aic.c310`。因此不能只按这一个字段把产物判断为纯 Cube kernel，具体函数声明和文件 hash 归档在第 12.1.3 节。
+
+`tla.call_extern` 还有外部实现的编译接缝，且 AutoSync 当前明确排除它。因而 H 也有“本 DSL 表达”“嵌入外部底层代码”两种覆盖来源，不能把外部 C++ 能力全部计入 Python 原生 API。[H-dsl] [H-extern-pass]
+
+### 4.12 I（CuTe DSL）：Host/device 分阶段编译，用户显式选择线程与 layout
+
+```text
+Python @cute.jit Host 程序 + @cute.kernel 设备函数
+  → Python DSL/元编程 lowering → CuTe 与 GPU/标准 MLIR
+  → 默认 cute-to-nvvm pipeline（扩展路径可先 lir-to-cute-dsl）
+  → NVVM / PTX 后端工具链 → cubin，及 Host 调用产物
+  → JIT executor / CUDA runtime → CUDA launch
+  → CTA/cluster 执行；用户可在 kernel 内使用 persistent tile / warp 级任务流水
+```
+
+默认 pipeline 字符串、扩展 pipeline 入口、cubin 提取/装载和 CUDA launch 均能在 Python 源码定位。**本次源码证明到调用契约；未生成或反汇编 I 的 GPU 二进制。** 安装依赖文件固定 `nvidia-cutlass-dsl==4.8.0.dev0`，这份 checkout 并未提供足够材料证明整个配套 CuTe/NVVM 编译器都可从这里独立重建；不能用“CUTLASS 仓库公开”替代编译组件来源与版本核对。[I-dsl] [I-compiler] [I-executor] [I-runtime] [I-requirements]
+
+`@cute.kernel` 调用产生待 launch 对象，`.launch(grid=...,block=...,cluster=...,smem=...,stream=...)` 确定调用；Host `@cute.jit` 内可以包含多次这样的调用。GQA simple 正是一个完整反例：Python 一次调用覆盖 decode 与 reduction，两个阶段经 GM partial 连接。它不受 E 当前“只接受某些 PyPTO 单函数/静态模式”的同一 emitter 限制，也不能把 I 的覆盖倒灌给 E。[I-dsl] [I-gqa]
+
+### 4.13 重点对比 H/I，并与 B/D/F 对齐
+
+| 具体问题 | H 与 I 的相似处 | 差别及相邻路线 |
+| --- | --- | --- |
+| 用户先写数学还是硬件分区 | 都允许 Python 元编程生成显式 tile/layout 实现 | H 组织 AIC/AIV、GM/UB/L1/L0；I 组织 thread/warp/CTA/cluster、register/SMEM/TMEM；与 F 的常规 logical program 写法不同 |
+| layout 解决什么 | 都把地址/布局纳入算法 | H 的逻辑有效范围与硬件 packing tag 更突出；I 的 layout 代数和线程—值/MMA 分区更突出；D 同样值得按逻辑/物理布局比较 |
+| 数据流如何流水化 | 都有多缓冲、生产/消费与异步硬件操作 | H 是 MTE/Cube/FIX/Vector 及跨核 flag/mutex；I 是 TMA/MMA/warp 与 mbarrier/pipeline/TS；不能直接翻译事件 ID |
+| `jit` 在哪执行 | 都区分编译期 Python 与设备动态值 | H helper 在设备 IR 内联；I Host JIT 可发多个 kernel；D 也应按自身 Host/Device staging 判断，不能只比较装饰器 |
+| 谁负责全局程序推进 | 所查 H/I 示例主要由作者组织 kernel 与 launch | A/C 有独立任务执行体系；I TS 又把单 kernel 内的异构 warp 任务提升为显式抽象，但粒度不同 |
+| 谁承担新硬件适配 | kernel 作者和后端共同承担 | H 的 A5 regbase、I 的 SM100/TMA/TMEM 都是具体目标契约；不能以 CATLASS/CUTLASS C++ 全库支持范围替代 DSL 支持范围 |
+
+据此，H/I 是新的 **layout 与显式流水** 比较组；H/B/D 则是同硬件上的 **显式核内工程** 比较组。它们的存在进一步支持原第 4.8—4.10 节的分析方式：先比较相同责任层，再讨论整体系统。相近命名与接口风格仅能支持设计相似性，不足以确认仓库之间的代码派生关系。[H-api-layout] [H-mixed] [I-layout] [I-task]
+
 <a id="mlir"></a>
 ## 5. MLIR 专章：表达范围很宽，但不会自动交付 tiling、调度与极致性能
 
@@ -2578,7 +2768,7 @@ Triton 接回的是设备二进制，并可从 callback 共享库查询 task typ
 
 因此，二者的相似处是核内编译链的一部分；关键不同是 **AscendNPU-IR 的通用编译基础设施还覆盖 Host 图→kernel 分组→tiling→Host launch，而 PyPTO3 当前没有把这些上层责任交给 PTOAS。**若仅替换 PyPTO3 的核内后端，应比较 PTOAS 与 AscendNPU-IR 的设备子流水线；若要利用后者的 Host 图编译，则涉及另一套编排/launch 契约，不能归为“只换核内 codegen”。这仍不构成任何路线的性能排名。
 
-### 5.8 AscendC 应作为下层参照，而不是第八个同等级平台
+### 5.8 AscendC 应作为下层参照，而不是额外的同等级平台
 
 AscendC 直接暴露 LocalTensor / GlobalTensor、TBuf / TQue / TPipe、搬运、Vector/Cube API 与同步等设备编程构件，Host 侧可组织 tiling、workspace 和 launch。这使它在用户感知上最接近 B（PyPTO2-Pro）/D（CANNBot DSL） 的核内工程层，在 G（AutoFuse + Inductor） 中则往往由生成器替用户使用。
 
@@ -2604,6 +2794,21 @@ AscendC 直接暴露 LocalTensor / GlobalTensor、TBuf / TQue / TPipe、搬运�
 | G（AutoFuse + Inductor） | AutoFuse相关生成和模板 | v35及A5相关代码/分支 | 选定AutoFuse路径非GPU |
 
 表中“有分支/测试”不是“当前机器实测可用”，更不是所有 dtype、layout、shape 和融合形式的通用覆盖保证。
+
+### 5.10 H/I 的 MLIR：新增的具体共享点与不能共用的边界
+
+H 的 `buildTlaPipeline()` 提供了明确的 pass 顺序：先区分 AIC/AIV/MIX，再处理自动 mutex、extern、pointer、mixed 函数拆分和 tensor descriptor；随后降低 Vector/Cube 区域、block 索引、flag/mutex，最后进入 HIVM/AVE、regbase intrinsic 及 SCF→CF。还有一个能联系第 8 章的局部优化例子：AVE 合并可将 `vsub` 后接 `vexp` 的序列组合为 `vexpdif`。这是**具体核内指令序列优化**，不是自动把任意两个 attention/task 融合。[H-passes]
+
+I 的默认入口是 `cute-to-nvvm`，公共 Python 源码还可见 CuTe layout 操作和面向 NVIDIA 硬件的 atom。此处能确认 dialect 表达与后端调用关系；未公开在所选目录中的配套 pass 实现，不应凭 pipeline 名字补写内部的完整算法。二者都能复用 MLIR 的类型、SSA、region、pass/diagnostic 等基础设施；硬件地址空间、异步效应、layout 合法性和 launch ABI 仍属各自语义。[I-layout] [I-dsl] [I-compiler]
+
+| 对比 | 已有具体共同点 | 进一步共用所需条件 |
+| --- | --- | --- |
+| H 与 F | 下游均涉及 AscendNPU-IR / HIVM | 固定 revision、构建选项、tensor/memref/layout/同步契约一致；H 输入已带较多物理选择，F 的 TTIR 路径还承担另一组映射工作 |
+| H 与 D | 较早使用 MLIR，显式内存与流水 | TLA 与 CANNIR dialect、staging、address-space/effect 定义不同；D 选定主链生成 AscendC，不等于 H 的 `hivmc-a5` 链 |
+| I 与 E | GPU 目标与 MLIR 后端基础设施 | CuTe 的 thread/value/atom 与 E 的 TensorIR tile 表达不同；必须设计 lowering 与 runtime 适配，不能换一个 compiler 路径完成 |
+| H 与 I | Python DSL + 显式 layout + MLIR + 编译产物 | 先共享数学、尾块、异步所有权与资源约束的测试契约；物理映射和机器码分目标实现 |
+
+H 依赖 CATLASS 锁定的 `AscendNPU-IR@a07821269…`，与第 13 章单列的独立 `90037fe3371c…` checkout 分开；前者再锁定自己的 LLVM/Triton 版本。**已有另一个 MLIR 19 安装不等于具备 HIVM/AVE 的开发头文件和静态库**。这正好说明第 5.6 节的工程问题：能复用编译基础设施，不代表任意同名版本的二进制或 CMake 包可直接互换。[H-ir-build] [H-cmake]
 
 <a id="megakernel"></a>
 ## 6. megaKernel：一层 Transformer 变成“一个算子”究竟验收什么
@@ -2800,7 +3005,7 @@ C（PyPTO3（Simpler））的 `decode_fwd` 已提供比概念图更强的证据�
 
 NPU 不能照搬 GPU 的寄存器占用公式或 grid 限制，但同样要审核 AIC/AIV 参与集合、资源组、等待事件来源及 worker 协议。`sync_start`、`allow_early_resolve`、AIV sub-block 都是具体契约，不是“加了同步即可安全”的装饰参数。[C6（PyPTO3（Simpler））] [C14（PyPTO3（Simpler））]
 
-### 6.9 七条路线逐项评估：当前现状、极致性能可能性、用户代价与差距
+### 6.9 九条路线逐项评估：当前现状、极致性能可能性、用户代价与差距
 
 当前实现概览见第 6.2 节，调用链和源码见第 4 章；以下集中比较性能上探、用户代价与差距。“可能性”是补齐缺口后可争取的方向，不是已达到的硬件峰值比例。
 
@@ -2845,6 +3050,18 @@ NPU 不能照搬 GPU 的寄存器占用公式或 grid 限制，但同样要审�
 - **性能上探**：若图覆盖、成本模型和资源规划足够，可以自动生成接近手工安排的融合区间，并在不同 shape 自动选择策略；不存在“客户不显式写 buffer，所以理论上永远不能极致”的结论。
 - **用户代价**：客户保留 PyTorch 的成本低；达到某模型极限时，工作转移给 lowering/template/tiler/fusion planner 开发者。若必须依靠不透明 pattern 或频繁 fallback，用户调试性能的成本会上升。
 - **具体差距**：所选 Inductor 接入当前明确拒绝 matmul prologue、多处 indirect indexing 的合并，以及若干 indirect indexing/归约组合。[G12（AutoFuse + Inductor）] 这些是 PA 与整层融合需要跨越的实际入口约束，不只是抽象的“还需更多优化”；不能把该入口的限制推广到所有 AutoFuse 入口。仍需证明 native paged decode、动态图/状态写入/复杂归约的覆盖及选择质量。Inductor 捕获一整层不代表送给 AutoFuse 一个整层融合图，送进去也不保证一个物理 kernel；应给出 graph-break/extern/generated-kernel 清单和全层 trace，不用“模型可 torch.compile”代替。
+
+#### H（CATLASS DSL）：物理融合和 A5 流水有具体实现，整层推进还需要额外设计
+
+连续 FA 展示了 QK→softmax→PV→rescale 的 mixed kernel；`basic_mixed` 则把 MMAD 结果经 FIXPIPE 送入 UB，与另一个输入相加后写回。对第 6.6 节的性能模型而言，H 可以具体控制 KV tile、L1/L0/UB 多缓冲、矩阵/向量交接和寄存器计算，以减少选定阶段的 GM 往返。StreamK 还展示了改变工作分解与经 GM workspace 归并 partial 的另一种选择，不能把 H 概括为只会静态单 tile GEMM。[H-fa] [H-mixed] [H-streamk]
+
+从这些算子扩到整层仍须安排投影、norm、attention、MLP 各阶段的分解转换、全局完成条件、GM 生命周期和资源再分配；一个 `tla.jit` helper 内联不会完成这些工作。H 的当前优势方向是让算法作者明确表达硬件流水，代价是布局、事件协议、尾块、工具链版本与特化组合的维护。**单算子通过只为 K4/K5 的局部实现提供验证对象，不能替代整层 K1—K5 的验收。**
+
+#### I（CuTe DSL）：persistent 与 warp 专门化补充合作 kernel 路线，仍需辨明全局边界
+
+I 有完整 softmax、GEMM、连续 GQA、分页 MLA，以及静态/动态 persistent 和实验性 TS。用户可以控制 copy/MMA atom、线程与值分区、TMA/SMEM/TMEM、生产/消费阶段与 warp 角色，因此更容易把第 6.7 节的合作 kernel 方案落实成可读代码。它比“一个 CTA 只做一个 tile”的单一例子有更丰富的工程工具，但这只是相对于该简单写法的能力增量，不是已测出的性能优势。[I-softmax] [I-gqa] [I-mla] [I-static] [I-dynamic] [I-task]
+
+persistent 的收益取决于局部效率和工作不均衡；更多专门化 warp、barrier 和 TMEM/SMEM 占用也可能减少可驻留 CTA。整层不同阶段的输出分区仍需重排；跨 CTA 依赖与全局归约不能自动从 warp 级 TS 推出。I 的 GQA simple 选择两个 launch 加 GM partial，就是为了用明确的归并阶段衔接 split-KV；减少第二个 launch 是否值得，要与资源和进展协议的代价一起测量。[I-gqa]
 
 ### 6.10 用户使用代价：必须把“客户只调用一行”与“谁维护这一行后面”拆开
 
@@ -2965,6 +3182,47 @@ T_layer ≥ max(
 若要进一步区分 PyPTO2-普通版与 PyPTO3，建议做两组对照：第一组尽可能统一核内算法/数据布局，观察任务组织本身；第二组允许各自选择最佳融合/tiling/任务粒度，观察真实整层可达性能与实现代价。前一组帮助定位 scheduler，后一组才代表路线整体；只做其中一组都可能误判。当前没有这些 NPU 对照结果，本文的判断停留在**已实现机制、具体差距和工程可达路径**，不把推断写成性能名次。
 
 ---
+
+### 6.14 新增专题：CATLASS / CuTe 的 scheduler 应放在哪一层比较
+
+#### 6.14.1 五种具体机制，不用一个 scheduler 标签合并
+
+| 机制 | 被调度的工作 | 决策位置 / 进展来源 | 对整层 megaKernel 的实际帮助与边界 |
+| --- | --- | --- | --- |
+| A/C 设备任务体系 | 具有核内入口、参数和依赖的计算任务 | 设备控制/调度与 worker 按就绪状态推进 | 减少跨算子组织与 Host 参与；task 内部分工仍由该 kernel 负责 |
+| H FA 的固定步长循环 | `(batch, Q tile, head)` 工作项 | `block_idx()` 起点、`block_num()` 步长；无逐项就绪队列 | 一组物理核重复处理更多工作；不自动拆分长请求或调度任意后继算子 |
+| H StreamK / I 静态 persistent | GEMM tile 或 K 区间 | 算法制定工作映射；静态 persistent 的后续 tile 可由固定规则求出 | 缓解末轮/分解不均衡或复用调度结构；不是运行时检查依赖后的任意任务派发 |
+| I CLC 动态 persistent | 待执行 CTA/cluster 对应的 tile | 利用 Cluster Launch Control 获取尚未启动的工作，并处理取消/接管结果 | 动态补充 tile，改善某些长尾；工作域与 kernel 已确定，不是多算子 ready DAG |
+| I 实验性 TS | 同一 kernel 内由若干连续 warp 执行的任务及资源阶段 | 编译期声明 schedule/dependency，运行时执行 acquire/commit/wait/release 协议 | 降低复杂 warp 专门化流水的协议编写成本；不能直接当成设备端模型任务 runtime |
+
+来源：[H-fa] [H-streamk] [I-static] [I-dynamic] [I-task] [I-schedule]；A/C 的原有证据与性能分析保留在第 4.8/4.10/6.13 节。
+
+这也使 SPMD/MPMD 的讨论更具体：I 的 CTA grid 可以总体执行同一 kernel，CTA 内又让不同 warp 执行 TMA、MMA、softmax、修正等不同程序段；H mixed kernel 则由 AIC/AIV 执行不同角色。二者都可体现**局部角色专门化**。A/C 外层派发不同核内入口时的 MPMD 属于另一层；不能依据局部角色分工就宣布已有相同的整层任务系统。
+
+#### 6.14.2 CuTe TS 的价值是可声明、可检查的异步资源协议
+
+`Task` 把一段连续 warp 范围与输入/输出资源绑定；`@schedule` 构造 schedule，作者仍编写实际搬运和计算。资源的生产者 acquire/commit 与消费者 wait/release 定义 buffer 何时可覆写、何时可读取；`TaskManager` 据这些声明组织执行和依赖。与 D 的 Channel、H 的 mutex/flag 一样，关键问题都是**异步所有权、槽位轮转与资源可用性**，但 TS 把多角色关系提升到了专门的编程抽象。[I-task] [I-schedule] [I-task-manager]
+
+它还提供检查器枚举抽象执行状态，报告阻塞、资源竞争等问题；这对复杂合作 kernel 的可维护性很有价值。不过检查对象是已声明的模型，并不能证明用户任意地址运算/底层指令都正确。实现还记录状态探索上限及 `hit_state_limit`，应连同覆盖范围检查；“在探索状态内未发现问题”不能省略为无条件的死锁/竞争自由证明。[I-checker]
+
+`work_tile_loop` 与 `domain_loop` 又是两条不同的轴：前者推进 tile，后者遍历一个 tile 内的 K/序列等计算域。静态 WorkQueue 可以不需要单独的工作获取流水；CLC 队列需要动态获取工作及配套协议；dynamic domain 则可能只是在当前 tile 内读取运行时 offset 后循环。**运行时循环次数变化，不必意味着工作分配也是动态的。**[I-schedule] [I-ts-tutorial]
+
+#### 6.14.3 用原有性能模型评估新增机制
+
+假设相同算法与工作集合下，固定分配产生的末尾空闲为 `T_tail`，动态机制能够减少其中的 `ΔT_tail`，但增加工作获取、同步及资源占用导致的时间，则可用下式作一阶分析：
+
+```text
+动态分配的潜在净收益
+  ≈ ΔT_tail
+    − T_work_fetch
+    − ΔT_sync
+    − ΔT_resource_pressure
+    − ΔT_local_compute_or_memory
+```
+
+这是分析框架，不是本次测量结果。I 的 CLC 主要直接作用于 tile 工作分配，TS 主要降低局部异步合作的实现难度并影响流水效率；H 的 StreamK 改变工作分解，并同时引入 partial 归并。它们可能与 A/C 的外层任务调度互补，但无法代替 QK/PV 的高效实现、GQA 复用、页访问局部性及整层重分片。
+
+验收时应保持算法、dtype、shape 和实际工作相同，分别记录静态/动态策略的 tile 分配、空闲尾部、额外同步、workspace、寄存器/片上峰值与总耗时。I 的示例本次仅作源码参照；H 的 correctness 也不直接提供这些性能计量。
 
 <a id="dynamic-tiling"></a>
 ## 7. 动态 shape 与 tiling：是否另写函数、由谁计算、具体怎么写
@@ -3566,6 +3824,32 @@ PA计划的正确性至少要包含这些契约：batch索引一致；GQA映射�
 
 
 
+### 7.15 H/I：动态 layout、固定资源和动态工作队列分别验收
+
+| 变化 | H（CATLASS DSL） | I（CuTe DSL） | 对客户的影响 |
+| --- | --- | --- | --- |
+| 地址或内容变化、类型/布局契约不变 | 编译样本与运行实参分开 | DLPack/runtime tensor 与编译类型分开 | 可以设计重复调用；仍须满足设备、stream、生命周期和 ABI |
+| 逻辑 shape/stride 变化 | `mark_layout_dynamic` / `mark_compact_shape_dynamic`；kernel 读取 `origin_shape` 等动态值 | 对应动态 tensor 元数据接口，保留指定连续维/对齐约束 | 标注哪些值动态，再检查 kernel 是否真正用动态值；不是所有 shape 自动共用一份产物 |
+| 物理 tile/槽数/执行角色变化 | `allocate` 容量静态；例子 tiling 字段或 Python 全局量决定特化 | Copy/MMA tile、warp/cluster、SMEM/TMEM 布局通常进入编译配置 | 经常需要另一个特化与资源计划，不能因 GM 动态就运行时任意扩大片上 tile |
+| 每请求 KV 长度不同 | 当前 FA 的长度参数未被设备读取；语言级动态能力不能补齐例子 | MLA 的 cache sequence / var-seq 路径提供具体对象；另查可变 split 的约束 | 应在同一产物下改变设备长度内容，再检查输出、迭代数及 cache key |
+| 工作项数或单项迭代数变化 | basic MMAD 的动态 GM 与固定步长遍历；FA 特化按源码实际处理 | persistent work-tile 域与 dynamic domain 分开 | 动态元数据、Host tiling、设备取工作是三种不同开销 |
+
+来源：[H-tensor-runtime] [H-api-allocate] [H-mmad-example] [H-fa] [I-tensor-runtime] [I-mla] [I-schedule]。
+
+#### 7.15.1 H 的已有两种写法：basic MMAD 与 FA 不能一起标成“全动态”
+
+basic MMAD 从 GM tensor 的 `origin_shape` 取得 M/N/K，用 `_tiling.l1_tm/l1_tn/l1_tk` 等固定块确定片上容量，再让核按 `block_idx/block_num` 遍历输出块与 K 段；Host 负责构造 tensor、tiling 参数及 launch。这样可以做到**逻辑范围动态、物理策略固定**，不要求客户另写 C++ TilingFunc。实际可复用范围仍受 dtype、layout、拷贝对齐和 tile 配置限制；Host 的 `create_tla_tensor()` 明确调用 `mark_layout_dynamic()`。[H-mmad-example] [H-common-utils] [H-tensor-runtime]
+
+FA 则在 `apply_shape_args()` 里改写全局 `Q_SEQ/KV_SEQ/HEAD_NUM` 等，并在编译时读取。这里已有 `compute_tiling()` 和长度 tensor，但设备端当前没有消费它们。要支持同一二进制下 `[127,513,...]` 的异长请求，不能只换 Host 数组：应修改设备取长度、batch 偏移、task 映射和尾块逻辑，再做相应验证。此处明确的是**现有例子的实现边界**，不是 H 语言在原理上做不到。[H-fa] [H-fa-tiling]
+
+本轮 `M/N/K=128/128/256` 与 `384/160/272` 的 MMAD 均通过，且记录到同一 cache key 和 `kernel.o` 路径（第 12.1.3 节）。这给固定物理策略覆盖不同逻辑尺寸提供了具体对象；没有据两个样本外推完整 shape 域。
+
+#### 7.15.2 I 的参数分类：动态形状并不替作者选择 tile
+
+CuTe runtime tensor 可标记动态 shape/layout；`Constexpr` 则把算法与元编程选择放到编译期。MLA 还使用 page-table、cache sequence 等设备内容，持久化 scheduler 与 var-seq/split 配置共同决定工作。在连续 GQA simple 中，Host `compute_gqa_decode_grid()` 又根据 B/head/序列规模与 SM 数选择 split 数、g tile 和网格。这说明 **CuTe 同样存在 tiling 策略函数，只是不必是 NPU 风格注册式 TilingFunc**。[I-tensor-runtime] [I-mla] [I-gqa]
+
+若动态 domain 只改变一个 CTA 内的 K 循环，它不会自动解决不同 CTA 间的长尾；若把固定队列换成 CLC，也不会自动把 static layout 变成任意动态物理布局。客户必须分别验证“缓存是否复用”“Host 是否重算策略”“设备是否读取新长度”“是否重新分配工作”四件事，沿用第 7.13.3 节的四种缓存区分。
+
 <a id="intra-kernel-fusion"></a>
 ## 8. 用户怎样写出核内融合：多个 Vector 计算如何复用片上数据
 
@@ -3809,7 +4093,7 @@ Inductor 的预融合节点列表
 
 #### 8.3.8 AscendC 基础层补充：多个 Vector API 调用不是多个 kernel launch
 
-AscendC 是多条路线使用的底层 API/编译接口，此处不另算第八条完整路线。AutoFuse 的 AscendC 扩展库提供了一个直观例子：`AxpyExtend` 是 `inline __aicore__` 函数，输入输出为 `AscendC::LocalTensor`，其非 half 分支连续执行：[G17（AutoFuse + Inductor）]
+AscendC 是多条路线使用的底层 API/编译接口，此处不另算一条完整路线。AutoFuse 的 AscendC 扩展库提供了一个直观例子：`AxpyExtend` 是 `inline __aicore__` 函数，输入输出为 `AscendC::LocalTensor`，其非 half 分支连续执行：[G17（AutoFuse + Inductor）]
 
 ```cpp
 AscendC::Muls(dst, src_1, alpha, count);
@@ -3960,6 +4244,64 @@ SPMD attention task（24 logical blocks）
 
 C（PyPTO3（Simpler））的native PA在Phase 0后明确执行cache/fence/sync操作：[C16（PyPTO3（Simpler））]。这说明“所有核到达”与“GM数据对消费者可见”也不是可以随便混用的一条语义。
 
+### 8.12 H/I 怎样实现核内融合、片上复用与同步
+
+#### 8.12.1 H：已有 mixed GEMM 与 FA，把四种融合证据落到源代码
+
+`basic_mixed.py` 的数据路径可以用下图表示；它描述源码中的局部数据流，不是本次 profiler trace：
+
+```text
+A/B 的 GM → L1 → L0A/L0B → MMAD / L0C
+                                  ↓ FIXPIPE，按 AIV 分工送 UB
+addend 的 GM ───────────────────→ UB → Vector load/add/store → UB → 输出 GM
+                                  ↑ cross_core flag 标记结果可读
+```
+
+作者先为 L1/L0/UB 分配容量，再用 layout 建立视图；Cube 完成 MMAD 后搬到 UB，Vector 等待跨核通知，将结果与 addend 相加。它让第 8.1 节的“同一核内协作区域”“中间结果不经 GM”有了具体实现对象。但 UB 到寄存器仍有 load/store，片上流量并未凭空消失；FA 的 softmax 也明确写入部分 UB 状态，再配合同核内存屏障和跨阶段事件。[H-mixed] [H-fa]
+
+H 的 `@tla.kernel(auto_sync="v0")` 可在约束域内自动插入局部 mutex；它不负责跨核或 `vec.func` 内线程同步，且不允许与显式 local flag/mutex 混用，extern 也不在支持域。这意味着可以比较 **同一算法的显式同步与局部自动同步**，不能写成“开启后自动完成任意整层流水”。当前 FA 已自行写显式协议，不能简单叠加 AutoSync。[H-dsl] [H-auto-sync]
+
+#### 8.12.2 H 的片上分配算法：静态容量与编译器选偏移不等于自动生命周期复用
+
+`planTlaScratchAllocations()` 遍历 `tla.alloc_ptr`，按地址空间各自维护 next offset，为每次分配做对齐并递增。源码中这一层没有根据 last-use 将不同分配复用到相同区间；`TlaLowerPtrPass` 消费这些偏移，UB 还有对应 scratch symbol。因此至少要分清：
+
+- 用户选择空间、容量、对齐和槽数；TLA 分配器给出静态偏移。
+- 用户可在算法内重复使用同一已分配 buffer，但仍要保证异步消费者已结束。
+- 两个不同 `allocate` 不会仅因源码作用域先后，就在这个分配器中自动获得相同物理空间。
+- 下游额外优化或最终峰值以生成物为准，不能拿“采用 MLIR”作为全局最优内存规划的证据。
+
+来源：[H-scratch] [H-ptr-pass] [H-api-allocate]。这为第 8.9/10.2 节的公共 planner 讨论提供了一个具体的起点：可以设计更强的生命周期复用，但必须把 flag、异步 copy、跨 CV 读写和 alias 效应作为输入。
+
+用默认 FA 的 `Q_BLOCK=KV_BLOCK=HEAD_DIM=128`、`Q_BLOCK_SUB=64`、b16 输入做一次**源码预算计算**，逐个 `allocate` 乘 dtype 字节数，并按当前分配器的 512 B 对齐累加，可得到：
+
+| 局部空间 | 源码中主要声明 | 按该分配规则计算的字节数 |
+| --- | --- | --- |
+| L1 | Q 单槽、K/V 各双槽、P 三槽；每槽 `128×128×2 B` | 262,144 B = 256 KiB |
+| L0A / L0B | 各两个 32 KiB 槽 | 各 65,536 B = 64 KiB |
+| L0C | QK 双槽与 PV 双槽；每槽 `128×128×4 B` | 262,144 B = 256 KiB |
+| UB | S/P/PV 缓冲、acc、max/sum 等状态、tmp 与 mask 声明 | 原始元素量 207,616 B；逐分配对齐后 209,920 B = 205 KiB |
+
+这里统计源级声明，**没有把不同地址空间或各个物理核的容量相加，也没有把它当成硬件总容量/最终峰值**。例如 mask buffer 虽被声明，当前数学路径没有使用输入 mask；最终是否保留以 lowering/二进制为准。`ub_out_f16_ptr` 由 acc pointer 做 `recast_ptr`，没有增加独立 `allocate`，但“可以换类型复用同一 buffer”仍须由算法保证旧值已无需保留。[H-fa] [H-scratch]
+
+这个对象让第 6.7 节的整层问题更具体：不能仅把下一阶段函数内联进 FA，就假设它自动获得足够 UB/L1；需要决定哪些分配结束、哪些槽可复用、状态是否必须经 GM 交接，再计算加入新流水后的峰值。
+
+#### 8.12.3 I：layout/atom、pipeline 与 TS 分别承担不同工作
+
+在 CuTe 中，同一 kernel 里选择 local tile、线程/值分区、Copy/MMA atom 与寄存器运算，可以让生产者结果继续交给消费者；TMA/MMA 等异步阶段依赖 pipeline/mbarrier 协议。分页 MLA 的 page-table pipeline、Q/KV 载入、矩阵计算、softmax 与输出修正是具体组合。普通 GQA simple 则把 split 输出放在 GM，再 launch reduction，所以它既有 kernel 内融合，也有 kernel 间中间存储。[I-layout] [I-copy] [I-mma] [I-pipeline] [I-mla] [I-gqa]
+
+TS 的内存模块进一步提供资源声明、SMEM 字节/TMEM 列分配和显式 phase alias group：同一 phase 的分配同时存活，不同 phase 可复用一个物理区域。这是一种**用户声明生命周期关系、分配器计算布局**的工具；不是自动发现任意模型图上所有可复用内存。声明的 phase 顺序还需实际同步保证，检查器的边界见第 6.14.2 节。[I-ts-memory] [I-checker]
+
+连续 GQA simple 还有一个可对照的 tiling 计算：先为 Q、P、max/sum 和各 pipeline barrier 预留 SMEM，再用剩余预算除以每个 KV stage 的数据与同步开销，求 `KV_stages`。这相当于 `floor((容量−固定占用)/(每槽数据+每槽同步))`，因此改变 head dimension、g tile 或 stage 数会影响可用缓冲深度。它是具体作者策略，不能泛化成 CuTe 自动找到所有算法的最优 stage；预算值也应与最终分配和占用率复核。[I-gqa]
+
+| 规划/同步层 | H | I | 本文的验收方式 |
+| --- | --- | --- | --- |
+| 跨 kernel GM/workspace | Host/算子安排，例如 StreamK partial | Host/算子安排，例如 GQA split partial | 记录分配、生命周期与真实读写字节 |
+| 核内片上空间 | 静态 allocate + TLA 偏移规划 | SMEM/TMEM 布局，TS 可显式 phase alias | 核对空间峰值、对齐、alias 和消费者完成时点 |
+| 寄存器与局部计算 | `vec.func`、寄存器 mask/load/store 等 | thread/value fragment、warp shuffle/寄存器计算 | 检查最终指令、spill 与片上访问，不只看源代码变量 |
+| 异步/跨角色同步 | 本地 flag/mutex、CV cross flag、线程/内存屏障 | pipeline/mbarrier/CTA/cluster，TS 资源协议 | 分别验收内存可见性、buffer 安全与执行进展 |
+
+H/I 都为深度融合提供了更细的控制；控制越细，越需要第 8.7 节的产物与硬件证据来判断是否兑现收益。
+
 <a id="gpu-launch"></a>
 ## 9. GPU 多 SM、实际 launch 与 NPU block 的区别
 
@@ -4032,6 +4374,14 @@ Triton用户logical grid
 [F3（Triton-Ascend）]/[F9（Triton-Ascend）] 是这一编译器—runtime联合契约的证据。故 `tl.program_id` 数量、CANN物理blockDim、AIV sub-block数量和GPU CTA数量不是同一个计数器。
 
 对所有路线，都应该并列输出 `logical work / physical resources / launch config / stream / actual trace`，而不是只报告“用了32核”。
+
+### 9.5 I（CuTe DSL）与 E（PyPTO on GPU）：同是 CUDA launch，作者控制面不同
+
+第 9.1 节关于 grid/CTA/warp/SM 的区分同样适用于 I。CuTe 的 `.launch()` 显式给 grid、block，并可带 cluster、动态 shared-memory 和 stream；作者还可在 kernel 里分配 warp 角色。E 的历史实验则由 PyPTO/TensorIR 编译与 runtime 决定相应映射。不能把 E 历史 trace 中的物理线程数套到 I 的 MLA/GQA，更不能把 Blackwell 的 TMA/TMEM/CLC 当作旧 Ada `sm89` 实验已验证的能力。[I-dsl] [I-gqa] [I-mla] [I-dynamic]
+
+CuTe GQA simple 的源码给 decode 配置 12 个 warp（384 线程），然后以另一份 launch 配置执行 reduction。这个数能说明该源码的角色分配，不能说明 CTA 同时驻留多少 SM；同理，persistent grid 控制工作驻留与重复领取的策略，仍须结合每 CTA 的寄存器/SMEM/TMEM、cluster 约束及目标硬件分析占用率。[I-gqa]
+
+本次没有 NVIDIA GPU，I 的 launch 数判断限于所引 Host 程序的静态调用结构，尚无运行 trace；E 的第 9.3 节历史 profiling 原样保留，二者不能相互充当实测来源。
 
 <a id="replacement"></a>
 ## 10. 技术替代与共用：明确改哪一层、不改哪一层
@@ -4116,6 +4466,21 @@ B（PyPTO2-Pro）/D（CANNBot DSL）通常需要把直接launch模型封装为ta
 
 优先做哪个不是本文替管理层决策；可先用一个带动态长度和workspace的attention子图验证接口跨度，再判断收益是否抵得过迁移与维护成本。
 
+### 10.5 H/I 加入后的替代与公共契约
+
+| 设想 | 可以保留什么 | 还需具体实现什么 | 当前判断 |
+| --- | --- | --- | --- |
+| H kernel 接入 Simpler | TLA 核内算法、物理 layout、部分资源策略 | `kernel_entry(args)`/参数打包、逻辑 block ID、mixed entry、workspace/flag、任务完成与重入协议 | 设计方向可行；当前 PyACL launch artifact 不等于 Simpler extern ABI 已兼容 |
+| H 与 F 共用下游编译 | 部分 HIVM/AVE 语义和目标转换 | 固定版本/构建配置、layout/地址空间/异步效应契约、双方进入下游时已经做出的 tiling 选择 | 有共同基础设施对象；不是直接交换 Python frontend 就能共用全部 passes |
+| H/D/B 共用局部 planner | 空间、容量、对齐、读写/异步生命周期、槽数等描述 | 各 IR 的效应提取、alias、硬件通路、合法 barrier；把计划重新编码回各 DSL/IR | 可先共享测试与算法输入契约，不能把 H 的简单偏移分配器当现成全能 planner |
+| E 改用 I 作为核内实现 | 客户算子/模型接口与部分数学规格 | PyPTO TensorIR 模式到 CuTe layout/atom/线程分区的转换，CUDA Host ABI/cache/export 适配 | 能讨论新后端或模板调用方案；当前无现成兼容证据 |
+| H/I 共用流水描述 | 数据依赖、buffer 所有权、stage、生命周期/资源约束 | NPU CV/FIX/MTE 与 GPU warp/TMA/TMEM 的目标映射、可见性和进展模型 | 最有价值的共用方向之一；物理空间及同步不能机械同名映射 |
+| I 的 TS 思路用于整层 runtime | 资源声明、依赖可视化、协议检查的设计经验 | 任意任务入口、全局就绪/完成、跨阶段 GM、失败处理和跨核资源调度 | 可借鉴方法；不能把 CTA 内 TaskManager 直接等同 A/C 的 runtime |
+
+H 的编译产物可以由 Host 装载/执行，只能证明其现有 launch ABI 完整，不能证明它已经满足任意设备 runtime 的调用规约。I 的 JIT executor 提供 cubin 与导出相关逻辑，也不能消除设备二进制架构、参数布局、stream/上下文和全局同步上的差异。[H-runtime] [H-execution] [I-executor] [I-task] [H-scratch]
+
+因此第 10.1—10.4 节的公共契约分析继续成立；新增 H/I 的作用，是把资源规划、layout、异步协议和 kernel artifact 这些接缝落实到更多具体代码。先实现一个小 kernel 的适配并检验动态参数、重入和完成通知，再扩大到 PA/整层，才有证据谈现成替代关系。
+
 ## 11. 多维相似性、优化空间和开发成本
 
 ### 11.1 相似性必须按层回答
@@ -4161,11 +4526,27 @@ B（PyPTO2-Pro）/D（CANNBot DSL）通常需要把直接launch模型封装为ta
 
 这是责任位置比较，不是“代码越少开发成本越低”的排名；性能调优、诊断、版本适配和客户支持可能大于首个kernel实现成本。
 
+### 11.4 H/I 的相似性、优化空间与工程成本
+
+| 维度 | H（CATLASS DSL） | I（CuTe DSL） |
+| --- | --- | --- |
+| 最接近的既有局部工作 | B/D 的显式核内工程；F 的部分 AscendNPU-IR 下游 | E 的 CUDA artifact/launch；更细的核内角色/资源控制可与 B/D/H 对照 |
+| 两者之间最明显的相似性 | Python 元编程、显式 tensor/layout、局部 buffer/流水、编译产物 | 相同责任族；CuTe layout 代数、thread/value 分区更明确，物理目标不同 |
+| 可直接优化的对象 | CV 分工、L1/L0/UB tile/槽、FA 状态、布局搬运、StreamK 归并 | atom/线程分区、TMA/MMA overlap、warp 角色、persistent/CLC、SMEM/TMEM 占用 |
+| 客户调用成本 | 调用已有封装可以很低；直接实现 kernel 需要学习物理路径 | 现成算子/封装可降低调用成本；手写高性能 kernel 需掌握 layout/warp/pipeline |
+| 算子作者成本 | 尾块、mask、buffer/flag、跨 CV 交接；本例 PA 还需补分页与设备长度逻辑 | 架构特定 tile/atom、线程合作、barrier、split/归并；标准 GQA PA 不能直接以 MLA 替代 |
+| 编译器/运行库成本 | TLA passes、AscendNPU-IR 固定版本、CANN、ABI/cache/mixed metadata | Python DSL 与配套编译组件版本、CUDA/SM 目标、JIT/export、实验性接口演进 |
+| 可维护性工具 | 受限 AutoSync、具体 IR/manifest、现有 end-to-end golden | pipeline helper、TS 资源/schedule/检查器、可调度示例；检查器不替代数值/硬件测试 |
+
+H 的公开说明将当前实现定位为 TLA API 封装，更完整的 CATLASS C++ 分层抽象仍有后续建设空间。因此不能把 C++ 模板库里所有 schedule/算子自动计入 H。I 也应分开核心 CuTe API、`cute_ext`/experimental 和具体架构示例；依赖文件与目录名称本身不是接口长期稳定性的保证。[H-readme] [I-requirements] [I-task] [I-gqa]
+
+对 megaKernel 项目管理最有用的新增信息，是**显式控制与自动化之间存在多种责任分配方式**：H 已有受限自动同步，I TS 可自动组织已声明的资源协议；它们都不是简单的“所有同步全手写”，也都没有因此自动获得任意模型整层融合。原有客户/算子作者/基础设施三方成本分析继续适用。
+
 ## 12. 证据口径、验证结果与后续测试边界
 
 ### 12.1 验证范围与已记录结果
 
-以下保留源码分析阶段的验证记录，并补充本次 A5 环境准备与 PA 执行结果。旧 CPU/GPU 数值标识其历史来源，A5 日志另有随文快照；理论模型、源码机制、编译执行正确性和硬件性能四类证据分别解释，不以其中一项替代另一项。此次文档修订整理的是本 session 已完成的测试，没有重新跑全套 NPU 性能实验。
+以下保留源码分析阶段的验证记录，并补充本次 A5 环境准备与 PA 执行结果。旧 CPU/GPU 数值标识其历史来源，A5 日志另有随文快照；理论模型、源码机制、编译执行正确性和硬件性能四类证据分别解释，不以其中一项替代另一项。A—G 整理本 session 已完成的测试；本次新增 H 的工具链与现有用例验证另列第 12.1.3 节，没有重新跑全套 NPU 性能实验。
 
 | 事项 | 已记录状态 | 能支持什么结论 |
 | --- | --- | --- |
@@ -4279,6 +4660,51 @@ bash .npu-stack/paged-attention/run.sh autofuse 4
 
 将第一条的`pypto2_rebind`改为`pypto2`可复现未修改原版，当前预期在KV-append精度校验处非零退出。修正版已通过该复跑入口再次验证。[RUN-script] [RUN-results]
 
+#### 12.1.3 H/I 本次核对与验证
+
+**H 已完成构建安装和板端验证；七组主用例中六组通过，Q=1 连续 decode 精度失败。**本轮使用独立 CATLASS venv，公共 `catlass.tla` 可导入，已从当前 CATLASS checkout 构建 TLA 编译工具、Python bridge 与 MLIR 绑定。AscendNPU-IR 使用第 13 章的固定子模块及其 LLVM/Triton 版本，并应用该版本要求的 Triton 补丁。[H-run-build] [H-ir-build] [H-ir-patches]
+
+本机为物理 NPU 4（进程内逻辑 0），`Ascend950PR_957b`，28 Cube / 56 Vector；CANN 为 `9.2.0-weekly.20260902.01`，末端 `hivmc-a5` 报 `0.3.0 / Release build`。Host 编译器使用本地安装的 Clang 19.1.1，按用户指定 **16 并发**完成构建；AscendNPU-IR 为 Release + PIC + RTTI，assertions 关闭，TLA extension 为 Debug editable 安装。Python 3.12.3、torch 2.10.0+cpu、torch_npu 2.10.0.post4；具体版本、编译选项和文件 hash 见快照。[H-run-env] [H-run-build]
+
+GCC 13.3.0 的先前尝试在两处模板特化代码上失败。切换 Clang 后撤回了临时兼容性补丁，最终构建没有额外修改 `bishengir` 编译器源码；这些失败日志与最终成功状态一起归档。CATLASS 示例的 kernel、Host 输入构造和 golden 均未修改；外围驱动只传入 CLI 参数并采集结果。[H-run]
+
+以下 FA 均为 `B=1,Hq/Hkv=8/1,D=128`、连续 KV、全零 mask。表中的最大绝对误差是对原驱动参考结果的诊断量，判定仍采用原驱动的完整标准。[H-run-results]
+
+| 用例 | 输入/输出类型 | 尺寸 | block_num | 原始精度判定 | 最大绝对误差 |
+| --- | --- | --- | --- | --- | --- |
+| MMAD | f16/f16 → f32 | M/N/K=128/128/256 | 2 | **通过** | `1.220703e-04` |
+| MMAD 动态尺寸 | f16/f16 → f32 | M/N/K=384/160/272 | 2 | **通过** | `1.831055e-04` |
+| MMAD + Vector add | f32 | M/N/K=32/32/32 | 1 | **通过** | `1.525879e-05` |
+| 连续 FA，多 query / 无 mask | f16 | Q=117，KV=512 | 8 | **通过** | `2.638102e-04` |
+| 连续 FA，多 query / 无 mask | bf16 | Q=117，KV=512 | 8 | **通过** | `2.073646e-03` |
+| 连续 decode | f16 | Q=1，KV=512 | 8 | **失败** | `8.130878e-03` |
+| 连续 FA，KV 尾块 | f16 | Q=117，KV=513 | 8 | **通过** | `2.626181e-04` |
+
+MMAD/mixed 的这三组均为 f32 输出、K<2048，共享比较函数使用 `abs(error) <= (1/256) * max(1, abs(reference))`。FA 则分别计算 NPU 输出和分块低精度参考相对完整 FP32 attention 的 MARE（最大相对误差）、MERE（平均相对误差）、RMSE，再比较 `error_NPU / max(error_blocked_reference, eps)`；阈值依次为 `2.0/1.2/1.2`，f16 的 eps 为 `2^-7`，bf16 为 `2^-6`。这些不是 A—G 的统一容差，也不构成跨路线精度排名。[H-common-golden] [H-fa]
+
+外围检查还确认全部输出有限；四组主 FA 的输出均已覆盖哨兵值。Q=1 那组尽管 1,024 个输出全部写入，仍因精度失败返回非零，不能把完成 launch 当作通过。[H-run-results]
+
+**decode 失败的复核：**固定原驱动随机种子 42、相同 Q/K/V 与 cache key `4a86ee93a8ed579a`，8 核复跑仍失败，最大绝对误差从首次的 `8.130878e-3` 变为 `6.538039e-2`；仅改成 1 核也失败，误差为 `6.415969e-2`。首次 MARE ratio 为 `2.175862 > 2.0`，8 核复跑为 `16.324497`。随后默认 Q=117 的 FP16 FA 对照复跑通过，误差与首轮一致。当前只确认这个固定配置存在可复现的精度问题、且误差随运行变化，尚未定位到具体 kernel 语句、lowering 或运行时机制。[H-run-diagnostics] [H-run]
+
+**实测怎样支持前面的理论：**两组 MMAD 的 cache key 均为 `02db0bc37b247666`，对应同一 `kernel.o` 路径，为第 7.15 节的动态逻辑范围提供了对象。mixed 与 FA 的实际 `lowered.mlir` 含 `_mix_aic`、`_mix_aiv` 和 Vector helper，为第 4.11/8.12 节的异构核内合作提供了产物证据；这仍不是设备 profiler 的 launch 计数。编译产物、ABI manifest、函数声明及 hash 均已归档。[H-run-artifacts]
+
+脱敏后的完整记录保存在本仓库 `tests/npu_gpu_programming_stacks_comparison.catlass.json`，文中引用固定到该文件的 GitHub commit。[H-run] 本机已有环境的复跑方式如下；脚本内容也包含在快照中，恢复到另一 workspace 时需替换 `<MEGA_ROOT>`、`<USER_HOME>` 并准备对应依赖。[H-run-replay]
+
+```bash
+# 从本 session 的 mega workspace 根目录执行
+source .npu-stack/catlass/activate.sh 4
+cd pto_qcy
+export PYPTO_BUILD_JOBS=16
+source .claude/skills/testing/load-env.sh
+python ../.npu-stack/catlass/run_examples.py
+python ../.npu-stack/catlass/run_examples.py --decode-diagnostics
+python ../.npu-stack/catlass/run_examples.py --prefill-control
+```
+
+主用例脚本和 decode 复核脚本当前预期返回非零，并分别留下 `results.json`、`decode-diagnostics.json`；默认 FA 对照通过，记录在 `prefill-control.json`。如需重建，本机入口为 `PYPTO_BUILD_JOBS=16 bash .npu-stack/catlass/build-ir.sh` 和 `PYPTO_BUILD_JOBS=16 bash .npu-stack/catlass/build-dsl.sh`，从 workspace 根目录运行。快照中的过程总耗时包含编译、Host golden 和检查，**不是 kernel latency**。[H-run-replay]
+
+I 的全部新增判断来自固定 CUTLASS checkout 的代码核对。本次未安装/运行 CuTe 的 CUDA kernel，也未生成其性能数据；E 的旧 GPU 实验不代替 I 的实测。H 的连续 attention、I 的分页 MLA 与原 A—G PA 用例分别记录，不汇成同口径性能排名。
+
 ### 12.2 后续若要测性能，建议统一验收表
 
 | 类别 | 必须记录 |
@@ -4359,6 +4785,11 @@ Triton-Ascend HEAD中 `third_party/ascend/AscendNPU-IR` 的gitlink是 `aea934a66
 | torch_npu源码分析 | `9f15aa301f6c` | [NPU组合调度][F-inductor]；安装wheel版本另见环境记录 |
 | 独立AscendNPU-IR源码分析 | `90037fe3371c` | [HIVM pipeline][N-pipeline]；非本轮CANN二进制的源码版本声明 |
 | 独立PTOAS源码分析 | `30a83c586cc9` | [driver][P-driver]；本轮实测工具为[v0.57发布包][P-release] |
+| H：cann/catlass Python TLA DSL | `337cc89254d4` | [Python DSL][H-dsl] / [FA][H-fa]；不包含全库 C++ 算子覆盖声明 |
+| H：固定 AscendNPU-IR 子模块 | `a07821269ede` | [固定版本构建说明][H-ir-build] / [子模块配置][H-ir-submodules]；使用 Clang 构建，与独立 NPU-IR checkout 分开；GCC 曾在 [模板特化][H-ir-matmul] 处失败，不计入可用工具链 |
+| H：配套 LLVM / Triton | `9c0841dc3fa2` / `c3c476f357f1` | [LLVM][H-llvm] / [Triton][H-triton]，再应用固定 NPU-IR 的 [Triton 补丁][H-ir-patches] |
+| I：NVIDIA/cutlass CuTe DSL | `59e3a3338d51` | [DSL 入口][I-dsl] / [CuTe 示例][I-examples]；源码核对，未 GPU 执行 |
+| I：配套 wheel 要求 | `nvidia-cutlass-dsl==4.8.0.dev0` | [仓库 requirements][I-requirements]；是源码的安装要求，不是本机安装成功记录 |
 
 GPU bundle的`origin_url`标识上游来源，不保证fork commit可在上游GitHub文件页访问。因此本文引用已公开的bundle与source lock，底层文件路径在第9节给出；已按锁文件恢复并核对bundle SHA256及head tree。旧版的`.sources/pypto`本地路径不再当作可点击来源。[E-lock] [E-bootstrap] [E-bundle]
 
@@ -4404,6 +4835,10 @@ GPU bundle的`origin_url`标识上游来源，不保证fork commit可在上游Gi
 | G（AutoFuse + Inductor）入口/IR | [G1（AutoFuse + Inductor）] 安装/启用；[G2（AutoFuse + Inductor）] Inductor→ASCGraph；[G3（AutoFuse + Inductor）] Autofuser/三份代码输出 |
 | G（AutoFuse + Inductor）tiling/内存/launch | [G4（AutoFuse + Inductor）] compile_ascendc；[G5（AutoFuse + Inductor）] tiling生成；[G6（AutoFuse + Inductor）] buffer lifecycle；[G7（AutoFuse + Inductor）] wrapper；[G8（AutoFuse + Inductor）] compile_adapter |
 | PTOAS | [P1（PTOAS）] emitc/vpto/arch选项；[P2（PTOAS）] memory规划；[P3（PTOAS）] modern规划实现 |
+| H（CATLASS DSL）前端 / 编译 | [H-dsl] `CatlassBaseDSL/TlaDSL`；[H-compile] `CompileCallable`；[H-passes] `buildTlaPipeline` |
+| H（CATLASS DSL）内存 / runtime | [H-scratch] 静态地址空间偏移；[H-execution] `_compile_kernel`；[H-runtime] `launch_kernel` |
+| I（CuTe DSL）编译 / runtime | [I-dsl] `CutlassBaseDSL` / pipeline；[I-compiler] compiler；[I-executor] cubin/JIT；[I-runtime] CUDA load/launch |
+| I（CuTe DSL）工作分配 / 资源 | [I-static] 静态 persistent；[I-dynamic] CLC；[I-task] / [I-schedule] / [I-task-manager] TS；[I-ts-memory] 内存；[I-checker] 协议检查 |
 
 ### 13.3 用户完整示例入口
 
@@ -4417,6 +4852,8 @@ GPU bundle的`origin_url`标识上游来源，不保证fork commit可在上游Gi
 | E（PyPTO on GPU） | [E8（PyPTO on GPU）] 五阶段完整实验 | [E10（PyPTO on GPU）] paged decode API；[E11（PyPTO on GPU）] 完整benchmark用法 |
 | F（Triton-Ascend） | [F5（Triton-Ascend）] kernel与Host教程 | [F6（Triton-Ascend）] 原生paged unified attention、decode参数和golden |
 | G（AutoFuse + Inductor） | 第2.3节客户程序；[G1（AutoFuse + Inductor）]入口文档 | 第2.4节客户表达；[G9（AutoFuse + Inductor）] 仅作外部FA/ACLGraph集成证据 |
+| H（CATLASS DSL） | [H-fa] FA 内 online-softmax；没有据此宣称独立长行 softmax 已验证 | [H-fa] 连续 FA；[H-fa-tiling] Host tiler；[H-mmad-example] 动态 GM；[H-mixed] CV 交接；[H-streamk] 工作切分/归并 |
+| I（CuTe DSL） | [I-softmax] 八种实现及 launcher，源码证据 | [I-mla] / [I-mla-fp8] 分页 MLA；[I-gqa] 连续 GQA 两阶段；[I-ts-tutorial] persistent/domain/warp 调度教程 |
 
 链接行号对应上述HEAD；源码以后移动时优先按符号定位。相对路径便于本文随pto工作区一起阅读。
 
@@ -4678,10 +5115,74 @@ GPU bundle的`origin_url`标识上游来源，不保证fork commit可在上游Gi
 [D-arena-rms]: ../../cannbot_dsl/cannbot-arena/test/rms_norm/test_rms_norm.py
 [D-arena-mm]: ../../cannbot_dsl/cannbot-arena/test/matmul/matmul/test_matmul_precision.py
 
+[H-readme]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/README.md#L1
+[H-dsl]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/catlass/catlass_dsl/catlass.py#L15
+[H-compile]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/catlass/base_dsl/compiler.py#L8
+[H-execution]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/catlass/execution.py#L312
+[H-runtime]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/catlass/base_dsl/runtime/ascend.py#L137
+[H-api-layout]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/catlass/core_api.py#L3810
+[H-api-copy]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/catlass/core_api.py#L4421
+[H-api-mmad]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/catlass/core_api.py#L5522
+[H-api-allocate]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/catlass/core_api.py#L7575
+[H-tensor-runtime]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/catlass/tla/runtime.py#L274
+[H-passes]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/csrc/mlir/lib/Passes/PassRegistry.cpp#L44
+[H-mixed-pass]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/csrc/mlir/lib/Passes/TlaSplitMixedFuncPass.cpp#L1
+[H-extern-pass]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/csrc/mlir/lib/Passes/TlaLowerExternCallPass.cpp#L1
+[H-auto-sync]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/csrc/mlir/lib/Passes/TlaInsertAutoMutexPass.cpp#L1
+[H-scratch]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/csrc/mlir/lib/Passes/TlaScratchAllocation.cpp#L31
+[H-ptr-pass]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/csrc/mlir/lib/Passes/TlaLowerPtrPass.cpp#L129
+[H-fa]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/examples/end_to_end/flash_attention_infer/flash_attention_infer.py#L90
+[H-fa-readme]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/examples/end_to_end/flash_attention_infer/README.md#L1
+[H-fa-tiling]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/examples/end_to_end/flash_attention_infer/fa_tiling.py#L63
+[H-mmad-example]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/examples/end_to_end/basic_mmad/basic_matmul.py#L36
+[H-common-golden]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/examples/end_to_end/common/golden.py#L23
+[H-common-utils]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/examples/end_to_end/common/utils.py#L95
+[H-mixed]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/examples/end_to_end/basic_mixed/basic_mixed.py#L52
+[H-streamk]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/examples/end_to_end/basic_mmad_streamk/basic_mmad_streamk.py#L1
+[H-ir-build]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/docs/zh/dsl_development/build_guide/ascend_npu_ir.md#L1
+[H-cmake]: https://gitcode.com/cann/catlass/blob/337cc89254d46f5d6041d117aca64edf7197027a/python/tla_dsl/csrc/mlir/CMakeLists.txt#L1
+[H-ir-submodules]: https://gitcode.com/Ascend/AscendNPU-IR/blob/a07821269ede7a5e683ac02c8a2d291608083741/.gitmodules#L1
+[H-ir-matmul]: https://gitcode.com/Ascend/AscendNPU-IR/blob/a07821269ede7a5e683ac02c8a2d291608083741/bishengir/lib/Conversion/HFusionToHIVM/Matmul.cpp#L510
+[H-ir-patches]: https://gitcode.com/Ascend/AscendNPU-IR/tree/a07821269ede7a5e683ac02c8a2d291608083741/build-tools/patches/triton
+[H-llvm]: https://gitcode.com/Ascend/llvm-project/blob/9c0841dc3fa2a224595b41e9e0641b796d2afeb9/llvm/CMakeLists.txt#L1
+[H-triton]: https://github.com/triton-lang/triton/blob/c3c476f357f1e9768ea4e45aa5c17528449ab9ef/CMakeLists.txt#L1
+[H-inductor-template]: https://gitcode.com/Ascend/pytorch/blob/9f15aa301f6c69f7632b57e1ff198a84c27c3f79/torch_npu/_inductor/codegen/catlass/catlass_template.py#L156
+[I-dsl]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/python/CuTeDSL/cutlass/cutlass_dsl/cutlass.py#L567
+[I-layout]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/python/CuTeDSL/cutlass/cute/core.py#L3684
+[I-mma]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/python/CuTeDSL/cutlass/cute/nvgpu/tcgen05/mma.py#L1
+[I-copy]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/python/CuTeDSL/cutlass/cute/nvgpu/cpasync/copy.py#L1
+[I-pipeline]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/python/CuTeDSL/cutlass/pipeline/sm100.py#L1
+[I-compiler]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/python/CuTeDSL/cutlass/base_dsl/compiler.py#L1
+[I-executor]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/python/CuTeDSL/cutlass/base_dsl/jit_executor.py#L139
+[I-runtime]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/python/CuTeDSL/cutlass/base_dsl/runtime/cuda.py#L600
+[I-tensor-runtime]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/python/CuTeDSL/cutlass/cute/runtime.py#L213
+[I-requirements]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/python/CuTeDSL/requirements.txt#L1
+[I-softmax]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/examples/python/CuTeDSL/experimental/primitives/tutorial/06_softmax.py#L86
+[I-mla]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/examples/python/CuTeDSL/cute/blackwell/kernel/attention/mla/mla_decode_fp16.py#L3378
+[I-mla-fp8]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/examples/python/CuTeDSL/cute/blackwell/kernel/attention/mla/mla_decode_fp8.py#L1
+[I-gqa]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/examples/python/CuTeDSL/cute_ext/blackwell/attention/gqa_decode_simple.py#L88
+[I-static]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/examples/python/CuTeDSL/helpers/static_persistent_tile_scheduler.py#L1
+[I-dynamic]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/python/CuTeDSL/cutlass/utils/dynamic_persistent_tile_scheduler.py#L1
+[I-task]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/python/CuTeDSL/cutlass/experimental/task_scheduling/task.py#L546
+[I-schedule]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/python/CuTeDSL/cutlass/experimental/task_scheduling/schedule_builder.py#L15
+[I-task-manager]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/python/CuTeDSL/cutlass/experimental/task_scheduling/task_manager.py#L1
+[I-ts-memory]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/python/CuTeDSL/cutlass/experimental/task_scheduling/memory.py#L15
+[I-checker]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/python/CuTeDSL/cutlass/experimental/task_scheduling/exhaustive_checker.py#L1
+[I-ts-tutorial]: https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/examples/python/CuTeDSL/experimental/task_scheduling/blackwell/tutorial/03_persistent_scheduling_dynamic_domain_ts/README.md#L1
+[I-examples]: https://github.com/NVIDIA/cutlass/tree/59e3a3338d516ca6ce0e073af8da65289678a35c/examples/python/CuTeDSL
+
+[H-run]: https://github.com/nalinaly/pypto/blob/fcb8d1b0070c7921a56c103a43eafb3cf309a8c8/tests/npu_gpu_programming_stacks_comparison.catlass.json#L1
+[H-run-env]: https://github.com/nalinaly/pypto/blob/fcb8d1b0070c7921a56c103a43eafb3cf309a8c8/tests/npu_gpu_programming_stacks_comparison.catlass.json#L5
+[H-run-build]: https://github.com/nalinaly/pypto/blob/fcb8d1b0070c7921a56c103a43eafb3cf309a8c8/tests/npu_gpu_programming_stacks_comparison.catlass.json#L88
+[H-run-results]: https://github.com/nalinaly/pypto/blob/fcb8d1b0070c7921a56c103a43eafb3cf309a8c8/tests/npu_gpu_programming_stacks_comparison.catlass.json#L217
+[H-run-diagnostics]: https://github.com/nalinaly/pypto/blob/fcb8d1b0070c7921a56c103a43eafb3cf309a8c8/tests/npu_gpu_programming_stacks_comparison.catlass.json#L479
+[H-run-artifacts]: https://github.com/nalinaly/pypto/blob/fcb8d1b0070c7921a56c103a43eafb3cf309a8c8/tests/npu_gpu_programming_stacks_comparison.catlass.json#L620
+[H-run-replay]: https://github.com/nalinaly/pypto/blob/fcb8d1b0070c7921a56c103a43eafb3cf309a8c8/tests/npu_gpu_programming_stacks_comparison.catlass.json#L3441
+
 <a id="nearest"></a>
 ## 14. 最终选择：每种方式最相似的另一种是谁
 
-这里按 **整体执行组织/责任分层 → 用户编程与tiling → 核内编译分工 → 前端代码血缘** 的顺序判断。megaKernel也按程序级与物理kernel级分开考虑。只在上述七种方式中选一个“最相似者”；这是有方向的选择，不强制成对，不是性能或优劣排名。
+这里按 **整体执行组织/责任分层 → 用户编程与tiling → 核内编译分工 → 前端代码血缘** 的顺序判断。megaKernel也按程序级与物理kernel级分开考虑。下面先保留 A—G 七种方式子集中的“最相似者”；这是有方向的选择，不强制成对，不是性能或优劣排名。
 
 | 方式 | 最相似的另一种 | 首要理由 | 最重要的不相同 | 若换一个维度，谁会更近 |
 | --- | --- | --- | --- | --- |
@@ -4694,3 +5195,19 @@ GPU bundle的`origin_url`标识上游来源，不保证fork commit可在上游Gi
 | G（AutoFuse + Inductor） | **F（Triton-Ascend）** | 客户可保留PyTorch表达，Inductor选择融合/模板/extern并生成NPU kernel | G（AutoFuse + Inductor）不是Triton frontend；ASCIR、ATT tiling及生成代码方式不同 | 只看生成AscendC及局部buffer语义，D（CANNBot DSL）的下层更近 |
 
 最终可以压缩为：**A（PyPTO2-普通版）↔C（PyPTO3（Simpler）） 是程序/任务执行家族；B（PyPTO2-Pro）↔D（CANNBot DSL） 是显式核内工程家族；F（Triton-Ascend）↔G（AutoFuse + Inductor） 是 Inductor kernel 生成家族；E（PyPTO on GPU） 的当前整体形态最靠近 F（Triton-Ascend），但前端血缘靠近 C（PyPTO3（Simpler））。** 这份归类并不否定各家内部的其他模式，特别是 C（PyPTO3（Simpler）） 已有与 B（PyPTO2-Pro）/D（CANNBot DSL） 接近的SPMD核内实现。它用于定位哪些层可以共用、哪些层存在替代关系，而不是把混合架构强塞进互斥标签。
+
+
+### 14.1 纳入 H/I 后的九路线补充判断
+
+上表仍解释 A—G 子集的相似性，没有删去原先的比较依据。扩大到九条后，按本章优先级，H 可首先选 D，I 可首先选 H；D 则增加 H 这一更直接的候选，其余原有主要分组仍有解释力。该判断按整体执行与资源责任作出，不要求双向匹配。
+
+| 对象 / 比较角度 | 纳入 H/I 后的选择 | 理由与边界 |
+| --- | --- | --- |
+| H 的整体执行与核内责任 | **D（CANNBot DSL）** | 同为 NPU 显式硬件/内存/流水 + 较早进入 MLIR + Host launch；H 的 TLA/HIVM 链、D 的 CANNIR/AscendC 与 Host staging 不同 |
+| I 的整体核内编程责任 | **H（CATLASS DSL）** | Python 元编程、显式 layout/搬运/矩阵与流水、直接 kernel artifact/launch 相近；I 的 GPU 线程/warp 与 TS、H 的 AIC/AIV/物理 tag 仍有显著差异 |
+| D 的新增最强候选 | **H**，原 B 仍是有价值的同硬件参照 | H 补充了显式资源与 MLIR 主链同时接近的对象；若优先比较 TileGroup/Channel 的作者责任，B/D 原讨论仍有效 |
+| H/I 仅看 layout 和 Python 接口 | **互为重点比较对象** | 不能从名字相近推出 layout 代数同等覆盖、代码血缘或后端兼容 |
+| H 仅看下游编译基础设施 | **F 的 AscendNPU-IR 路径** | 输入抽象、已完成的物理分解、固定版本与 launch metadata 不同 |
+| I 的 TS 与 A/C 的任务系统 | **按粒度对照，不能合为同一整体家族** | 单 kernel 的 warp/资源协议，与跨计算入口的设备任务依赖/派发分别减少不同工程工作 |
+
+因此九路线的视图是在原有 **A↔C 程序/任务、B↔D 显式核内、F↔G Inductor、E 的 PyPTO/GPU 接缝** 之上，加入 **H 的 A5 layout/流水实现与 I 的 CuTe layout/warp/persistent 工具**。它们给原文的 megaKernel 理论提供更多可核对的实现对象，同时保留“程序级推进、单 kernel 合作、片上数据复用、最终性能”四个问题各自的边界。
