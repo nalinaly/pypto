@@ -1,0 +1,1364 @@
+{
+  "schema_version": 1,
+  "description": "Auditable snapshot of the 2026-09-07 A5 PA runs. Source checkouts were executed during environment bring-up; this archive does not claim new tests or performance profiling.",
+  "redaction": "Only workspace/home path prefixes are replaced by ${WORKSPACE}/${USER_HOME}. SHA256 values refer to original, unredacted files.",
+  "environment": {
+    "date_utc": "2026-09-07",
+    "machine": "Linux x86_64",
+    "cann_root": "${USER_HOME}/Ascend/cann-9.2.0-weekly.20260902.01/cann-9.2.0",
+    "driver_version": "Version=25.7.rc1.2\nascendhal_version=7.35.23\naicpu_version=1.0\ntdt_version=1.0\nlog_version=1.0\nprof_version=2.0\ndvppkernels_version=1.1\ntsfw_version=1.0\nInnerversion=V100R001C10SPC103B220\ncompatible_version=[V100R001C22],[V100R001C23],[V100R001C25],[V100R001C10],[V100R001C11]\ncompatible_version_fw=[7.0.0,8.9.9]\npackage_version=25.7.rc1.2\n",
+    "physical_device": 4,
+    "logical_device": 0,
+    "allocator": "task-submit unavailable; direct execution, no performance claim",
+    "source_snapshot": {
+      "pypto2": {
+        "head": "85c9484e236e35aaf4f6f04e3099c0a9442fd452",
+        "status_lines": 0
+      },
+      "pypto3/pypto": {
+        "head": "9f657f37ed20ce148b46fb7229c267a152a0644e",
+        "status_lines": 0
+      },
+      "pypto3/pypto-lib": {
+        "head": "c6bc0bf50d6b1b58bde4698cdd4d8ff0f5d33b80",
+        "status_lines": 0
+      },
+      "pypto3/PTOAS": {
+        "head": "30a83c586cc9af801a9db0eb9137820b4cd8554c",
+        "status_lines": 1
+      },
+      "pypto3/pto-isa": {
+        "head": "a8040450238f162985d8b596fbebeb54bfba2bf5",
+        "status_lines": 0
+      },
+      "cannbot_dsl/cannbot-dsl": {
+        "head": "e87c6ed5ec1a20264426a46d65be2a2546536cf6",
+        "status_lines": 1007
+      },
+      "cannbot_dsl/cannbot-arena": {
+        "head": "3077d4f296d09c4213b4ed64f6a74e85f6151ea6",
+        "status_lines": 0
+      },
+      "triton-ascend/triton-ascend": {
+        "head": "c747daae7f67fb7acd1013bf9793505aec1dc9e2",
+        "status_lines": 0
+      },
+      "triton-ascend/triton-ascend-kernels": {
+        "head": "f7d13ba7c7b6b4590b1d3910f93a2fd66fa6e9a3",
+        "status_lines": 0
+      },
+      "graph-autofusion": {
+        "head": "3b5e6a387e7dc2a0eef7d052a0f7a50c06947db2",
+        "status_lines": 0
+      },
+      "torchair": {
+        "head": "cf2acaee5fe6139617fa7014ea0d09933cf8b35c",
+        "status_lines": 0
+      },
+      "torch_npu": {
+        "head": "9f15aa301f6c69f7632b57e1ff198a84c27c3f79",
+        "status_lines": 0
+      },
+      "AscendNPU-IR": {
+        "head": "90037fe3371cb88d50c42cd4e165075cbafe83b1",
+        "status_lines": 0
+      },
+      "pto_qcy": {
+        "head": "098b896ffb84ffebd0dac87af62835b7e33195a9",
+        "status_lines": 0
+      }
+    },
+    "simpler": "4e4d3a4ad1e54c1db3d50e72decc025a9075bfa0",
+    "triton_integrated_ascendnpu_ir": "aea934a66646e837c54fea11e87db54d42eb3221",
+    "pto_isa_pin": "a8040450238f162985d8b596fbebeb54bfba2bf5",
+    "toolchains": {
+      ".npu-stack/toolchains/ptoas-v0.57.tar.gz": {
+        "sha256": "ea53c268c31ce3ad3aad45b25c35782562e19e570e156f5dd2b1bf2addb4fc79",
+        "size_bytes": 44092476
+      },
+      ".npu-stack/toolchains/triton-llvm.tar.gz": {
+        "sha256": "c1d8d52ddaacd155b650c2a0465fcd0f84be2053468a6354fccf594b7954741e",
+        "size_bytes": 1234595493
+      }
+    },
+    "compiler_versions": {
+      "gcc": {
+        "exit_code": 0,
+        "output": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+      },
+      "cann_bisheng": {
+        "exit_code": 0,
+        "output": "2026-08-31T13:55:18+08:00 clang version 15.0.5 (clang-5c68a1cb1231 flang-5c68a1cb1231)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: ${USER_HOME}/Ascend/cann-9.2.0-weekly.20260902.01/cann-9.2.0/bin"
+      },
+      "cann_bishengir": {
+        "exit_code": 0,
+        "output": "bishengir-opt 1.2.0 (/usr1/npuir-a3/bishengir db17d67fe460 2026-09-02) \nllvm 19.1.7 3254a1b1c59d\nRelease build"
+      },
+      "ptoas": {
+        "exit_code": 0,
+        "output": "ptoas 0.57"
+      }
+    },
+    "device_name": "Ascend950PR_957b",
+    "package_inventory": "packages/",
+    "import_path_inspection": {
+      "base": "packages/base.environment.json",
+      "pypto2": "packages/pypto2.environment.json",
+      "pypto3": "packages/pypto3.environment.json",
+      "cannbot": "packages/cannbot.environment.json",
+      "triton": "packages/triton.environment.json",
+      "autofuse": "packages/autofuse.environment.json"
+    },
+    "source_builds": [
+      "pypto2",
+      "pypto3/pypto",
+      "pypto3/pypto/runtime",
+      "cannbot_dsl/cannbot-dsl",
+      "triton-ascend/triton-ascend",
+      "graph-autofusion/autofuse"
+    ],
+    "editable_python_sources": [
+      "cannbot_dsl/cannbot-dsl",
+      "triton-ascend/triton-ascend-kernels",
+      "torchair/experimental/_inductor_npu_ext/python"
+    ],
+    "prebuilt_dependencies": [
+      "torch / torch_npu wheels",
+      "PyPTO3 pinned PTOAS v0.57",
+      "CANN Bisheng/BishengIR",
+      "LLVM archives and existing LLVM 19.1.7 static+PIC install"
+    ],
+    "local_build_artifacts": {
+      ".npu-stack/triton-build-applied.patch": {
+        "sha256": "653265689de463c2162c52426d0ba004929ba4e8b4b8496710fdec3d72bf3f0d",
+        "size_bytes": 57038
+      },
+      ".npu-stack/triton-link-fix.patch": {
+        "sha256": "3accd55f873f647f8260b5798a0f8ca6e3bbf39ce3ed4a8efdde81c05fd6257a",
+        "size_bytes": 557
+      },
+      ".npu-stack/triton-kernel-api-fix.patch": {
+        "sha256": "8953b2b9a9a03bff4be27829a859eb8dfa114bbad7623b0b6c85477acaf6e3b9",
+        "size_bytes": 2693
+      },
+      ".npu-stack/wheels/triton_ascend-3.6.0+gitc747daae-cp312-cp312-linux_x86_64.whl": {
+        "sha256": "726fc2449f0dfdf4e67e506fac1680a313c7d3f3a651b910cea5d8184c8a44a5",
+        "size_bytes": 215372842
+      }
+    }
+  },
+  "results": {
+    "schema_version": 1,
+    "environment": {
+      "date_utc": "2026-09-07",
+      "physical_device": 4,
+      "logical_device": 0,
+      "device": "Ascend950PR_957b",
+      "cann_root": "${USER_HOME}/Ascend/cann-9.2.0-weekly.20260902.01/cann-9.2.0",
+      "stacks": {
+        "pypto2": {
+          "head": "85c9484e236e35aaf4f6f04e3099c0a9442fd452"
+        },
+        "pypto3/pypto": {
+          "head": "9f657f37ed20ce148b46fb7229c267a152a0644e"
+        },
+        "pypto3/pypto-lib": {
+          "head": "c6bc0bf50d6b1b58bde4698cdd4d8ff0f5d33b80"
+        },
+        "cannbot_dsl/cannbot-dsl": {
+          "head": "e87c6ed5ec1a20264426a46d65be2a2546536cf6"
+        },
+        "cannbot_dsl/cannbot-arena": {
+          "head": "3077d4f296d09c4213b4ed64f6a74e85f6151ea6"
+        },
+        "triton-ascend/triton-ascend": {
+          "head": "c747daae7f67fb7acd1013bf9793505aec1dc9e2"
+        },
+        "triton-ascend/triton-ascend-kernels": {
+          "head": "f7d13ba7c7b6b4590b1d3910f93a2fd66fa6e9a3"
+        },
+        "torchair": {
+          "head": "cf2acaee5fe6139617fa7014ea0d09933cf8b35c"
+        },
+        "graph-autofusion": {
+          "head": "3b5e6a387e7dc2a0eef7d052a0f7a50c06947db2"
+        }
+      }
+    },
+    "scope": "Compile, real A5 execution and numerical correctness of existing PA implementations. Not latency benchmarking, not all shapes or complete model validation.",
+    "summary": {
+      "native_routes_unmodified_pass": [
+        "B",
+        "C",
+        "D",
+        "F"
+      ],
+      "native_route_pass_with_local_workaround": [
+        "A"
+      ],
+      "graph_probe_pass_with_external_ops": [
+        "G"
+      ],
+      "all_unmodified_routes_pass": false
+    },
+    "routes": [
+      {
+        "id": "A",
+        "name": "PyPTO2 ordinary",
+        "status": "PASS_WITH_LOCAL_WORKAROUND",
+        "native_paged_implementation_found": true,
+        "source": {
+          "path": "pypto2/python/tests/st/test_ctrl_cpu_perf.py",
+          "entry": "ctrl_perf_kernel",
+          "line": 71,
+          "sha256": "ba55cd1aa3caffe08e759c308f7d5a43d998166164591255cad7634b3fdbee69"
+        },
+        "tested_variant": {
+          "path": ".npu-stack/paged-attention/pypto2_rebound_cache.py",
+          "entry": "ctrl_perf_kernel with cache views rebuilt after scatter_update",
+          "line": 71,
+          "sha256": "770800eaef52271afe39eefbb4c2ce31b93743a1bc3fe2c72d551f08270e5314"
+        },
+        "patch": "pypto2-cache-view-rebind.patch",
+        "upstream_source_modified": false,
+        "driver": ".npu-stack/tests/smoke_paged_pypto2.py",
+        "replay": "bash .npu-stack/paged-attention/run.sh pypto2_rebind 4",
+        "case": {
+          "mode": "prolog + KV append + single-token PA decode",
+          "batch": 4,
+          "q_heads": 8,
+          "kv_heads": 1,
+          "head_dim": 128,
+          "page_size": 128,
+          "kv_lengths": [
+            127,
+            128,
+            129,
+            513
+          ],
+          "dtype": "float16",
+          "kv_layout": "[physical_pages, page_size, Hkv, D]",
+          "page_mapping": "random permutation with overallocated pool",
+          "softmax_scale": "1/sqrt(128)",
+          "reference": "Independent dense CPU FP32 attention after CPU prolog and KV append, preserving FP16 casts",
+          "atol": 0.001,
+          "rtol": 0.01
+        },
+        "original": {
+          "status": "FAIL_NUMERICAL",
+          "device_exit_code": 1,
+          "diagnostics": {
+            "q_buffer_unchanged": false,
+            "q_buffer_max_error": 6.103515625e-05,
+            "k_buffer_unchanged": false,
+            "v_buffer_unchanged": false,
+            "max_abs_error": 0.7950679659843445,
+            "pre_update_attention_max_abs_error": 0.0001582503318786621
+          },
+          "frontend_tensor_graph": "PASS against the post-update reference",
+          "interpreter_log": "logs/pypto2-original-interpreter.log",
+          "interpreter_result_line": 14,
+          "log": "logs/pypto2.log",
+          "internal_log_dir": "output/output_20260907_052431_815400_ubuntu_0000892653",
+          "replay": "bash .npu-stack/paged-attention/run.sh pypto2 4"
+        },
+        "local_workaround": {
+          "status": "PASS",
+          "device_exit_code": 0,
+          "diagnostics": {
+            "q_buffer_unchanged": false,
+            "q_buffer_max_error": 6.103515625e-05,
+            "k_buffer_unchanged": false,
+            "v_buffer_unchanged": false,
+            "max_abs_error": 0.0002454519271850586,
+            "pre_update_attention_max_abs_error": 0.7952229380607605
+          },
+          "frontend_tensor_graph": "PASS",
+          "interpreter_log": "logs/pypto2-rebind-interpreter.log",
+          "interpreter_result_line": 14,
+          "log": "logs/pypto2-rebind.log",
+          "internal_log_dir": "output/output_20260907_052330_967913_ubuntu_0000883508"
+        },
+        "limitations": [
+          "Original source is a performance guard without a numerical golden.",
+          "Observed backend output uses the pre-update cache; rebuilding both views after updates restores the tested append semantics. No specific compiler pass or runtime root cause established.",
+          "Local correction tested for B=4, one prolog batch tile. Not a replacement validation of the original B=16 performance guard."
+        ]
+      },
+      {
+        "id": "B",
+        "name": "PyPTO2 Pro",
+        "status": "PASS",
+        "native_paged_implementation_found": true,
+        "source": {
+          "path": "pypto2/python/tests/st/pypto_pro/frontend/fa/test_flex_attention_prefill.py",
+          "entry": "flex_attention_bf16",
+          "line": 840,
+          "sha256": "2d49fc8ad0ec3a8d8154e478ae7fd251447cb94cf8f68d8c79e4c321fb82fbf5"
+        },
+        "test_source": "pypto2/python/tests/st/pypto_pro/frontend/fa/test_flex_attention_prefill.py",
+        "driver": ".npu-stack/tests/smoke_paged_pypto2_pro.py",
+        "replay": "bash .npu-stack/paged-attention/run.sh pypto2_pro 4",
+        "cases": [
+          {
+            "mode": "existing paged causal/hybrid prefill",
+            "batch": 2,
+            "q_lengths": [
+              512,
+              256
+            ],
+            "kv_lengths": [
+              512,
+              256
+            ],
+            "q_heads": 8,
+            "kv_heads": 2,
+            "head_dim": 128,
+            "page_sizes": [
+              128,
+              256,
+              512
+            ],
+            "assertion": "All three page sizes match CPU reference and are bit-identical to each other"
+          },
+          {
+            "mode": "additional single-token decode using the original _run_case",
+            "batch": 4,
+            "q_lengths": [
+              1,
+              1,
+              1,
+              1
+            ],
+            "kv_lengths": [
+              127,
+              128,
+              129,
+              513
+            ],
+            "q_heads": 8,
+            "kv_heads": 2,
+            "head_dim": 128,
+            "page_size": 128,
+            "max_abs_error": 0.0
+          }
+        ],
+        "dtype": "bfloat16",
+        "kv_layout": "[physical_pages, page_size, Hkv, D]",
+        "page_mapping": "randomly shuffled pages in an overallocated garbage-filled pool",
+        "reference": "Existing CPU FA-flow reference with BF16 probability rounding",
+        "atol": 0.008,
+        "rtol": 0.008,
+        "log": "logs/pypto2-pro.log",
+        "records": [
+          {
+            "case": "existing_paged_prefill",
+            "status": "PASS",
+            "page_sizes": [
+              128,
+              256,
+              512
+            ]
+          },
+          {
+            "case": "single_token_decode",
+            "status": "PASS",
+            "B": 4,
+            "Hq": 8,
+            "Hkv": 2,
+            "D": 128,
+            "page_size": 128,
+            "lengths": [
+              127,
+              128,
+              129,
+              513
+            ],
+            "max_abs_error": 0.0
+          }
+        ]
+      },
+      {
+        "id": "C",
+        "name": "PyPTO3 + Simpler + PTOAS",
+        "status": "PASS",
+        "native_paged_implementation_found": true,
+        "source": {
+          "path": "pypto3/pypto/examples/models/04_paged_attention.py",
+          "entry": "build_paged_attention_program / build_paged_attention_unaligned_program",
+          "line": 230,
+          "sha256": "1f8b7c99cbfc69475a46a1f547fe293fdf01f647d5ebf12a08966b5b941f17ef"
+        },
+        "test_source": "pypto3/pypto/tests/st/runtime/framework_and_models/test_paged_attention.py",
+        "replay": "bash .npu-stack/paged-attention/run.sh pypto3 4",
+        "junit": {
+          "path": "pypto3.xml",
+          "tests": 2,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "cases": [
+            "test_paged_attention_ptoas[64-16-128-128-8192-32768]",
+            "test_paged_attention_unaligned_ptoas[64-16-128-128-8100-32768]"
+          ]
+        },
+        "cases": [
+          {
+            "batch": 64,
+            "q_heads": 16,
+            "kv_heads": 1,
+            "head_dim": 128,
+            "page_size": 128,
+            "kv_length": 8192,
+            "max_model_len": 32768
+          },
+          {
+            "batch": 64,
+            "q_heads": 16,
+            "kv_heads": 1,
+            "head_dim": 128,
+            "page_size": 128,
+            "kv_length": 8100,
+            "max_model_len": 32768
+          }
+        ],
+        "mode": "single-token MQA, existing multi-task PTOAS implementation",
+        "input_dtype": "bfloat16",
+        "output_dtype": "float32",
+        "kv_layout": "[total_pool_rows, D], physically flattened pages",
+        "q_layout": "[B * Hq, D]",
+        "page_mapping": "random physical page IDs; repetitions allowed",
+        "softmax_scale": 1.0,
+        "reference": "Existing CPU page-wise online reference with BF16 probabilities and FP32 online update",
+        "atol": 0.02,
+        "rtol": 0.02,
+        "log": "logs/pypto3.log",
+        "additional_native_source_found": "pypto3/pypto-lib/models/qwen3_14b/paged_attention_pypto.py",
+        "limitations": [
+          "All requests within a case share the same context length.",
+          "Qwen3-14B fused SPMD PA has only a2a3/a2a3sim test CLI choices in this checkout; its A5 path was not ported or tested.",
+          "Scale 1.0 is the existing test default, unlike other routes."
+        ]
+      },
+      {
+        "id": "D",
+        "name": "CANNBot DSL",
+        "status": "PASS",
+        "native_paged_implementation_found": true,
+        "source": {
+          "path": "cannbot_dsl/cannbot-dsl/examples/flash_attn_noquant/flash_attn_noquant.py",
+          "entry": "FlashAttnNoquant(paged=True)",
+          "line": 593,
+          "sha256": "be41d86ab26d8d3bd8fe5926812f3f64c48ade39ad09e6fc487fc9209b2def7d"
+        },
+        "paging_source_lines": [
+          368,
+          395,
+          442
+        ],
+        "test_source": "cannbot_dsl/cannbot-dsl/examples/flash_attn_noquant/test_flash_attn_noquant.py",
+        "driver": ".npu-stack/tests/smoke_paged_cannbot_decode.py",
+        "replay": "bash .npu-stack/paged-attention/run.sh cannbot 4",
+        "junit": {
+          "path": "cannbot.xml",
+          "tests": 2,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "cases": [
+            "test_flash_attn_noquant_paged[4-36-36-256-1024-128]",
+            "test_flash_attn_noquant_paged[4-9-1-1024-1024-128]"
+          ]
+        },
+        "cases": [
+          {
+            "mode": "unmasked full attention",
+            "batch": 4,
+            "q_heads": 36,
+            "kv_heads": 36,
+            "q_length": 256,
+            "kv_length": 1024
+          },
+          {
+            "mode": "unmasked full attention",
+            "batch": 4,
+            "q_heads": 9,
+            "kv_heads": 1,
+            "q_length": 1024,
+            "kv_length": 1024
+          },
+          {
+            "mode": "single-token decode",
+            "batch": 4,
+            "q_heads": 9,
+            "kv_heads": 1,
+            "q_length": 1,
+            "kv_length": 512
+          }
+        ],
+        "dtype": "float16",
+        "head_dim": 128,
+        "page_size": 128,
+        "kv_layout": "[physical_pages, Hkv, page_size, D]",
+        "page_mapping": "randomly permuted physical pages",
+        "softmax_scale": "1/sqrt(128)",
+        "reference": "Existing independent CPU full-attention reference",
+        "atol": 0.001,
+        "rtol": 0.001,
+        "logs": [
+          "logs/cannbot.log",
+          "logs/cannbot-decode.log"
+        ],
+        "decode_record": {
+          "status": "PASS",
+          "mode": "single_token_decode",
+          "B": 4,
+          "Hq": 9,
+          "Hkv": 1,
+          "D": 128,
+          "page_size": 128,
+          "lengths": [
+            512,
+            512,
+            512,
+            512
+          ]
+        },
+        "limitations": [
+          "KV lengths in these tests are full pages. No partial-KV-page or heterogeneous-batch-length coverage.",
+          "Multiquery cases use no causal mask.",
+          "Passing implementation comes from the DSL examples; arena flash_attn is not used as native PA evidence."
+        ]
+      },
+      {
+        "id": "F",
+        "name": "Triton-Ascend",
+        "status": "PASS",
+        "native_paged_implementation_found": true,
+        "source": {
+          "path": "triton-ascend/triton-ascend-kernels/src/triton_ascend_kernels/attention/paged_attention.py",
+          "entry": "paged_attention_fwd",
+          "line": 461,
+          "sha256": "fc824f3162fa2835d52a54c158a35d828673cff2649fc69f89f4f6afa60cf732"
+        },
+        "test_source": "triton-ascend/triton-ascend-kernels/tests/attention/test_paged_attention.py",
+        "replay": "bash .npu-stack/paged-attention/run.sh triton 4",
+        "junit": {
+          "path": "triton.xml",
+          "tests": 8,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0,
+          "cases": [
+            "test_accuracy_paged_attention[16-seq_lens0-history_lens0-8-2-32-48]",
+            "test_accuracy_paged_attention[16-seq_lens0-history_lens0-8-2-32-32]",
+            "test_accuracy_paged_attention[16-seq_lens0-history_lens0-2-2-32-48]",
+            "test_accuracy_paged_attention[16-seq_lens0-history_lens0-2-2-32-32]",
+            "test_accuracy_paged_attention[16-seq_lens1-history_lens1-8-2-32-48]",
+            "test_accuracy_paged_attention[16-seq_lens1-history_lens1-8-2-32-32]",
+            "test_accuracy_paged_attention[16-seq_lens1-history_lens1-2-2-32-48]",
+            "test_accuracy_paged_attention[16-seq_lens1-history_lens1-2-2-32-32]"
+          ]
+        },
+        "matrix": {
+          "batch": 4,
+          "q_heads_kv_heads": [
+            [
+              8,
+              2
+            ],
+            [
+              2,
+              2
+            ]
+          ],
+          "qk_dims": [
+            48,
+            32
+          ],
+          "v_dims": [
+            32
+          ],
+          "page_sizes": [
+            16
+          ],
+          "dtype": "float16",
+          "modes": [
+            {
+              "mode": "causal prefill",
+              "q_lengths": [
+                30,
+                50,
+                70,
+                90
+              ],
+              "kv_lengths": [
+                80,
+                90,
+                100,
+                110
+              ]
+            },
+            {
+              "mode": "single-token decode",
+              "q_lengths": [
+                1,
+                1,
+                1,
+                1
+              ],
+              "kv_lengths": [
+                51,
+                41,
+                31,
+                21
+              ]
+            }
+          ]
+        },
+        "kv_layout": "[physical_pages, page_size, Hkv, Dk_or_Dv]",
+        "q_layout": "TND",
+        "page_mapping": "interleaved non-contiguous page IDs",
+        "reference": "Existing dense Torch NPU reference, FP32 softmax probabilities cast to FP16 before PV",
+        "atol": 0.001,
+        "rtol": 1e-05,
+        "log": "logs/triton.log",
+        "limitations": [
+          "Two window-attention tests deselected.",
+          "Not a performance comparison or exhaustive shape suite."
+        ]
+      },
+      {
+        "id": "G",
+        "name": "AutoFuse + Inductor",
+        "status": "PASS_GRAPH_WITH_EXTERNAL_OPS",
+        "native_paged_implementation_found": false,
+        "source": {
+          "path": ".npu-stack/tests/smoke_paged_autofuse.py",
+          "entry": "paged_decode_padded from comparison document section 2.4",
+          "line": 15,
+          "sha256": "0b6478aef46cd690bd658c68e8678daad4aeba8bdf9416e61096915861df5d5d"
+        },
+        "replay": "bash .npu-stack/paged-attention/run.sh autofuse 4",
+        "case": {
+          "batch": 3,
+          "q_heads": 40,
+          "kv_heads": 8,
+          "head_dim": 128,
+          "page_size": 128,
+          "max_pages": 5,
+          "pool_pages": 19,
+          "dtype": "bfloat16",
+          "kv_layout": "[physical_pages, Hkv, page_size, D]",
+          "page_mapping": "random page IDs; repetitions allowed",
+          "softmax_scale": "1/sqrt(128)",
+          "reference": "Independent dense CPU FP32 paged decode, output rounded to BF16",
+          "atol": 0.002,
+          "rtol": 0.02
+        },
+        "record": {
+          "status": "PASS",
+          "mode": "document graph capability probe",
+          "B": 3,
+          "Hq": 40,
+          "Hkv": 8,
+          "D": 128,
+          "page_size": 128,
+          "cases": [
+            {
+              "lengths": [
+                1,
+                129,
+                513
+              ],
+              "max_abs_error": 0.0009765625
+            },
+            {
+              "lengths": [
+                127,
+                128,
+                512
+              ],
+              "max_abs_error": 0.000244140625
+            }
+          ],
+          "artifacts_dir": "${WORKSPACE}/.npu-stack/paged-attention/cache/autofuse/inductor"
+        },
+        "compile": {
+          "backend": "inductor",
+          "npu_scheduling": "inductor_npu_ext.NPUScheduling asserted before and after execution",
+          "fullgraph": true,
+          "dynamic": false,
+          "runtime_length_contents_changed_without_shape_change": true
+        },
+        "lowering_evidence": "autofuse-lowering.json",
+        "lowering_summary": {
+          "generated_functions": 7,
+          "generated_function_call_sites": 9,
+          "external_index_select_calls": 2,
+          "external_bmm_calls": 2,
+          "external_repeat_interleave_calls": 2,
+          "counts_are_device_launch_counts": false
+        },
+        "log": "logs/autofuse.log",
+        "limitations": [
+          "Padded cache and GQA expansion materialize large intermediate tensors.",
+          "No native single-kernel PA or megaKernel claim."
+        ]
+      }
+    ],
+    "implementation_edits_this_task": [
+      "Local copy of PyPTO2 ctrl_perf_kernel with two added cache-view reshapes; source checkout unchanged."
+    ],
+    "inherited_environment_compatibility_notes": "See ../README.md for prior Triton build and MatMul API compatibility edits. No new Triton or CANNBot PA source edits were needed.",
+    "driver_hashes": {
+      ".npu-stack/tests/smoke_paged_pypto2.py": "73896b6204dfd3b9aac9efb0255bb41767f56c3eb75503669de3736a1817e6e2",
+      ".npu-stack/tests/smoke_paged_pypto2_pro.py": "f3a3fd55caef6fd86b0b222be19492b98d0fbc8e8e6c2b7714f58ae21417b6c0",
+      ".npu-stack/tests/smoke_paged_cannbot_decode.py": "6747cb60323106d1cbded81186e50a6d0c6b18381074da78624c2572b7e53265",
+      ".npu-stack/tests/smoke_paged_autofuse.py": "0b6478aef46cd690bd658c68e8678daad4aeba8bdf9416e61096915861df5d5d"
+    },
+    "replay_script": {
+      "path": ".npu-stack/paged-attention/run.sh",
+      "sha256": "9b8c038bd0446411b7fe81e56545ec5edcb42f3cfd9b5a078982920df317ba54",
+      "log_policy": "New timestamped replay directory; original recorded test logs preserved."
+    },
+    "historical_diagnostic_attempts": {
+      "pypto2-driver-setup-error.log": "Wrong compile-option Python API in the new test driver, corrected before compilation.",
+      "pypto2-driver-scope-error.log": "Compile parallelism belongs to global.codegen, corrected in driver.",
+      "pypto2-intermediate-reference.log": "Initial post-update golden read back actual intermediates; failed like the independent CPU full-program golden.",
+      "pypto2-post-update-reference.log": "Independent CPU full-program golden confirmed the same device failure.",
+      "pypto2-verify.log": "Pre-update golden diagnostic: device matched but tensor_graph verifier FAILED; the driver at that time did not enforce interpreter status. This is not a successful complete-program result.",
+      "pypto2-pre-update-golden-interpreter.log": "Interpreter failure against the pre-update golden; actual interpreter result includes the appended values."
+    },
+    "replay_validation": {
+      "route": "pypto2_rebind",
+      "exit_code": 0,
+      "status": "PASS",
+      "log": "logs/replay-pypto2-rebind.log",
+      "run_dir": ".npu-stack/paged-attention/replays/20260907T063647-pypto2_rebind-1508049",
+      "max_abs_error": 0.0002454519271850586,
+      "frontend_tensor_graph": "PASS",
+      "note": "Fresh replay directory tested through run.sh after the driver and runner were finalized."
+    },
+    "artifact_validation": {
+      "json_valid": true,
+      "readme_local_links_exist": true,
+      "source_hashes_match": true,
+      "source_heads_unchanged": true,
+      "driver_python_syntax": "PASS",
+      "runner_bash_syntax": "PASS",
+      "local_variant_matches_documented_patch": true
+    }
+  },
+  "autofuse_lowering": {
+    "wrapper": ".npu-stack/paged-attention/cache/autofuse/inductor/wz/cwzpqdqfab45qmoeous25qy4c5gqs5n74lmfh7nky6da2c7bygbi.debug/output_code.py",
+    "sha256": "8b7e7096b027778353448a3bca6211b691320cf91a7d9ce6a82838d3da5ee9f6",
+    "external_calls": [
+      {
+        "line": 52055,
+        "function": "torch.ops.aten.arange.default"
+      },
+      {
+        "line": 52084,
+        "function": "torch.ops.aten.bitwise_not.default"
+      },
+      {
+        "line": 52105,
+        "function": "torch.ops.aten.reshape.default"
+      },
+      {
+        "line": 52110,
+        "function": "torch.ops.aten.reshape.default"
+      },
+      {
+        "line": 52131,
+        "function": "torch.ops.aten.index_select.default"
+      },
+      {
+        "line": 52154,
+        "function": "torch.ops.aten.reshape.default"
+      },
+      {
+        "line": 52158,
+        "function": "torch.ops.aten.repeat_interleave.self_int"
+      },
+      {
+        "line": 52180,
+        "function": "torch.ops.aten.reshape.default"
+      },
+      {
+        "line": 52184,
+        "function": "torch.ops.aten.bmm.default"
+      },
+      {
+        "line": 52224,
+        "function": "torch.ops.aten.reshape.default"
+      },
+      {
+        "line": 52229,
+        "function": "torch.ops.aten.index_select.default"
+      },
+      {
+        "line": 52253,
+        "function": "torch.ops.aten.reshape.default"
+      },
+      {
+        "line": 52257,
+        "function": "torch.ops.aten.repeat_interleave.self_int"
+      },
+      {
+        "line": 52279,
+        "function": "torch.ops.aten.reshape.default"
+      },
+      {
+        "line": 52283,
+        "function": "torch.ops.aten.bmm.default"
+      }
+    ],
+    "external_call_counts": {
+      "torch.ops.aten.arange.default": 1,
+      "torch.ops.aten.bitwise_not.default": 1,
+      "torch.ops.aten.reshape.default": 7,
+      "torch.ops.aten.index_select.default": 2,
+      "torch.ops.aten.repeat_interleave.self_int": 2,
+      "torch.ops.aten.bmm.default": 2
+    },
+    "generated_fused_calls": [
+      {
+        "line": 52080,
+        "function": "autofused_lt_unsqueeze_70e2ba464c6b2708bd56d34c431c5b49"
+      },
+      {
+        "line": 52102,
+        "function": "autofused__to_copy_1ee9ff1011dfdfcb8aa0dcc454e9f472"
+      },
+      {
+        "line": 52125,
+        "function": "autofused__to_copy_837307805a1d44229873c9695360470d"
+      },
+      {
+        "line": 52152,
+        "function": "autofused_clone_permute_view_71338d28ec16b8962f0ab2d4ec569464"
+      },
+      {
+        "line": 52177,
+        "function": "autofused__to_copy_432a7c14e84d6d5a17755ea46b3b1c40"
+      },
+      {
+        "line": 52221,
+        "function": "autofused__softmax_masked_fill_matmul_mul_d3aee2296efb8ae7a2ec39c0c9410b8d"
+      },
+      {
+        "line": 52251,
+        "function": "autofused_clone_permute_view_71338d28ec16b8962f0ab2d4ec569464"
+      },
+      {
+        "line": 52276,
+        "function": "autofused__to_copy_432a7c14e84d6d5a17755ea46b3b1c40"
+      },
+      {
+        "line": 52309,
+        "function": "autofused__to_copy_matmul_squeeze_55bc26605f76ac22f7029d44da439864"
+      }
+    ],
+    "generated_fused_call_count": 9,
+    "unique_generated_functions": 7,
+    "scope": "Static wrapper call sites, not measured device kernel launches. Reshape can be a view."
+  },
+  "logs": {
+    "pypto2.log": {
+      "original_sha256": "5af8b66aed26ec09c7877cb997ddc1ae2110a03228ddf1f241edfdda571aae31",
+      "lines": [
+        "{\"diagnostics\": {\"q_buffer_unchanged\": false, \"q_buffer_max_error\": 6.103515625e-05, \"k_buffer_unchanged\": false, \"v_buffer_unchanged\": false, \"max_abs_error\": 0.7950679659843445, \"pre_update_attention_max_abs_error\": 0.0001582503318786621}}",
+        "{\"log_dir\": \"output/output_20260907_052431_815400_ubuntu_0000892653\", \"frontend_verify_enabled\": true, \"cache_view_rebind\": false}",
+        "Traceback (most recent call last):",
+        "  File \"${WORKSPACE}/.npu-stack/tests/smoke_paged_pypto2.py\", line 107, in <module>",
+        "    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-2)",
+        "  File \"${WORKSPACE}/.venvs/base/lib/python3.12/site-packages/torch/testing/_comparison.py\", line 1600, in assert_close",
+        "    raise error_metas[0].to_error(msg)",
+        "AssertionError: Tensor-likes are not close!",
+        "",
+        "Mismatched elements: 2982 / 4096 (72.8%)",
+        "Greatest absolute difference: 0.7950679659843445 at index (0, 0, 83) (up to 0.001 allowed)",
+        "Greatest relative difference: 123.95682525634766 at index (3, 0, 98) (up to 0.01 allowed)",
+        "[ERROR] 2026-09-07-05:24:48 (PID:892653, Device:0, RankID:-1) ERR99999 UNKNOWN applicaiton exception"
+      ]
+    },
+    "pypto2-original-interpreter.log": {
+      "original_sha256": "4a0e393162be398ed1e5f3746b25d9b82fef9ea3bbfdd7a6037b7fe91cd17b10",
+      "lines": [
+        "[2026-09-07 05:24:42][EVENT][tid:892653] tensor_graph Verify for 14 data view list index 0 result NO_COMPARE",
+        "[2026-09-07 05:24:42][EVENT][tid:892653] tensor_graph Verify for 14 data view list index 1 result NO_COMPARE",
+        "[2026-09-07 05:24:42][EVENT][tid:892653] tensor_graph Verify for 14 data view list index 2 result NO_COMPARE",
+        "[2026-09-07 05:24:42][EVENT][tid:892653] tensor_graph Verify for 14 data view list index 3 result NO_COMPARE",
+        "[2026-09-07 05:24:42][EVENT][tid:892653] tensor_graph Verify for 14 data view list index 4 result NO_COMPARE",
+        "[2026-09-07 05:24:42][EVENT][tid:892653] tensor_graph Verify for 14 data view list index 5 result NO_COMPARE",
+        "[2026-09-07 05:24:42][EVENT][tid:892653] tensor_graph Verify for 14 data view list index 6 result NO_COMPARE",
+        "[2026-09-07 05:24:42][EVENT][tid:892653] tensor_graph Verify for 14 data view list index 7 result NO_COMPARE",
+        "[2026-09-07 05:24:42][EVENT][tid:892653] tensor_graph Verify for 14 data view list index 8 result NO_COMPARE",
+        "[2026-09-07 05:24:42][EVENT][tid:892653] tensor_graph Verify for 14 data view list index 9 result NO_COMPARE",
+        "[2026-09-07 05:24:42][EVENT][tid:892653] tensor_graph Verify for 14 data view list index 10 result NO_COMPARE",
+        "[2026-09-07 05:24:42][EVENT][tid:892653] tensor_graph Verify for 14 data view list index 11 result NO_COMPARE",
+        "[2026-09-07 05:24:42][EVENT][tid:892653] tensor_graph Verify for 14 data view list index 12 result NO_COMPARE",
+        "[2026-09-07 05:24:42][EVENT][tid:892653] tensor_graph Verify for 14 data view list index 13 result PASS"
+      ]
+    },
+    "pypto2-rebind.log": {
+      "original_sha256": "a11862cd8d6eaf77cd63955f4d8946ae8a7b7bd31f1e6532441e34e2ee5463b8",
+      "lines": [
+        "{\"diagnostics\": {\"q_buffer_unchanged\": false, \"q_buffer_max_error\": 6.103515625e-05, \"k_buffer_unchanged\": false, \"v_buffer_unchanged\": false, \"max_abs_error\": 0.0002454519271850586, \"pre_update_attention_max_abs_error\": 0.7952229380607605}}",
+        "{\"log_dir\": \"output/output_20260907_052330_967913_ubuntu_0000883508\", \"frontend_verify_enabled\": true, \"cache_view_rebind\": true}",
+        "{\"status\": \"PASS\", \"source\": \"${WORKSPACE}/.npu-stack/paged-attention/pypto2_rebound_cache.py\", \"mode\": \"prolog + KV append + PA\", \"B\": 4, \"Hq\": 8, \"Hkv\": 1, \"D\": 128, \"page_size\": 128, \"lengths\": [127, 128, 129, 513], \"max_abs_error\": 0.0002454519271850586, \"cache_view_rebind\": true}"
+      ]
+    },
+    "pypto2-rebind-interpreter.log": {
+      "original_sha256": "0137df2faa3b650bc9afd87969611daa1d4dbee167dabbd8f4a919babb9dbf5c",
+      "lines": [
+        "[2026-09-07 05:23:41][EVENT][tid:883508] tensor_graph Verify for 14 data view list index 0 result NO_COMPARE",
+        "[2026-09-07 05:23:41][EVENT][tid:883508] tensor_graph Verify for 14 data view list index 1 result NO_COMPARE",
+        "[2026-09-07 05:23:41][EVENT][tid:883508] tensor_graph Verify for 14 data view list index 2 result NO_COMPARE",
+        "[2026-09-07 05:23:41][EVENT][tid:883508] tensor_graph Verify for 14 data view list index 3 result NO_COMPARE",
+        "[2026-09-07 05:23:41][EVENT][tid:883508] tensor_graph Verify for 14 data view list index 4 result NO_COMPARE",
+        "[2026-09-07 05:23:41][EVENT][tid:883508] tensor_graph Verify for 14 data view list index 5 result NO_COMPARE",
+        "[2026-09-07 05:23:41][EVENT][tid:883508] tensor_graph Verify for 14 data view list index 6 result NO_COMPARE",
+        "[2026-09-07 05:23:41][EVENT][tid:883508] tensor_graph Verify for 14 data view list index 7 result NO_COMPARE",
+        "[2026-09-07 05:23:41][EVENT][tid:883508] tensor_graph Verify for 14 data view list index 8 result NO_COMPARE",
+        "[2026-09-07 05:23:41][EVENT][tid:883508] tensor_graph Verify for 14 data view list index 9 result NO_COMPARE",
+        "[2026-09-07 05:23:41][EVENT][tid:883508] tensor_graph Verify for 14 data view list index 10 result NO_COMPARE",
+        "[2026-09-07 05:23:41][EVENT][tid:883508] tensor_graph Verify for 14 data view list index 11 result NO_COMPARE",
+        "[2026-09-07 05:23:41][EVENT][tid:883508] tensor_graph Verify for 14 data view list index 12 result NO_COMPARE",
+        "[2026-09-07 05:23:41][EVENT][tid:883508] tensor_graph Verify for 14 data view list index 13 result PASS"
+      ]
+    },
+    "pypto2-pro.log": {
+      "original_sha256": "9dcb243da852aa70867c28d9e67bd47f0473e214d23dd03d1bd88f7be89d9137",
+      "lines": [
+        "{\"case\": \"existing_paged_prefill\", \"status\": \"PASS\", \"page_sizes\": [128, 256, 512]}",
+        "{\"case\": \"single_token_decode\", \"status\": \"PASS\", \"B\": 4, \"Hq\": 8, \"Hkv\": 2, \"D\": 128, \"page_size\": 128, \"lengths\": [127, 128, 129, 513], \"max_abs_error\": 0.0}"
+      ]
+    },
+    "cannbot-decode.log": {
+      "original_sha256": "647e50e800bd56df7720f22c808ac71b8989a0ddbbdec0288bd0a6fbc187eb67",
+      "lines": [
+        "test_flash_attn_noquant_paged (B=4,N1=9,N2=1,S1=1,S2=512,D=128) finished!",
+        "{\"status\": \"PASS\", \"mode\": \"single_token_decode\", \"B\": 4, \"Hq\": 9, \"Hkv\": 1, \"D\": 128, \"page_size\": 128, \"lengths\": [512, 512, 512, 512]}"
+      ]
+    },
+    "pypto3.log": {
+      "original_sha256": "cd5b7466289fdfa008a54bc7ab572c368c5939e8d1a924890c4b06da43cf8905",
+      "lines": [
+        "============================= test session starts ==============================",
+        "platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- ${WORKSPACE}/.venvs/pypto3/bin/python",
+        "cachedir: .pytest_cache",
+        "rootdir: ${WORKSPACE}/pypto3/pypto",
+        "configfile: pyproject.toml",
+        "plugins: forked-1.7.5, xdist-3.8.0",
+        "collecting ... collected 11 items / 9 deselected / 2 selected",
+        "",
+        "tests/st/runtime/framework_and_models/test_paged_attention.py::TestPagedAttentionKernels::test_paged_attention_ptoas[64-16-128-128-8192-32768] PASSED [ 50%]",
+        "[DEVICE] tests/st/runtime/framework_and_models/test_paged_attention.py::TestPagedAttentionKernels::test_paged_attention_ptoas[64-16-128-128-8192-32768] -> device 0",
+        "",
+        "tests/st/runtime/framework_and_models/test_paged_attention.py::TestPagedAttentionKernels::test_paged_attention_unaligned_ptoas[64-16-128-128-8100-32768] PASSED [100%]",
+        "[DEVICE] tests/st/runtime/framework_and_models/test_paged_attention.py::TestPagedAttentionKernels::test_paged_attention_unaligned_ptoas[64-16-128-128-8100-32768] -> device 0",
+        "",
+        "",
+        "=============================== warnings summary ===============================",
+        "../../.venvs/base/lib/python3.12/site-packages/torch/jit/_script.py:362: 14 warnings",
+        "  ${WORKSPACE}/.venvs/base/lib/python3.12/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.",
+        "    warnings.warn(",
+        "",
+        "-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html",
+        "- generated xml file: ${WORKSPACE}/.npu-stack/paged-attention/pypto3.xml -",
+        "======================= per-device test count (2 total) ========================",
+        "  device   0: 2 tests",
+        "================ 2 passed, 9 deselected, 14 warnings in 21.02s ================="
+      ]
+    },
+    "triton.log": {
+      "original_sha256": "e39a78a0584ba7c606304df0a07115799ca39ec134ef5ab13993395df51ea9f4",
+      "lines": [
+        "============================= test session starts ==============================",
+        "platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- ${WORKSPACE}/.venvs/triton/bin/python",
+        "cachedir: .pytest_cache",
+        "rootdir: ${WORKSPACE}/triton-ascend/triton-ascend-kernels",
+        "configfile: pyproject.toml",
+        "plugins: xdist-3.6.1, forked-1.7.5",
+        "collecting ... collected 10 items / 2 deselected / 8 selected",
+        "",
+        "triton-ascend/triton-ascend-kernels/tests/attention/test_paged_attention.py::TestPagedAttention::test_accuracy_paged_attention[16-seq_lens0-history_lens0-8-2-32-48] PASSED",
+        "triton-ascend/triton-ascend-kernels/tests/attention/test_paged_attention.py::TestPagedAttention::test_accuracy_paged_attention[16-seq_lens0-history_lens0-8-2-32-32] PASSED",
+        "triton-ascend/triton-ascend-kernels/tests/attention/test_paged_attention.py::TestPagedAttention::test_accuracy_paged_attention[16-seq_lens0-history_lens0-2-2-32-48] PASSED",
+        "triton-ascend/triton-ascend-kernels/tests/attention/test_paged_attention.py::TestPagedAttention::test_accuracy_paged_attention[16-seq_lens0-history_lens0-2-2-32-32] PASSED",
+        "triton-ascend/triton-ascend-kernels/tests/attention/test_paged_attention.py::TestPagedAttention::test_accuracy_paged_attention[16-seq_lens1-history_lens1-8-2-32-48] PASSED",
+        "triton-ascend/triton-ascend-kernels/tests/attention/test_paged_attention.py::TestPagedAttention::test_accuracy_paged_attention[16-seq_lens1-history_lens1-8-2-32-32] PASSED",
+        "triton-ascend/triton-ascend-kernels/tests/attention/test_paged_attention.py::TestPagedAttention::test_accuracy_paged_attention[16-seq_lens1-history_lens1-2-2-32-48] PASSED",
+        "triton-ascend/triton-ascend-kernels/tests/attention/test_paged_attention.py::TestPagedAttention::test_accuracy_paged_attention[16-seq_lens1-history_lens1-2-2-32-32] PASSED",
+        "",
+        "- generated xml file: ${WORKSPACE}/.npu-stack/paged-attention/triton.xml -",
+        "======================= 8 passed, 2 deselected in 34.21s ======================="
+      ]
+    },
+    "cannbot.log": {
+      "original_sha256": "9ccd670b1baaf04f6fe3940198452f89d98ffad7a749350c297e5e0be3c24f16",
+      "lines": [
+        "============================= test session starts ==============================",
+        "platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- ${WORKSPACE}/.venvs/cannbot/bin/python",
+        "cachedir: .pytest_cache",
+        "rootdir: ${WORKSPACE}/cannbot_dsl/cannbot-dsl",
+        "configfile: pyproject.toml",
+        "plugins: forked-1.7.5, xdist-3.8.0",
+        "collecting ... collected 36 items / 34 deselected / 2 selected",
+        "",
+        "cannbot_dsl/cannbot-dsl/examples/flash_attn_noquant/test_flash_attn_noquant.py::test_flash_attn_noquant_paged[4-36-36-256-1024-128] PASSED [ 50%]",
+        "cannbot_dsl/cannbot-dsl/examples/flash_attn_noquant/test_flash_attn_noquant.py::test_flash_attn_noquant_paged[4-9-1-1024-1024-128] PASSED [100%]",
+        "",
+        "- generated xml file: ${WORKSPACE}/.npu-stack/paged-attention/cannbot.xml -",
+        "====================== 2 passed, 34 deselected in 14.20s ======================="
+      ]
+    },
+    "replay-pypto2-rebind.log": {
+      "original_sha256": "5078d069fed7137503aff9666f4da45b067d7cdabab15a0e98dc92087e01966b",
+      "lines": [
+        "Route: pypto2_rebind; physical NPU: 4; logs: ${WORKSPACE}/.npu-stack/paged-attention/replays/20260907T063647-pypto2_rebind-1508049",
+        "{\"diagnostics\": {\"q_buffer_unchanged\": false, \"q_buffer_max_error\": 6.103515625e-05, \"k_buffer_unchanged\": false, \"v_buffer_unchanged\": false, \"max_abs_error\": 0.0002454519271850586, \"pre_update_attention_max_abs_error\": 0.7952229380607605}}",
+        "{\"log_dir\": \"output/output_20260907_063722_876901_ubuntu_0001508148\", \"frontend_verify_enabled\": true, \"cache_view_rebind\": true}",
+        "{\"status\": \"PASS\", \"source\": \"${WORKSPACE}/.npu-stack/paged-attention/pypto2_rebound_cache.py\", \"mode\": \"prolog + KV append + PA\", \"B\": 4, \"Hq\": 8, \"Hkv\": 1, \"D\": 128, \"page_size\": 128, \"lengths\": [127, 128, 129, 513], \"max_abs_error\": 0.0002454519271850586, \"cache_view_rebind\": true}"
+      ]
+    }
+  },
+  "pypto2_local_patch": [
+    "--- a/python/tests/st/test_ctrl_cpu_perf.py",
+    "+++ b/python/tests/st/test_ctrl_cpu_perf.py",
+    "@@ -138,6 +138,9 @@",
+    "         pypto.set_vec_tile_shapes(bs_tile, _D)",
+    "         k_cache.move(pypto.scatter_update(k_cache_2d, -2, index_view, k_row))",
+    "         v_cache.move(pypto.scatter_update(v_cache_2d, -2, index_view, k_row))",
+    "+",
+    "+    k_cache_2d = pypto.reshape(k_cache, kv_2d_shape, inplace=True)",
+    "+    v_cache_2d = pypto.reshape(v_cache, kv_2d_shape, inplace=True)",
+    " ",
+    "     q_2d = pypto.reshape(q_tmp, [b * n1, _D], inplace=True)",
+    "     pypto.set_pass_options(cube_l1_reuse_setting={0: 4})"
+  ],
+  "driver_source_snapshots": {
+    "smoke_paged_pypto2.py": {
+      "original_sha256": "73896b6204dfd3b9aac9efb0255bb41767f56c3eb75503669de3736a1817e6e2",
+      "lines": [
+        "\"\"\"Validate PA inside the existing ordinary PyPTO2 multi-stage program.",
+        "",
+        "The unmodified program currently returns attention over the pre-update cache",
+        "on A5, while its frontend interpreter includes the appended values.",
+        "MEGA_PYPTO2_REBIND=1 tests a local copy with cache views rebuilt after the update.",
+        "MEGA_PYPTO2_VERIFY=1 also checks the frontend tensor graph.",
+        "\"\"\"",
+        "import importlib.util",
+        "import json",
+        "import os",
+        "from pathlib import Path",
+        "import sys",
+        "",
+        "import torch",
+        "import torch_npu",
+        "import pypto",
+        "",
+        "root = Path(os.environ[\"MEGA_ROOT\"])",
+        "artifact_dir = Path(os.environ.get(\"MEGA_PA_RESULT_DIR\", root / \".npu-stack/paged-attention\"))",
+        "source = root / \"pypto2/python/tests/st/test_ctrl_cpu_perf.py\"",
+        "rebind = os.environ.get(\"MEGA_PYPTO2_REBIND\") == \"1\"",
+        "loaded_source = root / \".npu-stack/paged-attention/pypto2_rebound_cache.py\" if rebind else source",
+        "spec = importlib.util.spec_from_file_location(\"ordinary_paged_attention\", loaded_source)",
+        "module = importlib.util.module_from_spec(spec)",
+        "sys.modules[spec.name] = module",
+        "spec.loader.exec_module(module)",
+        "torch.manual_seed(0)",
+        "torch.npu.set_device(0)",
+        "assert torch.npu.get_device_name(0).startswith(\"Ascend950\")",
+        "from pypto.config import set_global_config",
+        "set_global_config(\"codegen.parallel_compile\", 8)",
+        "",
+        "B, H, D, PAGE, PAGES = 4, 8, 128, 128, 8",
+        "lengths = torch.tensor([127, 128, 129, 513], dtype=torch.int32)",
+        "table = torch.randperm(B * PAGES + 11)[:B * PAGES].reshape(B, PAGES).int()",
+        "slots = torch.tensor([int(table[b, (int(lengths[b]) - 1) // PAGE]) * PAGE + (int(lengths[b]) - 1) % PAGE for b in range(B)], dtype=torch.int32)",
+        "x = torch.randn(B, 1024).half()",
+        "residual = torch.randn_like(x)",
+        "gamma, bias = torch.ones(1024).half(), torch.zeros(1024).half()",
+        "scale, offset = torch.ones(1024).half(), torch.zeros(1024).half()",
+        "weight = (torch.randn(1024, H * D) * 0.02).half()",
+        "q_tmp = torch.zeros(B, H * D).half()",
+        "k = torch.randn(B * PAGES + 11, PAGE, 1, D).half()",
+        "v = torch.randn_like(k)",
+        "out = torch.zeros(B * H, D).half()",
+        "host = [x, residual, gamma, bias, scale, offset, weight, q_tmp, k, v, table, lengths, slots, out]",
+        "device = [t.to(\"npu:0\") for t in host]",
+        "# Build both candidate references before running the program.",
+        "fused = x.float() + residual.float()",
+        "denom = ((fused * fused / 1024).sum(-1, keepdim=True) + 1e-5).sqrt()",
+        "norm = ((fused / denom) * gamma.float() + bias.float()).half()",
+        "quant = (norm.float() * scale.float() + offset.float()).half()",
+        "q_expected = (quant.float() @ weight.float()).half().reshape(B, H, D).float()",
+        "k_expected, v_expected = k.clone(), v.clone()",
+        "for b in range(B):",
+        "    k_expected.reshape(-1, D)[slots[b]] = q_expected[b, 0].half()",
+        "    v_expected.reshape(-1, D)[slots[b]] = q_expected[b, 0].half()",
+        "",
+        "",
+        "def attention_reference(keys_cache, values_cache):",
+        "    result = torch.empty(B, H, D)",
+        "    for b, length in enumerate(lengths.tolist()):",
+        "        pos = torch.arange(length)",
+        "        physical = table[b, pos // PAGE].long()",
+        "        keys = keys_cache[physical, pos % PAGE, 0].float()",
+        "        values = values_cache[physical, pos % PAGE, 0].float()",
+        "        prob = torch.softmax((q_expected[b] @ keys.T) * D**-0.5, -1)",
+        "        result[b] = prob @ values",
+        "    return result",
+        "",
+        "",
+        "pre_update_expected = attention_reference(k, v)",
+        "expected = attention_reference(k_expected, v_expected)",
+        "verify = os.environ.get(\"MEGA_PYPTO2_VERIFY\") == \"1\"",
+        "verify_options = {\"enable_pass_verify\": True, \"pass_verify_save_tensor\": True,",
+        "                  \"pass_verify_pass_filter\": []} if verify else None",
+        "if verify:",
+        "    pypto.set_verify_golden_data(goldens=[None] * 13 + [expected.reshape(B * H, D).half()])",
+        "",
+        "",
+        "@pypto.options(pass_options={\"enable_slice\": True}, verify_options=verify_options)",
+        "def run():",
+        "    module.ctrl_perf_kernel(*device, module._UNROLL_LIST, 1e-5)",
+        "",
+        "",
+        "run()",
+        "torch.npu.synchronize()",
+        "q_actual = device[7].cpu().reshape(B, H, D).float()",
+        "k_actual, v_actual = device[8].cpu(), device[9].cpu()",
+        "actual = device[-1].cpu().reshape(B, H, D).float()",
+        "diagnostics = {",
+        "    \"q_buffer_unchanged\": torch.equal(q_actual, q_tmp.reshape(B, H, D).float()),",
+        "    \"q_buffer_max_error\": (q_actual - q_expected).abs().max().item(),",
+        "    \"k_buffer_unchanged\": torch.equal(k_actual, k),",
+        "    \"v_buffer_unchanged\": torch.equal(v_actual, v),",
+        "    \"max_abs_error\": (actual - expected).abs().max().item(),",
+        "    \"pre_update_attention_max_abs_error\": (actual - pre_update_expected).abs().max().item(),",
+        "}",
+        "torch.save({\"inputs\": dict(zip((\"x\", \"residual\", \"gamma\", \"bias\", \"scale\", \"offset\", \"weight\", \"q_tmp\", \"k\", \"v\", \"table\", \"lengths\", \"slots\", \"out\"), host)),",
+        "            \"actual\": actual, \"expected\": expected, \"q_actual\": q_actual,",
+        "            \"q_expected\": q_expected, \"k_actual\": k_actual, \"v_actual\": v_actual,",
+        "            \"k_expected\": k_expected, \"v_expected\": v_expected,",
+        "            \"pre_update_expected\": pre_update_expected, \"diagnostics\": diagnostics},",
+        "           artifact_dir / f\"pypto2{'-rebind' if rebind else ''}-diagnostics.pt\")",
+        "print(json.dumps({\"diagnostics\": diagnostics}), flush=True)",
+        "print(json.dumps({\"log_dir\": pypto.pypto_impl.LogTopFolder(),",
+        "                  \"frontend_verify_enabled\": verify, \"cache_view_rebind\": rebind}), flush=True)",
+        "torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-2)",
+        "if verify:",
+        "    log = (Path(pypto.pypto_impl.LogTopFolder()) / \"verify/interpreter.log\").read_text()",
+        "    assert \"index 13 result PASS\" in log and \"result FAILED\" not in log, \"Check the interpreter log\"",
+        "print(json.dumps({\"status\": \"PASS\", \"source\": str(loaded_source), \"mode\": \"prolog + KV append + PA\", \"B\": B, \"Hq\": H, \"Hkv\": 1, \"D\": D, \"page_size\": PAGE, \"lengths\": lengths.tolist(), \"max_abs_error\": (actual - expected).abs().max().item(), \"cache_view_rebind\": rebind}), flush=True)"
+      ]
+    },
+    "smoke_paged_pypto2_pro.py": {
+      "original_sha256": "f3a3fd55caef6fd86b0b222be19492b98d0fbc8e8e6c2b7714f58ae21417b6c0",
+      "lines": [
+        "\"\"\"Run the existing Pro paged prefill tests and probe single-token decode.\"\"\"",
+        "import importlib.util",
+        "import json",
+        "import os",
+        "from pathlib import Path",
+        "import sys",
+        "",
+        "import torch",
+        "import torch_npu",
+        "",
+        "root = Path(os.environ[\"MEGA_ROOT\"])",
+        "source = root / \"pypto2/python/tests/st/pypto_pro/frontend/fa/test_flex_attention_prefill.py\"",
+        "spec = importlib.util.spec_from_file_location(\"pro_paged_attention\", source)",
+        "module = importlib.util.module_from_spec(spec)",
+        "sys.modules[spec.name] = module",
+        "spec.loader.exec_module(module)",
+        "torch.npu.set_device(0)",
+        "assert torch.npu.get_device_name(0).startswith(\"Ascend950\")",
+        "module.test_paged_block_sizes()",
+        "print(json.dumps({\"case\": \"existing_paged_prefill\", \"status\": \"PASS\", \"page_sizes\": [128, 256, 512]}), flush=True)",
+        "torch.manual_seed(0)",
+        "lengths = [127, 128, 129, 513]",
+        "status, error, mask, _ = module._run_case(\"npu:0\", [1] * 4, lengths, 8, 2, None, 28, module.ATOL_BF16)",
+        "assert status == \"PASS\", f\"decode failed: max_abs_error={error}\"",
+        "print(json.dumps({\"case\": \"single_token_decode\", \"status\": status, \"B\": 4, \"Hq\": 8, \"Hkv\": 2, \"D\": 128, \"page_size\": 128, \"lengths\": lengths, \"max_abs_error\": error}), flush=True)"
+      ]
+    },
+    "smoke_paged_cannbot_decode.py": {
+      "original_sha256": "6747cb60323106d1cbded81186e50a6d0c6b18381074da78624c2572b7e53265",
+      "lines": [
+        "\"\"\"Exercise the existing paged CANNBot kernel with one query token.\"\"\"",
+        "import json",
+        "import os",
+        "from pathlib import Path",
+        "import sys",
+        "",
+        "import torch",
+        "import torch_npu",
+        "",
+        "root = Path(os.environ[\"MEGA_ROOT\"])",
+        "sys.path.insert(0, str(root / \"cannbot_dsl/cannbot-dsl/examples/flash_attn_noquant\"))",
+        "from test_flash_attn_noquant import test_flash_attn_noquant_paged",
+        "",
+        "torch.manual_seed(0)",
+        "torch.npu.set_device(0)",
+        "assert torch.npu.get_device_name(0).startswith(\"Ascend950\")",
+        "test_flash_attn_noquant_paged(4, 9, 1, 1, 512, 128)",
+        "print(json.dumps({\"status\": \"PASS\", \"mode\": \"single_token_decode\", \"B\": 4, \"Hq\": 9, \"Hkv\": 1, \"D\": 128, \"page_size\": 128, \"lengths\": [512] * 4}), flush=True)"
+      ]
+    },
+    "smoke_paged_autofuse.py": {
+      "original_sha256": "0b6478aef46cd690bd658c68e8678daad4aeba8bdf9416e61096915861df5d5d",
+      "lines": [
+        "\"\"\"Run the comparison document's padded PA graph through AutoFuse/Inductor.",
+        "",
+        "This is a graph capability probe, not a standalone native PA kernel claim.",
+        "\"\"\"",
+        "import json",
+        "import os",
+        "from pathlib import Path",
+        "",
+        "import torch",
+        "import torch_npu",
+        "import inductor_npu_ext",
+        "from torch._inductor.codegen.common import get_scheduling_for_device",
+        "",
+        "",
+        "def paged_decode_padded(q, k, v, block_table, actual_seq_len):",
+        "    b, hq, d = q.shape",
+        "    hkv, page = k.shape[1], k.shape[2]",
+        "    max_pages = block_table.shape[1]",
+        "    capacity = max_pages * page",
+        "    group = hq // hkv",
+        "    ids = block_table.reshape(-1).long()",
+        "    keys = k.index_select(0, ids).reshape(b, max_pages, hkv, page, d)",
+        "    vals = v.index_select(0, ids).reshape(b, max_pages, hkv, page, d)",
+        "    keys = keys.permute(0, 2, 1, 3, 4).reshape(b, hkv, capacity, d)",
+        "    vals = vals.permute(0, 2, 1, 3, 4).reshape(b, hkv, capacity, d)",
+        "    keys = keys.repeat_interleave(group, dim=1).float()",
+        "    vals = vals.repeat_interleave(group, dim=1).float()",
+        "    score = torch.matmul(q.float().unsqueeze(-2), keys.transpose(-2, -1)) * d**-0.5",
+        "    valid = torch.arange(capacity, device=q.device)[None, :] < actual_seq_len[:, None]",
+        "    score = score.masked_fill(~valid[:, None, None, :], -torch.inf)",
+        "    result = torch.matmul(torch.softmax(score, dim=-1), vals).squeeze(-2)",
+        "    return result.to(q.dtype)",
+        "",
+        "",
+        "def reference(q, k, v, table, lengths):",
+        "    b, hq, d = q.shape",
+        "    hkv, page = k.shape[1:3]",
+        "    result = torch.empty_like(q)",
+        "    for batch, length in enumerate(lengths.tolist()):",
+        "        pos = torch.arange(length)",
+        "        physical = table[batch, pos // page].long()",
+        "        for head in range(hq):",
+        "            keys = k[physical, head // (hq // hkv), pos % page].float()",
+        "            vals = v[physical, head // (hq // hkv), pos % page].float()",
+        "            prob = torch.softmax((keys @ q[batch, head].float()) * d**-0.5, 0)",
+        "            result[batch, head] = prob @ vals",
+        "    return result",
+        "",
+        "",
+        "torch.manual_seed(0)",
+        "torch.npu.set_device(0)",
+        "assert torch.npu.get_device_name(0).startswith(\"Ascend950\")",
+        "assert get_scheduling_for_device(\"npu\").__module__.startswith(\"inductor_npu_ext\")",
+        "B, HQ, HKV, D, PAGE, MAX_PAGES, POOL = 3, 40, 8, 128, 128, 5, 19",
+        "q = torch.randn(B, HQ, D).bfloat16()",
+        "k = torch.randn(POOL, HKV, PAGE, D).bfloat16()",
+        "v = torch.randn_like(k)",
+        "table = torch.randint(POOL, (B, MAX_PAGES), dtype=torch.int32)",
+        "device = [t.to(\"npu:0\") for t in (q, k, v, table)]",
+        "compiled = torch.compile(paged_decode_padded, backend=\"inductor\", fullgraph=True, dynamic=False)",
+        "cases = []",
+        "for seq_lens in ([1, 129, 513], [127, 128, 512]):",
+        "    lengths = torch.tensor(seq_lens, dtype=torch.int32)",
+        "    actual = compiled(*device, lengths.to(\"npu:0\"))",
+        "    torch.npu.synchronize()",
+        "    actual = actual.cpu()",
+        "    expected = reference(q, k, v, table, lengths)",
+        "    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)",
+        "    cases.append({\"lengths\": seq_lens, \"max_abs_error\": (actual.float() - expected.float()).abs().max().item()})",
+        "assert get_scheduling_for_device(\"npu\").__module__.startswith(\"inductor_npu_ext\")",
+        "print(json.dumps({\"status\": \"PASS\", \"mode\": \"document graph capability probe\", \"B\": B, \"Hq\": HQ, \"Hkv\": HKV, \"D\": D, \"page_size\": PAGE, \"cases\": cases, \"artifacts_dir\": os.environ[\"TORCHINDUCTOR_CACHE_DIR\"]}), flush=True)"
+      ]
+    }
+  },
+  "replay_script": [
+    "#!/usr/bin/env bash",
+    "# Repeat one recorded PA check in a fresh stack environment on a physical NPU.",
+    "set -e -o pipefail",
+    "",
+    "pa_root=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")/../..\" && pwd)\"",
+    "pa_route=\"${1:-}\"",
+    "pa_device=\"${2:-4}\"",
+    "case \"$pa_route\" in",
+    "    pypto2|pypto2_rebind|pypto2_pro) pa_stack=pypto2 ;;",
+    "    pypto3|cannbot|triton|autofuse) pa_stack=\"$pa_route\" ;;",
+    "    *) printf 'Usage: %s {pypto2|pypto2_rebind|pypto2_pro|pypto3|cannbot|triton|autofuse} [PHYSICAL_NPU=4]\\n' \"$0\" >&2; exit 2 ;;",
+    "esac",
+    "",
+    "source \"$pa_root/.npu-stack/activate.sh\" \"$pa_stack\" \"$pa_device\"",
+    "pa_run_dir=\"$pa_root/.npu-stack/paged-attention/replays/$(date -u +%Y%m%dT%H%M%S)-$pa_route-$$\"",
+    "mkdir -p \"$pa_run_dir\"",
+    "export MEGA_PA_RESULT_DIR=\"$pa_run_dir\"",
+    "export ASCEND_PROCESS_LOG_PATH=\"$pa_run_dir/ascend-logs\"",
+    "printf 'Route: %s; physical NPU: %s; logs: %s\\n' \"$pa_route\" \"$pa_device\" \"$pa_run_dir\"",
+    "cd \"$pa_root\"",
+    "",
+    "case \"$pa_route\" in",
+    "    pypto2|pypto2_rebind)",
+    "        export MEGA_PYPTO2_VERIFY=1",
+    "        export MEGA_PYPTO2_REBIND=0",
+    "        if [[ \"$pa_route\" == pypto2_rebind ]]; then",
+    "            export MEGA_PYPTO2_REBIND=1",
+    "        else",
+    "            printf 'Reproducing the unmodified program; the recorded A5 KV-append check fails.\\n'",
+    "        fi",
+    "        cd \"$pa_run_dir\"",
+    "        timeout 600 python \"$pa_root/.npu-stack/tests/smoke_paged_pypto2.py\" 2>&1 | tee \"$pa_run_dir/test.log\"",
+    "        ;;",
+    "    pypto2_pro)",
+    "        cd \"$pa_run_dir\"",
+    "        timeout 600 python \"$pa_root/.npu-stack/tests/smoke_paged_pypto2_pro.py\" 2>&1 | tee \"$pa_run_dir/test.log\"",
+    "        ;;",
+    "    pypto3)",
+    "        cd \"$pa_root/pypto3/pypto\"",
+    "        source .claude/skills/testing/load-env.sh > \"$pa_run_dir/loader.log\"",
+    "        timeout 600 python -m pytest -v tests/st/runtime/framework_and_models/test_paged_attention.py \\",
+    "            --platform=a5 --device=0 --precompile-workers=\"${PYPTO_BUILD_JOBS:-2}\" \\",
+    "            -k 'test_paged_attention_ptoas or test_paged_attention_unaligned_ptoas' \\",
+    "            --junitxml=\"$pa_run_dir/results.xml\" 2>&1 | tee \"$pa_run_dir/test.log\"",
+    "        ;;",
+    "    cannbot)",
+    "        timeout 600 python -m pytest -v cannbot_dsl/cannbot-dsl/examples/flash_attn_noquant/test_flash_attn_noquant.py \\",
+    "            -k 'test_flash_attn_noquant_paged and not aot and not masked and not 4096' \\",
+    "            --junitxml=\"$pa_run_dir/results.xml\" 2>&1 | tee \"$pa_run_dir/test.log\"",
+    "        timeout 600 python .npu-stack/tests/smoke_paged_cannbot_decode.py 2>&1 | tee \"$pa_run_dir/decode.log\"",
+    "        ;;",
+    "    triton)",
+    "        export TRITON_CACHE_DIR=\"$pa_run_dir/cache/triton\"",
+    "        timeout 600 python -m pytest -v triton-ascend/triton-ascend-kernels/tests/attention/test_paged_attention.py \\",
+    "            -k test_accuracy_paged_attention --junitxml=\"$pa_run_dir/results.xml\" \\",
+    "            2>&1 | tee \"$pa_run_dir/test.log\"",
+    "        ;;",
+    "    autofuse)",
+    "        export TORCHINDUCTOR_NPU_EXT_DEBUG=''",
+    "        export TORCHINDUCTOR_CACHE_DIR=\"$pa_run_dir/cache/inductor\"",
+    "        export TORCHINDUCTOR_NPU_EXT_CACHE_DIR=\"$pa_run_dir/cache/ascendc\"",
+    "        export TRITON_CACHE_DIR=\"$pa_run_dir/cache/triton\"",
+    "        export TORCH_COMPILE_DEBUG_DIR=\"$pa_run_dir/cache/debug\"",
+    "        timeout 600 python .npu-stack/tests/smoke_paged_autofuse.py 2>&1 | tee \"$pa_run_dir/test.log\"",
+    "        ;;",
+    "esac"
+  ],
+  "junit": {
+    "triton": "<?xml version=\"1.0\" encoding=\"utf-8\"?><testsuites name=\"pytest tests\"><testsuite name=\"pytest\" errors=\"0\" failures=\"0\" skipped=\"0\" tests=\"8\" time=\"34.209\" timestamp=\"2026-09-07T05:01:46.145395+00:00\" hostname=\"ubuntu\"><testcase classname=\"tests.attention.test_paged_attention.TestPagedAttention\" name=\"test_accuracy_paged_attention[16-seq_lens0-history_lens0-8-2-32-48]\" time=\"22.618\" /><testcase classname=\"tests.attention.test_paged_attention.TestPagedAttention\" name=\"test_accuracy_paged_attention[16-seq_lens0-history_lens0-8-2-32-32]\" time=\"0.968\" /><testcase classname=\"tests.attention.test_paged_attention.TestPagedAttention\" name=\"test_accuracy_paged_attention[16-seq_lens0-history_lens0-2-2-32-48]\" time=\"1.028\" /><testcase classname=\"tests.attention.test_paged_attention.TestPagedAttention\" name=\"test_accuracy_paged_attention[16-seq_lens0-history_lens0-2-2-32-32]\" time=\"1.060\" /><testcase classname=\"tests.attention.test_paged_attention.TestPagedAttention\" name=\"test_accuracy_paged_attention[16-seq_lens1-history_lens1-8-2-32-48]\" time=\"2.652\" /><testcase classname=\"tests.attention.test_paged_attention.TestPagedAttention\" name=\"test_accuracy_paged_attention[16-seq_lens1-history_lens1-8-2-32-32]\" time=\"1.071\" /><testcase classname=\"tests.attention.test_paged_attention.TestPagedAttention\" name=\"test_accuracy_paged_attention[16-seq_lens1-history_lens1-2-2-32-48]\" time=\"1.161\" /><testcase classname=\"tests.attention.test_paged_attention.TestPagedAttention\" name=\"test_accuracy_paged_attention[16-seq_lens1-history_lens1-2-2-32-32]\" time=\"1.074\" /></testsuite></testsuites>",
+    "pypto3": "<?xml version=\"1.0\" encoding=\"utf-8\"?><testsuites name=\"pytest tests\"><testsuite name=\"pytest\" errors=\"0\" failures=\"0\" skipped=\"0\" tests=\"2\" time=\"21.013\" timestamp=\"2026-09-07T05:03:21.651167+00:00\" hostname=\"ubuntu\"><testcase classname=\"tests.st.runtime.framework_and_models.test_paged_attention.TestPagedAttentionKernels\" name=\"test_paged_attention_ptoas[64-16-128-128-8192-32768]\" time=\"11.532\" /><testcase classname=\"tests.st.runtime.framework_and_models.test_paged_attention.TestPagedAttentionKernels\" name=\"test_paged_attention_unaligned_ptoas[64-16-128-128-8100-32768]\" time=\"9.265\" /></testsuite></testsuites>",
+    "cannbot": "<?xml version=\"1.0\" encoding=\"utf-8\"?><testsuites name=\"pytest tests\"><testsuite name=\"pytest\" errors=\"0\" failures=\"0\" skipped=\"0\" tests=\"2\" time=\"14.205\" timestamp=\"2026-09-07T05:04:39.179592+00:00\" hostname=\"ubuntu\"><testcase classname=\"examples.flash_attn_noquant.test_flash_attn_noquant\" name=\"test_flash_attn_noquant_paged[4-36-36-256-1024-128]\" time=\"6.415\" /><testcase classname=\"examples.flash_attn_noquant.test_flash_attn_noquant\" name=\"test_flash_attn_noquant_paged[4-9-1-1024-1024-128]\" time=\"5.563\" /></testsuite></testsuites>"
+  }
+}
