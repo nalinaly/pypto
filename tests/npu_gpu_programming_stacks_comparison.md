@@ -5333,17 +5333,17 @@ GPU bundle的`origin_url`标识上游来源，不保证fork commit可在上游Gi
 
 ### 14.1 相似性判断的依据与适用范围
 
-按本章优先级，H 首先选 D，I 首先选 H，D 首先选 H。B/D 同样在显式核内资源与流水责任上相近，但 D 使用 MLIR Host/Device 链和 Channel，B 使用共享 PyPTO2 基础 IR 上的 block版操作与 TileGroup；D/H 则同时接近 NPU 显式资源和较早 MLIR 入口这两个维度。局部相似性与整体选择的权重不同，因此不要求双向匹配。
+按本章优先级，H（CATLASS DSL） 首先选 D（CANNBot DSL），I（CuTe DSL） 首先选 H（CATLASS DSL），D（CANNBot DSL） 首先选 H（CATLASS DSL）。B（PyPTO2-block版）/D（CANNBot DSL） 同样在显式核内资源与流水责任上相近，但 D（CANNBot DSL） 使用 MLIR Host/Device 链和 Channel，B（PyPTO2-block版） 使用共享 PyPTO2 基础 IR 上的 block版操作与 TileGroup；D（CANNBot DSL）/H（CATLASS DSL） 则同时接近 NPU 显式资源和较早 MLIR 入口这两个维度。局部相似性与整体选择的权重不同，因此不要求双向匹配。
 
 | 对象 / 比较角度 | 相似对象 | 理由与边界 |
 | --- | --- | --- |
-| H 的整体执行与核内责任 | **D（CANNBot DSL）** | 同为 NPU 显式硬件/内存/流水 + 较早进入 MLIR + Host launch；H 的 TLA/HIVM 链、D 的 CANNIR/AscendC 与 Host staging 不同 |
-| I 的整体核内编程责任 | **H（CATLASS DSL）** | Python 元编程、显式 layout/搬运/矩阵与流水、直接 kernel artifact/launch 相近；I 的 GPU 线程/warp 与 TS、H 的 AIC/AIV/物理 tag 仍有显著差异 |
-| D 的整体架构与核内责任 | **H**；B 也是同硬件参照 | D/H 同时接近显式资源与 MLIR 主链；若优先比较 TileGroup/Channel 的作者责任，B/D 也很相近 |
-| H/I 仅看 layout 和 Python 接口 | **互为重点比较对象** | 不能从名字相近推出 layout 代数同等覆盖、代码血缘或后端兼容 |
-| H 仅看下游编译基础设施 | **F 的 AscendNPU-IR 路径** | 输入抽象、已完成的物理分解、固定版本与 launch metadata 不同 |
-| I 的 TS 与 A/C 的任务系统 | **按粒度对照，不能合为同一整体家族** | 单 kernel 的 warp/资源协议，与跨计算入口的设备任务依赖/派发分别减少不同工程工作 |
+| H（CATLASS DSL） 的整体执行与核内责任 | **D（CANNBot DSL）** | 同为 NPU 显式硬件/内存/流水 + 较早进入 MLIR + Host launch；H（CATLASS DSL） 的 TLA/HIVM 链、D（CANNBot DSL） 的 CANNIR/AscendC 与 Host staging 不同 |
+| I（CuTe DSL） 的整体核内编程责任 | **H（CATLASS DSL）** | Python 元编程、显式 layout/搬运/矩阵与流水、直接 kernel artifact/launch 相近；I（CuTe DSL） 的 GPU 线程/warp 与 TS、H（CATLASS DSL） 的 AIC/AIV/物理 tag 仍有显著差异 |
+| D（CANNBot DSL） 的整体架构与核内责任 | **H（CATLASS DSL）**；B（PyPTO2-block版） 也是同硬件参照 | D（CANNBot DSL）/H（CATLASS DSL） 同时接近显式资源与 MLIR 主链；若优先比较 TileGroup/Channel 的作者责任，B（PyPTO2-block版）/D（CANNBot DSL） 也很相近 |
+| H（CATLASS DSL）/I（CuTe DSL） 仅看 layout 和 Python 接口 | **互为重点比较对象** | 不能从名字相近推出 layout 代数同等覆盖、代码血缘或后端兼容 |
+| H（CATLASS DSL） 仅看下游编译基础设施 | **F（Triton-Ascend） 的 AscendNPU-IR 路径** | 输入抽象、已完成的物理分解、固定版本与 launch metadata 不同 |
+| I（CuTe DSL） 的 TS 与 A（PyPTO2-tensor版）/C（PyPTO3（Simpler）） 的任务系统 | **按粒度对照，不能合为同一整体家族** | 单 kernel 的 warp/资源协议，与跨计算入口的设备任务依赖/派发分别减少不同工程工作 |
 
-九路线覆盖 **A/C 的程序与任务组织、B/D/H 的显式 NPU 核内工程、F/G 的 Inductor kernel 生成、E 的 PyPTO/GPU 接口，以及 I 的 CuTe layout/warp/persistent 工具**。这些实现分别说明 megaKernel 的不同层次：“程序级推进、单 kernel 合作、片上数据复用、最终性能”需要各自的证据，不能相互替代。
+九路线覆盖 **A（PyPTO2-tensor版）/C（PyPTO3（Simpler）） 的程序与任务组织、B（PyPTO2-block版）/D（CANNBot DSL）/H（CATLASS DSL） 的显式 NPU 核内工程、F（Triton-Ascend）/G（AutoFuse + Inductor） 的 Inductor kernel 生成、E（PyPTO on GPU） 的 PyPTO/GPU 接口，以及 I（CuTe DSL） 的 CuTe layout/warp/persistent 工具**。这些实现分别说明 megaKernel 的不同层次：“程序级推进、单 kernel 合作、片上数据复用、最终性能”需要各自的证据，不能相互替代。
 
-九路线的有向选择为 **A→C、B→D、C→A、D→H、E→F、F→G、G→F、H→D、I→H**。D/H/I 的判断依据是显式资源、Host/kernel 边界与实际编译链；B/D 的同硬件核内责任比较见第 4.9 节。这些选择不依据名字、未测性能或相同 ISA。[H-dsl] [H-passes] [H-api-layout] [I-dsl] [I-layout] [I-task]
+九路线的有向选择为 **A（PyPTO2-tensor版）→C（PyPTO3（Simpler））、B（PyPTO2-block版）→D（CANNBot DSL）、C（PyPTO3（Simpler））→A（PyPTO2-tensor版）、D（CANNBot DSL）→H（CATLASS DSL）、E（PyPTO on GPU）→F（Triton-Ascend）、F（Triton-Ascend）→G（AutoFuse + Inductor）、G（AutoFuse + Inductor）→F（Triton-Ascend）、H（CATLASS DSL）→D（CANNBot DSL）、I（CuTe DSL）→H（CATLASS DSL）**。D（CANNBot DSL）/H（CATLASS DSL）/I（CuTe DSL） 的判断依据是显式资源、Host/kernel 边界与实际编译链；B（PyPTO2-block版）/D（CANNBot DSL） 的同硬件核内责任比较见第 4.9 节。这些选择不依据名字、未测性能或相同 ISA。[H-dsl] [H-passes] [H-api-layout] [I-dsl] [I-layout] [I-task]
