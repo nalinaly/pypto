@@ -1,10 +1,16 @@
 # NPU / GPU 九种编程与编译执行路径：分层解剖、用户表达与技术相似性
 
-核对日期：2026-09-07。本文以编程模型、编译执行分层、megaKernel 性能机会及工程代价的分析为主体；A5 实测用于给这些分析提供具体的验证对象与边界。源码来源固定到 GitHub/GitCode commit，CANNBot DSL 继续引用本地代码。已有 GPU profiling 保留为历史实验记录，本次 A5 的环境、PA 结果和复跑入口补充在第 12 章。
+核对日期：2026-09-07。本文以编程模型、编译执行分层、megaKernel 性能机会及工程代价的分析为主体；A5 实测用于给这些分析提供具体的验证对象与边界。源码来源固定到 GitHub/GitCode commit，CANNBot DSL 引用本地代码。GPU profiling 来自历史实验；A5 环境、PA 结果和复跑入口见第 12 章。
 
 本文面向项目经理、技术主管、开发者、客户和测试人员，目的在于建立可用于技术分析及后续管理讨论的共同事实基础，而不是选择“获胜团队”。关注顺序为：技术相似性、megaKernel 可达成性、用户感知、表达能力、优化空间、动态能力、开发成本。
 
-**范围约定：**原称 PyPTO（Simpler）的路线，全文改称 **PyPTO3（Simpler）**；这是本文命名，当前对应工作区的 `pypto3/pypto`。graph-autofusion **只纳入 AutoFuse，排除 SuperKernel**，后者的静态多 kernel 重组能力不计入本文任何能力判断。`pypto-lib` 是 PyPTO3 的算子 / 模型库，不单列路线。新增 **H（CATLASS DSL）** 与 **I（CuTe DSL）**，原 A—G 的编号、讨论和实验保留；总览及逐路线主表统一覆盖 A—I；重点路线专题、历史实验及各自适用范围继续保留。H 特指 CATLASS 的 Python TLA DSL，不能将整个 CATLASS C++ 库的能力计入；I 特指 NVIDIA CuTe DSL，不能与 E 的 TensorIR / CUDA Tile IR 路径混同。H 的本机验证见第 12 章；I 本次仅核对源码，未在 NVIDIA GPU 执行。
+**比较范围：**A—I 九条路线按相同的编程、编译和执行层次比较，各自的源码及实验适用范围分别标注。
+
+- **A（PyPTO2-tensor版）** 对应 `pypto2/python/pypto`；**B（PyPTO2-block版）** 对应同仓的 `python/pypto_pro`。
+- **PyPTO3（Simpler）** 对应 `pypto3/pypto`；`pypto-lib` 是其算子 / 模型库，不单列路线。
+- **graph-autofusion 仅比较 AutoFuse，排除 SuperKernel**；SuperKernel 的静态多 kernel 重组能力不计入本文任何能力判断。
+- **H（CATLASS DSL）** 特指 CATLASS 的 Python TLA DSL，不能将整个 CATLASS C++ 库的能力计入。本机验证见第 12 章。
+- **I（CuTe DSL）** 特指 NVIDIA CuTe DSL，不能与 E 的 TensorIR / CUDA Tile IR 路径混同。其分析依据源码，未在 NVIDIA GPU 上执行验证。
 
 阅读导航：[主结论](#conclusions) → [softmax / paged decode 用户示例](#examples) → [Python 前端与 API 能力边界](#frontend-capabilities) → [分层架构](#layers) → [两组重点架构对比](#focused-comparisons) → [MLIR 专章](#mlir) → [megaKernel：性能、代价与差距](#megakernel) → [动态 scheduler 的真实收益边界](#scheduler-performance) → [动态 shape：谁写 tiling、具体怎么写](#dynamic-tiling) → [用户怎样实现核内融合与片上复用](#intra-kernel-fusion) → [GPU launch](#gpu-launch) → [替代及共用边界](#replacement) → 验证与源码 → [最后的逐项“最相似者”](#nearest)。
 
@@ -15,8 +21,8 @@
 
 | 标识（名称） | 具体范围 | 核心定位 | 主要执行组织 |
 | --- | --- | --- | --- |
-| A（PyPTO2-普通版） | `pypto2/python/pypto` + `framework` | Tensor 程序编译、自有 IR、TileFwk 任务体系 | 设备侧控制 / 依赖解析 / 任务派发 |
-| B（PyPTO2-Pro） | 同仓 `python/pypto_pro` | 显式 Tile / 核内编程，自有 IR → CCE | Host 直接 launch 多核 kernel；kernel 内划分工作 |
+| A（PyPTO2-tensor版） | `pypto2/python/pypto` + `framework` | Tensor 程序编译、自有 IR、TileFwk 任务体系 | 设备侧控制 / 依赖解析 / 任务派发 |
+| B（PyPTO2-block版） | 同仓 `python/pypto_pro` | 显式 Tile / 核内编程，自有 IR → CCE | Host 直接 launch 多核 kernel；kernel 内划分工作 |
 | C（PyPTO3（Simpler）） | `pypto3/pypto` + `runtime`；用户例子优先 `pypto3/pypto-lib` | 多层程序 / InCore / Orchestration + PTOAS + Simpler | 任务图；也能把混合核 SPMD kernel 作为一个多 block task |
 | D（CANNBot DSL） | `cannbot_dsl/cannbot-dsl`，补充 `cannbot_dsl/cannbot-arena` | Python 分阶段 Host / Device 编程，MLIR CANNIR → AscendC | Host launch；用户显式内存、Channel 和核内流水 |
 | E（PyPTO on GPU） | `PyPTO-LOVE-TensorIR` 集成层及 source lock 固定的 PyPTO 源码 bundle | PyPTO 前端 / 自有 IR → 受支持模式 → NVIDIA TensorIR / CUDA Tile IR | PyPTO GPU runtime 直接 CUDA launch；硬件安排 CTA |
@@ -25,20 +31,20 @@
 | H（CATLASS DSL） | `catlass/python/tla_dsl/catlass/catlass_dsl`，公共 API 为 `catlass.tla`；示例 `python/tla_dsl/examples` | Python 显式 tile / 物理 layout / Cube / Vector 编程；TLA MLIR → AscendNPU-IR → CANN | 编译 kernel 后由 Host 调用产物；支持 AIC/AIV mixed kernel，例子自行安排工作与同步 |
 | I（CuTe DSL） | `cutlass/python/CuTeDSL`；示例 `examples/python/CuTeDSL` | Python layout 代数、线程/值分区、Copy/MMA atom、异步流水；CuTe MLIR → NVVM / cubin | Host JIT / CUDA launch；CTA/cluster 内合作，另有 persistent tile scheduler 与实验性 Task Scheduling |
 
-前三个“PyPTO”必须按上述代码位置识别：A（PyPTO2-普通版）/B（PyPTO2-Pro） 同仓共享基础设施；C（PyPTO3（Simpler）） 不等于 A（PyPTO2-普通版）；E（PyPTO on GPU） 使用的是另一份 PyPTO checkout，不能把 C（PyPTO3（Simpler）） 的所有新能力直接投射到 E（PyPTO on GPU）。
+前三个“PyPTO”必须按上述代码位置识别：A（PyPTO2-tensor版）/B（PyPTO2-block版） 同仓共享基础设施；C（PyPTO3（Simpler）） 不等于 A（PyPTO2-tensor版）；E（PyPTO on GPU） 使用的是另一份 PyPTO checkout，不能把 C（PyPTO3（Simpler）） 的所有新能力直接投射到 E（PyPTO on GPU）。
 
 ### 1.2 十项最重要的判断
 
-以下十项在原 A—G 分析基础上纳入 H/I，按相同责任层比较；第 1.5 节进一步展开 H/I 的作用。局部相似组不排除其他路线，第 14 章的单一选择按九条路线统一判断。
+以下十项按相同责任层比较九条路线。局部相似组不排除其他路线；H/I 的具体定位见第 1.5 节，各路线按整体架构选择的最相似者见第 14 章。
 
-1. **A（PyPTO2-普通版） 与 C（PyPTO3（Simpler）） 最接近的是“程序 / 任务系统”层。** 两者可用设备侧执行体系组织多个计算阶段，但 A（PyPTO2-普通版） 的 TileFwk runtime 不是 C（PyPTO3（Simpler）） 的 Simpler。
-2. **B（PyPTO2-Pro） 与 D（CANNBot DSL） 最接近的是“显式核内工程”层。** 用户较直接地承担物理 tile、核间分工、尾块、流水及局部资源选择；二者并不共享同一个 IR 或后端。H（CATLASS DSL）也直接落在这一责任层，且与 D 都较早进入 MLIR；I（CuTe DSL）则把相近责任落实到 GPU layout/atom/warp，物理协议需另外比较。
+1. **A（PyPTO2-tensor版） 与 C（PyPTO3（Simpler）） 最接近的是“程序 / 任务系统”层。** 两者可用设备侧执行体系组织多个计算阶段，但 A（PyPTO2-tensor版） 的 TileFwk runtime 不是 C（PyPTO3（Simpler）） 的 Simpler。
+2. **B（PyPTO2-block版） 与 D（CANNBot DSL） 最接近的是“显式核内工程”层。** 用户较直接地承担物理 tile、核间分工、尾块、流水及局部资源选择；二者并不共享同一个 IR 或后端。H（CATLASS DSL）也直接落在这一责任层，且与 D 都较早进入 MLIR；I（CuTe DSL）则把相近责任落实到 GPU layout/atom/warp，物理协议需另外比较。
 3. **F（Triton-Ascend） 与 G（AutoFuse + Inductor） 最接近的是“PyTorch → Inductor → 自生成 NPU kernel”的集成位置。** F（Triton-Ascend） 还拥有明确的独立 kernel DSL；G（AutoFuse + Inductor） 没有同等定位的终端用户 kernel DSL，但不是“没有用户入口”。H 的 Python TLA DSL 与 torch_npu 中名为 CATLASS 的 C++ 模板接入应分开，I 的 tensor bridge 也不自动成为通用 Inductor backend。
 4. **E（PyPTO on GPU） 的前端血缘接近 C（PyPTO3（Simpler）），当前执行与核内编译分工更接近 F（Triton-Ascend）。** E（PyPTO on GPU） 没有把 Simpler scheduler 移植为 GPU runtime；多 SM 主要来自一个 launch 内的多个 CTA。I 同样采用 CUDA launch，但作者显式安排 layout/atom/线程分区；这使其核内控制面与 E 不同，也不共享 E 的历史实测。
 5. **PTOAS、AscendNPU-IR、NVIDIA TensorIR、AscendC 不能与上述九条上层路径当作平级替代品。** 前三者是不同层次的编译基础设施；AscendC 主要是设备编程 API / 库及配套编译接口，不是任务调度框架。
-6. **MLIR 和 SSA 不是对立选项；MLIR 的表示能力、已实现 pass 和运行时能力也不是同一件事。** A（PyPTO2-普通版）/B（PyPTO2-Pro）/C（PyPTO3（Simpler））/E（PyPTO on GPU） 的前端可以使用自有 SSA IR；C（PyPTO3（Simpler）） 在后端交 PTO dialect MLIR，E（PyPTO on GPU） 交 TensorIR；D（CANNBot DSL）/F（Triton-Ascend） 在更长的编译区间使用 MLIR；G（AutoFuse + Inductor） 的 ASCIR 图不是因为名字有 IR 就成为 MLIR。H 的 TLA→HIVM/AVE 与 I 的 CuTe→NVVM 都有具体 MLIR 链，前者共享部分 NPU 下游，后者仍有独立的 CUDA 目标与配套编译组件。
-7. **Pro 以 SPMD kernel 为主，PyPTO3 的外层则支持 MPMD 任务编排；两者不是互斥标签。** C（PyPTO3（Simpler）） 的 `pypto-lib` 已有多 block、混合 Cube/Vector、带显式任务依赖的 SPMD attention；框架与其中一个 kernel 的执行方式属于不同层。第 4.10 节展开用户分工、设备派发及组合边界。H 的 AIC/AIV 分工、I 的 warp 专门化也能在单个合作 kernel 内异构执行；I 的 TS 资源任务与 C 的模型任务属于不同粒度。
-8. **动态 shape 不必要求客户另写 tiling 函数。** B（PyPTO2-Pro）/D（CANNBot DSL）/F（Triton-Ascend） 可以在固定物理 tile 上循环并处理有效长度；G（AutoFuse + Inductor） 会生成 Host tiling；A（PyPTO2-普通版）/C（PyPTO3（Simpler）） 也仍然存在 tiling 决策，甚至有显式 tiling task。H/I 同样不普遍要求注册式 Host tiler，但作者仍需区分动态逻辑范围、编译期物理资源和设备工作分配；H 的 MMAD 动态复用与 FA 常量特化不能合并记账。
+6. **MLIR 和 SSA 不是对立选项；MLIR 的表示能力、已实现 pass 和运行时能力也不是同一件事。** A（PyPTO2-tensor版）/B（PyPTO2-block版）/C（PyPTO3（Simpler））/E（PyPTO on GPU） 的前端可以使用自有 SSA IR；C（PyPTO3（Simpler）） 在后端交 PTO dialect MLIR，E（PyPTO on GPU） 交 TensorIR；D（CANNBot DSL）/F（Triton-Ascend） 在更长的编译区间使用 MLIR；G（AutoFuse + Inductor） 的 ASCIR 图不是因为名字有 IR 就成为 MLIR。H 的 TLA→HIVM/AVE 与 I 的 CuTe→NVVM 都有具体 MLIR 链，前者共享部分 NPU 下游，后者仍有独立的 CUDA 目标与配套编译组件。
+7. **block版 以 SPMD kernel 为主，PyPTO3 的外层则支持 MPMD 任务编排；两者不是互斥标签。** C（PyPTO3（Simpler）） 的 `pypto-lib` 已有多 block、混合 Cube/Vector、带显式任务依赖的 SPMD attention；框架与其中一个 kernel 的执行方式属于不同层。第 4.10 节展开用户分工、设备派发及组合边界。H 的 AIC/AIV 分工、I 的 warp 专门化也能在单个合作 kernel 内异构执行；I 的 TS 资源任务与 C 的模型任务属于不同粒度。
+8. **动态 shape 不必要求客户另写 tiling 函数。** B（PyPTO2-block版）/D（CANNBot DSL）/F（Triton-Ascend） 可以在固定物理 tile 上循环并处理有效长度；G（AutoFuse + Inductor） 会生成 Host tiling；A（PyPTO2-tensor版）/C（PyPTO3（Simpler）） 也仍然存在 tiling 决策，甚至有显式 tiling task。H/I 同样不普遍要求注册式 Host tiler，但作者仍需区分动态逻辑范围、编译期物理资源和设备工作分配；H 的 MMAD 动态复用与 FA 常量特化不能合并记账。
 9. **“一层 Transformer 一个算子”必须同时验收组织方式、性能与代价。** 一个入口、一次提交、设备任务图、一个物理 kernel、消除中间 GM 不能互相替代证明。极致性能取决于权重/KV 访问、跨阶段重分片、局部效率、同步及负载均衡；第 6 章逐路线拆解已有实现、性能机会、用户责任与工程差距。
 10. **当前没有足以给九条路线做性能名次的同口径实验。** 本文可以判断已有实现、可行的组合边界和可能代价，不能据源码长度、MLIR 使用量、launch 数或核心利用率推导谁更快。
 
@@ -48,10 +54,10 @@
 
 | 重叠区域 | 主要对象 | 可以讨论的共用物 | 不能据此推出 |
 | --- | --- | --- | --- |
-| 设备任务图、依赖、逻辑任务 ABI、运行时诊断 | A（PyPTO2-普通版）、C（PyPTO3（Simpler）） | 任务描述契约、依赖测试集、诊断事件模型 | 两套 scheduler 直接替换 |
-| Tile / Vector / Cube 语义、流水与片上资源 | B（PyPTO2-Pro）、C（PyPTO3（Simpler）） 的 InCore、D（CANNBot DSL）、F（Triton-Ascend） 的后端、G（AutoFuse + Inductor） 的 kernel 生成 | 算子语义、资源描述、效应 / 生命周期模型、正确性用例 | 现有内存规划 pass 可不改就共用 |
+| 设备任务图、依赖、逻辑任务 ABI、运行时诊断 | A（PyPTO2-tensor版）、C（PyPTO3（Simpler）） | 任务描述契约、依赖测试集、诊断事件模型 | 两套 scheduler 直接替换 |
+| Tile / Vector / Cube 语义、流水与片上资源 | B（PyPTO2-block版）、C（PyPTO3（Simpler）） 的 InCore、D（CANNBot DSL）、F（Triton-Ascend） 的后端、G（AutoFuse + Inductor） 的 kernel 生成 | 算子语义、资源描述、效应 / 生命周期模型、正确性用例 | 现有内存规划 pass 可不改就共用 |
 | Inductor 接入、分组、外部算子边界、符号 shape | F（Triton-Ascend）、G（AutoFuse + Inductor） | FX/Inductor 测试、wrapper / profiling 约定、fallback 分类 | 两者生成相同 kernel 或共享全部 lowering |
-| 形状专门化、缓存、tile 选择和直接 launch | B（PyPTO2-Pro）、D（CANNBot DSL）、E（PyPTO on GPU）、F（Triton-Ascend）、G（AutoFuse + Inductor） | 编译产物 manifest、缓存键要求、launch 记录 | 编译缓存或二进制 ABI 已兼容 |
+| 形状专门化、缓存、tile 选择和直接 launch | B（PyPTO2-block版）、D（CANNBot DSL）、E（PyPTO on GPU）、F（Triton-Ascend）、G（AutoFuse + Inductor） | 编译产物 manifest、缓存键要求、launch 记录 | 编译缓存或二进制 ABI 已兼容 |
 | 最底层目标代码生成 | PTOAS 的末端、AscendNPU-IR 的末端、CCE / AscendC 工具链、GPU tile 编译器 | 硬件语义和指令级验证 | NPU / GPU 指令或内存层次可统一成一份实现 |
 | Python layout、显式搬运/矩阵与局部资源协议 | H（CATLASS DSL）、I（CuTe DSL）；与 B/D 的核内责任交叉 | tile/资源/异步效应描述、尾块与生命周期用例 | H 的物理 tag 等于 CuTe layout 代数，或 NPU CV 等于 GPU warp/TMA。[H-api-layout] [I-layout] [I-task] |
 | MLIR 下游、编译产物与直接 launch | H 与 F 的部分 AscendNPU-IR 基础设施；I 与 E 的 CUDA artifact/launch 分工 | 固定版本、IR 输入契约、manifest/cache 与 launch 诊断约定 | H/F 使用同一完整 pipeline，或 I 已集成为 E 的后端。[H-passes] [H-execution] [I-compiler] [I-executor] |
@@ -60,30 +66,30 @@
 
 ### 1.4 关键疑问与专题入口
 
-- **设备 scheduler 是否使 megaKernel 更容易？** 有助于组织和推进整层，但 PyPTO2-普通版也有设备任务体系；性能还取决于分解、核内质量、GM 和调度成本，见第 6.13 节。
-- **普通版是否把 tile 交给用户？** 是：Vector/Cube tile、split-K、view/loop/valid_shape 和 `sg_set_scope` 均可控制；与 PyPTO3 显式 InCore/TaskId/SPMD 边界的区别见第 4.8 节。
-- **Pro、PyPTO3 与 CANNBot 哪里相近？** Pro 与 CANNBot 更接近显式核内工程；与 PyPTO3 相近的是核内子域，不是完整任务体系。TileGroup/Channel、前端及后端差异见第 4.9—4.10 节。
+- **设备 scheduler 是否使 megaKernel 更容易？** 有助于组织和推进整层，但 PyPTO2-tensor版也有设备任务体系；性能还取决于分解、核内质量、GM 和调度成本，见第 6.13 节。
+- **tensor版是否把 tile 交给用户？** 是：Vector/Cube tile、split-K、view/loop/valid_shape 和 `sg_set_scope` 均可控制；与 PyPTO3 显式 InCore/TaskId/SPMD 边界的区别见第 4.8 节。
+- **block版、PyPTO3 与 CANNBot 哪里相近？** block版 与 CANNBot 更接近显式核内工程；与 PyPTO3 相近的是核内子域，不是完整任务体系。TileGroup/Channel、前端及后端差异见第 4.9—4.10 节。
 - **Python 前端与 API 是否完整？** 九条路线都有 Python 使用入口，但 DSL/构图层次不同；不能据此宣称覆盖全部 Vector/Cube/Tensor Core 指令组合。第 2.9—2.12 节按 API、lowering、目标支持和验证分层。
 - **怎样让连续 Vector 计算不经中间 GM？** 九条路线在各自支持域内均有源码路径，用户写法见第 8 章；同一核内区域、消除显式中间 GM、进一步减少 UB/片上读写须分别验收。
 
 - **CATLASS / CuTe 与既有路线怎样同层比较？** H 与 B/D 对照显式 NPU 资源责任，与 F 对照下游编译；I 与 H 对照 layout/流水，与 E 对照 CUDA 编译/launch。动态 layout、persistent/CLC、warp TS 各自的边界见第 4.13、6.14、7.15、8.12 节。
 
-### 1.5 纳入 CATLASS DSL / CuTe DSL 后，哪些判断需要扩展
+### 1.5 CATLASS DSL / CuTe DSL 的定位与能力边界
 
-1. **显式核内工程增加了 H/I 两个具体对象。** H 与 B/D 在 NPU 的物理 tile、搬运、混合核与同步责任上相近；H 与 I 则在 Python 元编程、显式 layout/tensor 和编译产物调用的思路上形成新的比较组。H 的 layout tag / `origin_shape` 与 I 的通用 layout 组合、线程—值分区不能按 API 名字一一替换。[H-api-layout] [I-layout]
+1. **H/I 都强调显式核内工程，硬件控制对象不同。** H 与 B/D 在 NPU 的物理 tile、搬运、混合核与同步责任上相近；H 与 I 则在 Python 元编程、显式 layout/tensor 和编译产物调用的思路上相近。H 的 layout tag / `origin_shape` 与 I 的通用 layout 组合、线程—值分区不能按 API 名字一一替换。[H-api-layout] [I-layout]
 2. **“有设备 scheduler”必须注明调度粒度。** H 的 FA 用 `block_idx/block_num` 做固定步长任务循环，StreamK 另有工作切分及归并；I 有静态 persistent、CLC 动态 tile 分配以及 warp 级 Task Scheduling。它们为第 6 章提供了有用的中间形态，但都不能直接当成 A/C 的整层任务 runtime。[H-fa] [H-streamk] [I-static] [I-dynamic] [I-task]
-3. **MLIR 前后端的比较增加两条独立实链。** H 有可定位的 TLA passes，并依赖 CATLASS 固定的 AscendNPU-IR 子模块；I 的 Python 源码明确调用 `cute-to-nvvm`，使用独立配套编译组件。H 不走 PTOAS，I 不走 E 的 TensorIR emitter；同用 MLIR 不说明后端、ABI 或 pass 已兼容。[H-passes] [H-ir-build] [I-dsl] [I-requirements]
+3. **H/I 采用不同的 MLIR 编译链。** H 有可定位的 TLA passes，并依赖 CATLASS 固定的 AscendNPU-IR 子模块；I 的 Python 源码明确调用 `cute-to-nvvm`，使用独立配套编译组件。H 不走 PTOAS，I 不走 E 的 TensorIR emitter；同用 MLIR 不说明后端、ABI 或 pass 已兼容。[H-passes] [H-ir-build] [I-dsl] [I-requirements]
 4. **Attention 示例分别证明不同组合。** H 是连续 KV 的 online-softmax FlashAttention；I 找到分页 MLA decode，以及另一套连续 GQA decode。后者的 simple 版本在同一个 JIT 入口中 launch decode 和 reduction 两个 kernel。标准 GQA PA、分页 MLA、连续 FA 的能力不能互相冒充。[H-fa] [I-mla] [I-gqa]
-5. **原有理论目标不变，证据对象更丰富。** 片上预算、全局归约、重分片、负载均衡和调度开销仍按第 6—8 章分析；新增源码使“可能怎样实现”更具体。本轮没有九条路线的同口径性能实验，也没有据此证明整层单物理 kernel 已完成。
+5. **局部实现与整层性能需要分别评估。** H/I 的源码为片上预算、全局归约、重分片、负载均衡和调度开销提供具体实现参照，分析见第 6—8 章。目前没有九条路线的同口径性能实验，也没有整层单物理 kernel 已完成的证明。
 
 <a id="examples"></a>
 ## 2. 用户表达：先用相同计算问题比较
 
 ### 2.1 示例口径与完整性
 
-本章保留数学参考、原生 kernel、Host 调用及源码入口，按下列四类标注完整性。**本章的代码示例用于展示表达方式与责任划分；已执行的 A5 PA 对象逐项列于第 12 章，不能把某个用例通过扩展为本章所有代码、shape 或融合模式都已验证。**“完整代码”不等于“已实测”，注明“摘录”的代码仍依赖所列上下文。版权与许可证以原文件为准。
+本章提供数学参考、原生 kernel、Host 调用及源码入口，按下列四类标注完整性。**本章的代码示例用于展示表达方式与责任划分；已执行的 A5 PA 对象逐项列于第 12 章，不能把某个用例通过扩展为本章所有代码、shape 或融合模式都已验证。**“完整代码”不等于“已实测”，注明“摘录”的代码仍依赖所列上下文。版权与许可证以原文件为准。
 
-源码摘录、整理后的用户写法、数学参考继续保留各自上下文。源码链接指向当前核对版本，历史 GPU 脚本与记录另指向原文归档；第 13 章同时保留旧环境版本及本次 A5 版本，避免把不同 checkout 的实验混为一谈。
+源码摘录、整理后的用户写法和数学参考分别注明上下文。源码链接指向核对版本，历史 GPU 脚本与记录指向实验归档；第 13 章分别列出 GPU 与 A5 环境版本，避免把不同 checkout 的实验混为一谈。
 
 - **完整语义参考**：普通 Python / PyTorch，可用于构造 golden；不代表会自动融合成一个 kernel。
 - **源码中的完整实现**：提供原文件、入口和适用边界。
@@ -150,8 +156,8 @@ y_j = exp(x_j - m) / l
 
 | 路径 | 实际用户表达 | 尾轴 / 尾块 | 超长 reduce 的工程动作 |
 | --- | --- | --- | --- |
-| A（PyPTO2-普通版） | Tensor 的 max/sub/exp/sum/div，设置 vec tile，写 `pypto.loop` | 动态标记、view 的 valid_shape、编译器 tiling | 调整 tile / reduce 分解；检查生成的子图和 task，不能只数 Python 运算 |
-| B（PyPTO2-Pro） | TileType、物理存储、load/store、row reduce、显式 core-stride | `DYNAMIC` + `set_validshape`；物理 TileType 上限仍固定 | 在同一 kernel 写分段循环或设计多核归并；可加 Host 策略但不强制另写 TilingFunc |
+| A（PyPTO2-tensor版） | Tensor 的 max/sub/exp/sum/div，设置 vec tile，写 `pypto.loop` | 动态标记、view 的 valid_shape、编译器 tiling | 调整 tile / reduce 分解；检查生成的子图和 task，不能只数 Python 运算 |
+| B（PyPTO2-block版） | TileType、物理存储、load/store、row reduce、显式 core-stride | `DYNAMIC` + `set_validshape`；物理 TileType 上限仍固定 | 在同一 kernel 写分段循环或设计多核归并；可加 Host 策略但不强制另写 TilingFunc |
 | C（PyPTO3（Simpler）） | `pl.parallel` + `CORE_GROUP` 中的 tensor/tile 运算；也可显式多 InCore | bind 动态维、slice/load 有效窗口、编译器核内 lowering | 选择核内循环、多个 task 或 SPMD task；任务依赖与局部算法分别设计 |
 | D（CANNBot DSL） | UB Buffer / Channel、reduce/expand、显式搬运，Host `@jit` 调 kernel | 动态 TensorSpec 与有效访问 / padding；Channel 物理容量仍需约束 | 分段 UB 流水，必要时 GM partial 与多 kernel / 显式同步 |
 | E（PyPTO on GPU） | PyPTO 图经当前支持的 pattern 编译；已有五阶段实验为五个 executable | 当前高层集成主要是静态 shape / stride 专门化 | 必须确认 emitter 支持该模式；NPU 写法不能直接保证 GPU 可编译 |
@@ -160,9 +166,9 @@ y_j = exp(x_j - m) / l
 | H（CATLASS DSL） | 现有 FA 子过程显式分配 UB 状态，在 `vec.func` 中写 max/exp/sum 与在线更新 | 固定物理块配合有效范围、寄存器 mask；本例全零输入 mask，不是完整 mask 支持验收 | 作者组织分块统计、重读/状态合并、CV 交接；不能把连续 FA 当独立通用 softmax 或 PA 已验证。[H-fa] |
 | I（CuTe DSL） | 教程八种 softmax，作者选择线程/值分区、shuffle/shared 归约及输出策略 | tile、线程数、mask 与编译常量由示例约定；本机只核对源码 | kernel 8 在线统计后重读输入；`range_constexpr` 展开也会带来编译/代码体积成本，不是任意长行的自动最优策略。[I-softmax] |
 
-#### A（PyPTO2-普通版）：完整用户入口的典型写法
+#### A（PyPTO2-tensor版）：完整用户入口的典型写法
 
-以下依据普通版 softmax 示例整理，展示动态 batch 与五个数学步骤。完整原文件包含数据生成、golden、运行参数：[A12（PyPTO2-普通版）]。
+以下依据tensor版 softmax 示例整理，展示动态 batch 与五个数学步骤。完整原文件包含数据生成、golden、运行参数：[A12（PyPTO2-tensor版）]。
 
 ```python
 import pypto
@@ -183,9 +189,9 @@ def softmax_pypto2(
 
 这里 `DYNAMIC` 只明确标在第一轴，`...` 不是“其他轴都动态”的声明。将普通参数取值改掉、将轴声明为动态、改物理 tile，是三种不同修改。
 
-#### B（PyPTO2-Pro）：双动态 softmax 已有完整测试，但“动态”有物理上限
+#### B（PyPTO2-block版）：双动态 softmax 已有完整测试，但“动态”有物理上限
 
-原文件 [B14（PyPTO2-Pro）] 含 kernel、参数生成、多核 launch 和六组 golden case。下面保留常量、双缓冲地址与**完整 kernel**，补齐导入：
+原文件 [B14（PyPTO2-block版）] 含 kernel、参数生成、多核 launch 和六组 golden case。下面保留常量、双缓冲地址与**完整 kernel**，补齐导入：
 
 ```python
 import pypto_pro.language as pl
@@ -678,13 +684,13 @@ max_reg_p1 = tmp_reg_p1.reduce(tla.ReductionOp.MAX, mask=pregFull)
 
 `experimental/primitives/tutorial/06_softmax.py` 包含逐线程串行、一行一 CTA、warp shuffle、warp + shared memory、online 等八种写法，以及 Host launcher。它使第 2.2 节关于“长行不必整体驻留片上”的理论有了另一组完整源文件，但本次未运行这些 CUDA kernel。[I-softmax]
 
-| 源码中的策略 | 用户要安排什么 | 与原文分析的联系 |
+| 源码中的策略 | 用户要安排什么 | 对应的分析维度 |
 | --- | --- | --- |
 | 一线程处理一行 | 线程/行索引，列遍历，max/sum/normalize | 容量可以小，行数不足时并行度可能不足 |
 | 一 CTA 处理一行 | 每线程列子集、shared partial、CTA barrier | 行内并行与跨行并行分开；单 CTA 归约不需要跨 CTA 全局 barrier |
 | online + warp + shared（kernel 8） | 每线程维护 `(max,sum)`，shuffle 合并，再经 shared 合并各 warp，最后再次遍历输出 | 在线合并节约暂存需求；不同 warp 的 sum 必须按共同最大值修正，不能直接相加 |
 
-这里还有值得保留的反例：教程前面的某些实现把 exp 中间值写入输出 GM 后再读取；kernel 8 主要保留归约状态，最后重读输入产生结果。因此 **“都在一个 `@cute.kernel` 里”不等于具有相同 GM 流量**。此外，不同实现把 N/C 作为运行时元数据或 `Constexpr` 的方式不同，不能对八个变体统一宣称动态 shape。教程开头的限制性注释也只作为该教程上下文，完整语言能力仍以当前 DSL 实现为准。[I-softmax] [I-dsl]
+一个具体反例是：教程前面的某些实现把 exp 中间值写入输出 GM 后再读取；kernel 8 主要保留归约状态，最后重读输入产生结果。因此 **“都在一个 `@cute.kernel` 里”不等于具有相同 GM 流量**。此外，不同实现把 N/C 作为运行时元数据或 `Constexpr` 的方式不同，不能对八个变体统一宣称动态 shape。教程开头的限制性注释也只作为该教程上下文，完整语言能力仍以当前 DSL 实现为准。[I-softmax] [I-dsl]
 
 kernel 8 具体把 C 作为 `Constexpr` 并使用 `range_constexpr` 遍历列。它说明有限归约状态的算法能够表达，不能直接证明超长行时编译成本和代码体积也理想；分段循环是否展开，是第 7 章动态与特化分析需要继续控制的另一项成本。[I-softmax]
 
@@ -810,7 +816,7 @@ o_new = alpha*o + P_i @ V[page_id]
 
 | 决策 | Tensor / task 路线 | 显式核内路线 | Triton 路线 | AutoFuse 客户路线 | H（CATLASS DSL，现有连续 FA） | I（CuTe DSL，分页 MLA） |
 | --- | --- | --- | --- | --- | --- | --- |
-| 遍历多少 page | A（PyPTO2-普通版） 的程序控制流，C（PyPTO3（Simpler）） 的 Orchestration 或 SPMD 内循环 | B（PyPTO2-Pro）/D（CANNBot DSL） kernel 从 GM 读取长度后循环 | `tl.load(seq_lens)` → runtime loop | padded mask 或受支持图算子；能否降为紧凑动态循环取决于 lowering | 当前按连续 KV 块循环；没有 page table，传入的实际长度参数未在设备体读取 | page-table/TMA 路径定位 KV 页；变量长度/split 还受具体入口约束 |
+| 遍历多少 page | A（PyPTO2-tensor版） 的程序控制流，C（PyPTO3（Simpler）） 的 Orchestration 或 SPMD 内循环 | B（PyPTO2-block版）/D（CANNBot DSL） kernel 从 GM 读取长度后循环 | `tl.load(seq_lens)` → runtime loop | padded mask 或受支持图算子；能否降为紧凑动态循环取决于 lowering | 当前按连续 KV 块循环；没有 page table，传入的实际长度参数未在设备体读取 | page-table/TMA 路径定位 KV 页；变量长度/split 还受具体入口约束 |
 | QK / PV | Tensor matmul 或独立 InCore | 显式 Cube / memory stage / pipeline | `tl.dot`，后端安排 Cube / Vector 交互 | `torch.matmul` / 模板 / 外部库，须查生成归属 | 作者安排 MMAD、L1/L0 与 UB 的 CV 数据路径 | 作者选 MMA atom、tile、warp 角色与 TMA/pipeline |
 | m/l/o 放哪里 | 编译器规划的 tensor 或 task 间 GM | UB / registers / GM transfer，由用户与 passes 分工 | 编译器 bufferization / workspace / pipeline | AutoFuse schedule、buffer 分配和 workspace | 显式 UB 状态、寄存器运算与跨 CV 交接 | 寄存器/SMEM/TMEM 及 split 输出策略，依具体实现 |
 | 请求分配给核 | 任务派发，或用户选择 SPMD 映射 | core-stride、work_ranges 或自定义协议 | program grid + 编译器映射 | 自动 tiling 决定 blockDim 和 work split | 逻辑 task 编号与 block-stride；不是 ready-task 队列 | tile scheduler、CTA/cluster 与 split 分工；不是模型任务 runtime |
@@ -820,9 +826,9 @@ H/I 两列分别依据 [H-fa]、[I-mla] [I-gqa]。H 列刻意记录现有连续 
 
 ### 2.6 每条路径的完整 PA 证据与动态写法
 
-#### A（PyPTO2-普通版）已有动态长度 + paged cache 的完整程序
+#### A（PyPTO2-tensor版）已有动态长度 + paged cache 的完整程序
 
-[A13（PyPTO2-普通版）] 的 `ctrl_perf_kernel` 包含残差/RMS 预处理、投影、cache 更新和 attention。下列摘录完整保留查页、QK、online max/sum、PV 与归一化循环，仅去除外围缩进；`q_2d/k_cache_2d/v_cache_2d`、常量及参数依赖函数前段，不是独立入口。
+[A13（PyPTO2-tensor版）] 的 `ctrl_perf_kernel` 包含残差/RMS 预处理、投影、cache 更新和 attention。下列摘录完整保留查页、QK、online max/sum、PV 与归一化循环，仅去除外围缩进；`q_2d/k_cache_2d/v_cache_2d`、常量及参数依赖函数前段，不是独立入口。
 
 ```python
 for b_idx in pypto.loop(b, name="LOOP_B", idx_name="b_idx"):
@@ -892,15 +898,15 @@ for b_idx in pypto.loop(b, name="LOOP_B", idx_name="b_idx"):
 
 `block_table` 两轴动态，cache 的 page 数轴动态，head / page 几何有静态约束。客户使用 Tensor API 和 tile 设置，而不是另注册通用 TilingFunc。实际 task 数取决于 graph / loop / tiling 编译，不能把源码段落数当 task 数。
 
-该例不是完整 Transformer 层性能证明；它是 A（PyPTO2-普通版） 能组织多阶段程序及数据相关 page 循环的实现证据。
+该例不是完整 Transformer 层性能证明；它是 A（PyPTO2-tensor版） 能组织多阶段程序及数据相关 page 循环的实现证据。
 
 **A5 实测补充：程序组织能力已有运行对象，但原版 KV 更新语义有数值失败。** 在 FP16、B=4、Hq/Hkv=8/1、D=128、page=128、L=[127,128,129,513] 下，新增包含前处理和 KV append 的完整 golden 后，原版板端最大绝对误差为 `0.7950679659843445`；板端 PA 与更新前 cache 的参考结果接近。前端解释器对更新后 cache 的 golden 通过。在 `LOOP_PRE` 后、PA 前重新建立 K/V 的二维 view，本地修正版通过，误差为 `0.0002454519271850586`。两行补丁及原版/修正版日志见第 12.1.1 节和[实测快照][RUN-results]；这为“view/别名、任务依赖及数据可见性须联合验证”的分析提供具体反例，尚未定位具体编译 Pass 或 runtime 根因。原始上游代码未被本地驱动覆盖。
 
-#### B（PyPTO2-Pro）：完整 paged prefill 实现，以及同一实现的 A5 decode 补充验证
+#### B（PyPTO2-block版）：完整 paged prefill 实现，以及同一实现的 A5 decode 补充验证
 
-以下保留 prefill 的完整算法、Host 分工与动态 tiling 讨论。本次还运行了原文件的页大小测试（128/256/512），并使用同一 `flex_attention_bf16` / `_run_case` 入口补充 Q长度=1、L=[127,128,129,513] 的 BF16 decode，均通过。因此“原文件以 prefill 为主”仍描述其组织方式，“没有 decode 实测”已不成立；decode 的正确性通过仍不能代替 decode 专项性能和负载均衡测量。[页大小测试][B-pa-test] [RUN-results]
+以下分析 prefill 的完整算法、Host 分工与动态 tiling。A5 验证包括原文件的页大小测试（128/256/512），以及通过同一 `flex_attention_bf16` / `_run_case` 入口执行的 Q长度=1、L=[127,128,129,513] BF16 decode，均通过。原文件以 prefill 为主组织代码；同一实现已有 decode 正确性结果，但不能代替 decode 专项性能和负载均衡测量。[页大小测试][B-pa-test] [RUN-results]
 
-[B15（PyPTO2-Pro）] 的 `test_flex_attention_prefill.py` 含完整 kernel、Host 工作分配、page cache 构造和 golden。实际 ABI：
+[B15（PyPTO2-block版）] 的 `test_flex_attention_prefill.py` 含完整 kernel、Host 工作分配、page cache 构造和 golden。实际 ABI：
 
 ```text
 K/V：[num_blocks, block_size, n_head_kv, dim]，NHD page layout
@@ -1016,9 +1022,9 @@ for i in pl.range(0, n_items):
                        left_db, right_db, acc_db)
 ```
 
-这里 `task_id` 是核内流水计数，`work_ranges` 是算子参数 tensor；二者都不是普通版或 Simpler 的任务队列。这是“Python Host 分工策略”不等于“AICPU scheduler”的具体代码。
+这里 `task_id` 是核内流水计数，`work_ranges` 是算子参数 tensor；二者都不是tensor版或 Simpler 的任务队列。这是“Python Host 分工策略”不等于“AICPU scheduler”的具体代码。
 
-但是，这个文件定位是 prefill；其 `TS/TKV/TD`、mask、Q tile 利用率不应当自动算作 `q_len=1` decode 的优化实现。另有 [B16（PyPTO2-Pro）] 的动态 TND attention，可证明设备读取 actual_seq 的方式，不能替代 decode 专项验证。
+但是，这个文件定位是 prefill；其 `TS/TKV/TD`、mask、Q tile 利用率不应当自动算作 `q_len=1` decode 的优化实现。另有 [B16（PyPTO2-block版）] 的动态 TND attention，可证明设备读取 actual_seq 的方式，不能替代 decode 专项验证。
 
 对于客户，改变 actual_seq 内容可能只改变 kernel 循环；若继续使用 Host cost-balanced 的 `work_ranges`，还要保证该元数据与新长度一致。改变 `B/P/T` 可由动态轴及 runtime descriptor 承接；改变 `D/page` 组织可能要求新变体。**是否“需要新 tiling”应区分：重新调用既有策略、修改策略、重新编译 kernel。**
 
@@ -1293,9 +1299,9 @@ m_after, l_after, rescale_after = pl.yield_(next_m, next_l, rescale)
 
 另一个重要反例在 [C19（PyPTO3（Simpler））]：保留的 CCE attention 先把 `paged_attention_tiling_cce` 声明为 `core_type="aiv"` 的 extern，用 `pl.spmd(1)` 生成 metadata，然后以 `deps=[tiling_tid]` 提交 attention。**tiling 在一个 AIV task 上执行，不是在 Host，也不是 AICPU tiler。**
 
-#### D（CANNBot DSL）：保留显式流水蓝本，并补充已找到和运行的 paged 实现
+#### D（CANNBot DSL）：显式流水与 paged attention 实现
 
-[D12（CANNBot DSL）] 保留设计过程和阶段性记录。当前工作区已在 `examples/flash_attn_noquant` 找到完整 `FlashAttnNoquant(paged=True)` 及其测试；旧版“未找到完整 PA”的判断需要更新。QK/PV 阶段读取 `block_table[batch_idx,n_idx]` 得到物理页，K/V 布局为 `[P,Hkv,S,D]`，真实长度通过设备端 `seqused_kv` 输入。[分页实现][D-pa] [分页输入构造与测试][D-pa-test]
+[D12（CANNBot DSL）] 是设计过程和阶段性记录；`examples/flash_attn_noquant` 提供完整的 `FlashAttnNoquant(paged=True)` 及其测试。QK/PV 阶段读取 `block_table[batch_idx,n_idx]` 得到物理页，K/V 布局为 `[P,Hkv,S,D]`，真实长度通过设备端 `seqused_kv` 输入。[分页实现][D-pa] [分页输入构造与测试][D-pa-test]
 
 下面用已有连续、无 mask FlashAttention 的**完整 Cube helper 类**对比 `matmul/tl.dot`。它只负责 QK/PV 和搬运，不是 PA 实现；Source/Vector、online softmax、流水与 launch 在 [D14（CANNBot DSL）]，本摘录不能单独运行。
 
@@ -1505,7 +1511,7 @@ stream.synchronize()
 
 #### F（Triton-Ascend）：完整统一 attention 中已有原生 paged decode case
 
-**新增实测对象与下列示例分别标识：** 本节完整保留 Triton-Ascend 编译器仓的 unified attention 代码，用于分析 runtime loop、online softmax、program 映射和编译器职责。本次 A5 实际运行的是新增 `triton-ascend-kernels` 仓的 `paged_attention_fwd`，其原测试 8例通过，覆盖 MHA/GQA、causal prefill/decode、KV 尾页及 QK/V 维度不同；没有把该结果当作下面 unified attention 全参数矩阵的执行结果。[实测 kernel][F-pa] [实测测试][F-pa-test] [RUN-F-xml]
+**源码示例与实测对象：** 本节使用 Triton-Ascend 编译器仓的完整 unified attention 代码，分析 runtime loop、online softmax、program 映射和编译器职责。A5 实测对象是 `triton-ascend-kernels` 仓的 `paged_attention_fwd`，其原测试 8例通过，覆盖 MHA/GQA、causal prefill/decode、KV 尾页及 QK/V 维度不同；该结果不代表下面 unified attention 全参数矩阵的执行结果。[实测 kernel][F-pa] [实测测试][F-pa-test] [RUN-F-xml]
 
 完整 kernel、Host 和 reference：[F6（Triton-Ascend）]。测试参数包括 `[(1,523),(1,37),(1,2011)]`，每请求一个 query 的 decode 形态就在测试源码中。
 
@@ -1844,7 +1850,7 @@ def fa_compiled(q, k, v, qlen, kvlen):
 
 必须继续看参数是否被消费：kernel 签名有 `tiling_data`、`actual_q_seqlen` 和 `actual_kv_seqlen`，但当前函数体没有读取这三个 tensor 的内容。实际 task 数、Q/KV 上界和 batch 偏移来自 `HEAD_NUM/Q_SEQ/KV_SEQ/TOTAL_TASKS` 等 Python 全局量；Host `apply_shape_args()` 在编译前改写这些量。`fa_tiling.py` 能构造长度数组，并不足以证明这个 kernel 支持同一产物下每请求异长。[H-fa]
 
-这不削弱它在理论比较中的价值：它展示了 A5 上 **Cube↔Vector 交接、KV 分段、在线状态与物理 layout 转换** 的完整用户实现；缺分页只是特定算子的实现差距。若扩成原文 PA，至少还需页表间接寻址、每请求有效长度真正下沉设备、尾页 mask、页内跨界搬运及对应验证。把 Q 长度改为 1 只能得到连续 decode 场景，不能因此改名为 PagedAttention。本轮连续多 query、BF16 及 KV 尾块用例通过；Q=1 用例实际精度失败，且复跑仍失败，详见第 12.1.3 节。
+它展示了 A5 上 **Cube↔Vector 交接、KV 分段、在线状态与物理 layout 转换** 的完整用户实现，可用于核内资源与流水的理论比较；缺分页是这个算子的实现差距。若扩成第 2.4 节定义的 PA，至少还需页表间接寻址、每请求有效长度真正下沉设备、尾页 mask、页内跨界搬运及对应验证。把 Q 长度改为 1 只能得到连续 decode 场景，不能因此改名为 PagedAttention。本轮连续多 query、BF16 及 KV 尾块用例通过；Q=1 用例实际精度失败，且复跑仍失败，详见第 12.1.3 节。
 
 #### I（CuTe DSL）：找到的是分页 MLA decode，另有连续 GQA decode
 
@@ -1858,7 +1864,7 @@ def fa_compiled(q, k, v, qlen, kvlen):
 
 FP16 MLA 的 `can_implement()` 给出具体约束：latent 维 512、rope 维 64，输入/输出 f16，累加/LSE f32；Q 长度 1—4，head 数不超过 128；head 数小于 128 时 split-KV 必须为 1；page size 不能为 1 且须整除 QK 的 N tile；可变 split-KV 依赖 var-seq。上述是源码检查，仍不等价于所有通过检查的组合均已验证。[I-mla]
 
-它的测试页表先构造成 `[B,page_count]`，填入 `b+j*B` 使不同请求的物理页交错，再转为设备视图 `[page_count,B]` 并标记动态 layout；参考计算按页表 gather latent/rope 数据。因此它确实能为“间接页访问怎样进入 TMA、流水和在线计算”提供代码参照。若与原文 `Hq=40,Hkv=8,D=128,S=128` 比性能，应另找或适配标准 GQA PA；不能靠转置页表消除 MLA 与 GQA 的数学差异。[I-mla]
+它的测试页表先构造成 `[B,page_count]`，填入 `b+j*B` 使不同请求的物理页交错，再转为设备视图 `[page_count,B]` 并标记动态 layout；参考计算按页表 gather latent/rope 数据。因此它确实能为“间接页访问怎样进入 TMA、流水和在线计算”提供代码参照。若与本文约定的 `Hq=40,Hkv=8,D=128,S=128` 比性能，应另找或适配标准 GQA PA；不能靠转置页表消除 MLA 与 GQA 的数学差异。[I-mla]
 
 ### 2.7 实际长度变化，对 tiling 的四种可能影响
 
@@ -1878,11 +1884,11 @@ FP16 MLA 的 `can_implement()` 给出具体约束：latent 维 512、rope 维 64
 
 | 具体修改 | 直接对应的代码动作 | 不应误解为 |
 | --- | --- | --- |
-| Pro softmax `(777,300)→(2049,100)` | 两轴已经 DYNAMIC；原 Host 重新算 num_tiles/num_cores，kernel 用 set_validshape | 每个新取值必须新增一个 tiling 函数 |
-| Pro softmax `N=300→131075` | 超出 MAX_N=512；需分段算法/新 tile 策略，不能沿用原 kernel | 只改 shape 元数据就能突破片上容量 |
+| block版 softmax `(777,300)→(2049,100)` | 两轴已经 DYNAMIC；原 Host 重新算 num_tiles/num_cores，kernel 用 set_validshape | 每个新取值必须新增一个 tiling 函数 |
+| block版 softmax `N=300→131075` | 超出 MAX_N=512；需分段算法/新 tile 策略，不能沿用原 kernel | 只改 shape 元数据就能突破片上容量 |
 | PyPTO3 教学 softmax 改 ROWS/COLS | 修改静态常量后专门化；想运行时动态应换成动态声明/有效窗口的实现 | 固定切片循环自动获得任意 shape 安全性 |
 | PyPTO3 native PA 只改 seq_lens 内容 | 设备 pl.read 决定 page/stack 次数和尾列；符合已有容量等契约时无需新增 Host TilingFunc | 所有 shape 一定共用同一个编译产物 |
-| Pro paged prefill 只改实际长度 | kernel getval 读新值；Host work_ranges 若依赖旧长度必须更新 | 设备循环动态意味着 Host 分配元数据永远不用更新 |
+| block版 paged prefill 只改实际长度 | kernel getval 读新值；Host work_ranges 若依赖旧长度必须更新 | 设备循环动态意味着 Host 分配元数据永远不用更新 |
 | GPU PA 只改 valid_tokens 内容 | 保持 bucket/geometry 合法，改变 mask；保留有效 padded 映射 | mask 一变就会改变静态 tile 容量，或工作量必然线性下降 |
 | Triton PA 改长度与改 page/D | 长度是 tl.load 的数据；page/D 是 constexpr/资源几何，可能走新编译变体 | 二者都是“改输入”，所以代价一样 |
 | AutoFuse 客户 PA 改 L 与改 B/P/T | L 可作为设备 mask；B/P/T 进入符号 shape/guards/tiling，由 compiler 接受范围决定 | dynamic=True 等于无 guards、无 fallback、零编译成本 |
@@ -1929,17 +1935,17 @@ H/I 的实际改法也应落到参数来源：H basic MMAD 的 Host helper 将 G
 
 | 路线 | 客户实际写什么 | Python 如何进入编译器 | 不能据此宣称的能力 |
 | --- | --- | --- | --- |
-| PyPTO2-普通版 | `@pypto.frontend.jit`、Tensor 运算、切片、动态循环、tile/pass 配置 | 当前默认新前端生成 PIL/自有 IR，再进入 TileFwk；另有直接 Tensor/IR 构建接口 | 不是只能手工连图；也不是任意 Python 程序或任意 PyTorch 调用都能进入设备程序 |
-| PyPTO2-Pro | `@pl.jit`、`TileType`、out-first 核内操作、Cube/Vector section、VF；Host 用方括号指定 launch | ASTParser 识别 DSL，生成共享基础自有 IR 上的 Pro 操作；设备入口直接编译/launch | 有 Python kernel DSL；并不因此具备普通版或 Simpler 的通用外层任务系统 |
+| PyPTO2-tensor版 | `@pypto.frontend.jit`、Tensor 运算、切片、动态循环、tile/pass 配置 | 当前默认新前端生成 PIL/自有 IR，再进入 TileFwk；另有直接 Tensor/IR 构建接口 | 不是只能手工连图；也不是任意 Python 程序或任意 PyTorch 调用都能进入设备程序 |
+| PyPTO2-block版 | `@pl.jit`、`TileType`、out-first 核内操作、Cube/Vector section、VF；Host 用方括号指定 launch | ASTParser 识别 DSL，生成共享基础自有 IR 上的 block版 操作；设备入口直接编译/launch | 有 Python kernel DSL；并不因此具备tensor版或 Simpler 的通用外层任务系统 |
 | PyPTO3（Simpler） | `@pl.jit`、Tensor/Tile、层次 scope、InCore/Orchestration，必要时显式 TaskId/SPMD/extern | Python DSL parser → 自有程序 IR；核内与编排分路编译 | 不只是构图 API；但某个语言构件只在规定层级合法，不能任意跨 Host/Orchestration/InCore 使用 |
 | CANNBot DSL | Python 类/方法、`@jit` Host、`@kernel` Device、Tensor/Buffer/Channel、寄存器函数 | 捕获源码，执行 `analyze → lower → materialize`，再以分阶段执行/IR builder 生成 MLIR | **不是“没有 AST 的纯 tracing”**；Python helper 的 trace-time 执行也不是设备上运行任意 Python |
 | PyPTO on GPU | 集成 operator API 或受支持的 PyPTO DSL kernel | PyPTO 自有 IR → 当前 emitter/pattern → TensorIR | 前端能解析的表达，不保证该 GPU 后端能编；不能沿用 PyPTO3 的全部任务语义 |
 | Triton-Ascend | 独立 `@triton.jit` + `tl.*`；或者 PyTorch 交由 Inductor 生成 Triton | Triton Python kernel DSL → TTIR；编译常量与运行时 tensor/control flow 分开 | 不是只有构图接口；但 Triton 公共名字存在，不代表 NVIDIA 参数语义及所有 NPU 目标都支持 |
-| AutoFuse + Inductor | 客户主要写 PyTorch；接入开发者使用 ASCGraph/ASCIR 操作接口 | Inductor 把 loop/index/size/compute 组织为 ASCIR 图，AutoFuse 生成 kernel/tiling | 有 Python 客户入口、有 Python 构图接口；本次路径未提供与 Pro/CANNBot/Triton 同定位的独立客户 kernel DSL |
+| AutoFuse + Inductor | 客户主要写 PyTorch；接入开发者使用 ASCGraph/ASCIR 操作接口 | Inductor 把 loop/index/size/compute 组织为 ASCIR 图，AutoFuse 生成 kernel/tiling | 有 Python 客户入口、有 Python 构图接口；本次路径未提供与 block版/CANNBot/Triton 同定位的独立客户 kernel DSL |
 | H（CATLASS DSL） | `catlass.tla`、`@tla.kernel`、layout/allocate/copy/MMAD/Vector，Host 编译后调用产物 | Python staging 建 TLA MLIR；`@tla.jit` 在 kernel 编译中内联设备 helper，Host 直接调用它仍是普通 Python | 不能把 H 的 `jit` 等同 I 的编译 Host 多 launch，也不能把 C++ CATLASS 全部抽象算作本 Python DSL 已覆盖。[H-dsl] [H-readme] |
 | I（CuTe DSL） | `@cute.jit` Host、`@cute.kernel` Device、layout/atom、线程分区及 pipeline | 分阶段生成 MLIR；kernel 调用先形成 launcher，再 `.launch()`；Host JIT 可以编排多个 launch | 编译期 Python 不等于设备执行任意 Python；一个 JIT 不是一个物理 kernel，TS 不是跨模型任务 runtime。[I-dsl] [I-gqa] [I-task] |
 
-依据：[A1（PyPTO2-普通版）]—[A3（PyPTO2-普通版）]、[B17（PyPTO2-Pro）] [B20（PyPTO2-Pro）]、[C21（PyPTO3（Simpler））]、[D1（CANNBot DSL）] [D17（CANNBot DSL）]、[E1（PyPTO on GPU）] [E2（PyPTO on GPU）]、[F1（Triton-Ascend）] [F5（Triton-Ascend）]、[G11（AutoFuse + Inductor）]。
+依据：[A1（PyPTO2-tensor版）]—[A3（PyPTO2-tensor版）]、[B17（PyPTO2-block版）] [B20（PyPTO2-block版）]、[C21（PyPTO3（Simpler））]、[D1（CANNBot DSL）] [D17（CANNBot DSL）]、[E1（PyPTO on GPU）] [E2（PyPTO on GPU）]、[F1（Triton-Ascend）] [F5（Triton-Ascend）]、[G11（AutoFuse + Inductor）]。
 
 因此，“有 Python 前端”不是有区分度的终点。更有区分度的是：**用户写的是被编译的程序语义，还是构造编译器 IR 的 Python 工具代码；哪部分 Python 只在编译期执行；运行时动态值在哪个处理器上被读取。** 三者可以在一个系统中共存，不能仅靠 `@jit` 这个名字归类。
 
@@ -1949,8 +1955,8 @@ H/I 的实际改法也应落到参数来源：H basic MMAD 的 Host helper 将 G
 
 | 路线 | Vector / 索引 / 数值 API 示例 | Cube / 矩阵 API 示例 | 更低层与更高层的表达范围 |
 | --- | --- | --- | --- |
-| PyPTO2-普通版 | `exp/amax/sum/argmax/topk/gather/scatter_update`、cast、quantize/dequantize | `matmul/scaled_mm`、conv/conv_backward_input；Cube tile 和 split-K 配置 | 以 Tensor 值及 view/loop/有效形状组织程序；能设融合/复用策略，不等于逐条安排 VF 寄存器或固定物理核 |
-| PyPTO2-Pro | Tile 算术、row/column reduce/expand、gather/scatter/sort、quant；`pl.Vf` 寄存器、mask、cast 等 | `matmul/matmul_acc/matmul_mx` 及相应累加形式 | Tile 地址/布局/槽、mutex、pipeline、Cube/Vector section、system；还有 SIMT API 表面，目标约束必须另查；通常以一个显式 kernel 为直接编译对象 |
+| PyPTO2-tensor版 | `exp/amax/sum/argmax/topk/gather/scatter_update`、cast、quantize/dequantize | `matmul/scaled_mm`、conv/conv_backward_input；Cube tile 和 split-K 配置 | 以 Tensor 值及 view/loop/有效形状组织程序；能设融合/复用策略，不等于逐条安排 VF 寄存器或固定物理核 |
+| PyPTO2-block版 | Tile 算术、row/column reduce/expand、gather/scatter/sort、quant；`pl.Vf` 寄存器、mask、cast 等 | `matmul/matmul_acc/matmul_mx` 及相应累加形式 | Tile 地址/布局/槽、mutex、pipeline、Cube/Vector section、system；还有 SIMT API 表面，目标约束必须另查；通常以一个显式 kernel 为直接编译对象 |
 | PyPTO3（Simpler） | Tensor/Tile 统一分派的算术/归约/广播/转换；paged_gather、sort、scatter；显式 load/store/move | Tensor/Tile matmul、acc、gemv、MX 相关操作 | 片上 MemRef/slot、system 同步与跨核传递，以及 TaskId/SPMD/Orchestration；不同层级的操作并非全部互通 |
 | CANNBot DSL | Tensor math/reduce/expand/cast；`reg.*` 算术、mask、转换、gather/scatter、load/store | `matmul`、Cube 控制和 conv2d 数据通路 helper | 显式逻辑/物理 layout、Buffer、Channel、搬运引擎、VF 和同步；Host 也能编译，但不是设备任务 DAG runtime |
 | PyPTO on GPU | 已接通的逐元素、行归约、norm/激活等模式；算子包装层及特定融合 builder | structured matmul、attention 等 emitter 路径 | 主要以 tile/张量语义与 schedule 选项进入 TensorIR；不是面向每种 GPU 指令的 Python 封装，也不是任意自有 IR 图都能通过 |
@@ -1959,7 +1965,7 @@ H/I 的实际改法也应落到参数来源：H basic MMAD 的 Host helper 将 G
 | H（CATLASS DSL） | `vec.func` 内寄存器 load/store、mask、exp/reduce 等；tensor/view、逻辑有效范围 | MMAD、L1→L0A/B、L0C→GM/UB 等显式搬运 | `allocate`、地址空间、物理 layout tag、flag/mutex 与跨 CV 协议；部分局部同步可自动生成，不提供默认模型任务图。[H-api-copy] [H-api-mmad] [H-fa] [H-auto-sync] |
 | I（CuTe DSL） | layout 的 composition/product/divide/coalesce、local tile、线程/值 fragment、warp 归约 | Copy/MMA atom，cp.async/TMA、架构特定 tcgen05 形式 | 线程/warp/CTA/cluster、SMEM/TMEM、pipeline、persistent/CLC，experimental TS 声明资源协议；具体 SM/dtype/layout 组合须逐项核对。[I-layout] [I-copy] [I-mma] [I-task] |
 
-API 入口与实现索引：[A17（PyPTO2-普通版）] [A19（PyPTO2-普通版）]、[B17（PyPTO2-Pro）] [B18（PyPTO2-Pro）]、[C21（PyPTO3（Simpler））]、[D18（CANNBot DSL）]、[E2（PyPTO on GPU）] [E12（PyPTO on GPU）]、[F5（Triton-Ascend）] [F6（Triton-Ascend）] [F16（Triton-Ascend）]、[G11（AutoFuse + Inductor）]。这些属于**接口/实现存在性**证据；相应 softmax/PA 的验证边界仍按第 2.3/2.6 节。
+API 入口与实现索引：[A17（PyPTO2-tensor版）] [A19（PyPTO2-tensor版）]、[B17（PyPTO2-block版）] [B18（PyPTO2-block版）]、[C21（PyPTO3（Simpler））]、[D18（CANNBot DSL）]、[E2（PyPTO on GPU）] [E12（PyPTO on GPU）]、[F5（Triton-Ascend）] [F6（Triton-Ascend）] [F16（Triton-Ascend）]、[G11（AutoFuse + Inductor）]。这些属于**接口/实现存在性**证据；相应 softmax/PA 的验证边界仍按第 2.3/2.6 节。
 
 #### “支持所有 Vector 算子 / Cube / Tensor Core 指令”为什么不能直接打勾
 
@@ -1970,7 +1976,7 @@ API 入口与实现索引：[A17（PyPTO2-普通版）] [A19（PyPTO2-普通版�
 3. **lowering 路径**：当前前端/IR/pass/codegen 是否保留这些选项并交给目标？下游 PTOAS、AscendC、AscendNPU-IR、TensorIR 有某个操作，上层也不自动获得它。
 4. **实际产物**：是否真的用了所需单元/指令，数值和性能是否达标？API 名、dtype 枚举、生成的 C++ 调用甚至一个 MLIR op，都不能单独替代目标编译产物和硬件验证。
 
-当前报告没有“完整目标指令清单 × 所有参数组合”的分母，也没有覆盖该集合的端到端测试。因此不提供 API/ISA 覆盖百分比，不写“全部支持”。这不表示九条路线同样受限：**Pro/CANNBot 更直接暴露低层选项，普通版/AutoFuse 更多交给编译器，PyPTO3 同时提供 Tensor/Tile 核内计算与带依赖的任务编排接口，GPU 集成还明显受 emitter 覆盖约束**；这是控制面的差异，不是未经测量的完整性名次。
+当前报告没有“完整目标指令清单 × 所有参数组合”的分母，也没有覆盖该集合的端到端测试。因此不提供 API/ISA 覆盖百分比，不写“全部支持”。这不表示九条路线同样受限：**block版/CANNBot 更直接暴露低层选项，tensor版/AutoFuse 更多交给编译器，PyPTO3 同时提供 Tensor/Tile 核内计算与带依赖的任务编排接口，GPU 集成还明显受 emitter 覆盖约束**；这是控制面的差异，不是未经测量的完整性名次。
 
 #### PyPTO3（Simpler）的“多级表达”：核内抽象与核外任务组织是两个维度
 
@@ -1986,7 +1992,7 @@ API 入口与实现索引：[A17（PyPTO2-普通版）] [A19（PyPTO2-普通版�
 
 以 softmax 串起来看：用户可以选择 `ROW_TILE=64`，在一个 `pl.at(CORE_GROUP)` 内用 Tensor 写完 max → sub → exp → sum → div；编译器处理该区域的 Tensor→Tile lowering，外层行块任务由 Simpler 调度。需要更细控制时，再将核内局部改成显式 Tile/存储/同步写法。**“能编排五个 InCore”与“把五项计算融合在一个 InCore”是两种能力**：前者不自动获得后者的 UB/L1 中间值复用，`pl.scope()` 也不是核内融合 scope。完整代码及反例见第 8.3.3 节。
 
-因此，原句想表达的是 **PyPTO3 把 Tensor 写法、显式 Tile 写法和设备侧任务编排接在同一编程体系里，用户可按区域承担不同深度的实现责任**，而非“每一层都完全手工可控/完全自动”。Pro/CANNBot 同样有 Tensor/Tile 与低层选项；这里有区分度的是它们是否进一步接入这类通用设备侧任务依赖与调度体系，不能仅凭“也能写 Tensor 或一个完整 kernel”判断路线相同。
+**PyPTO3 把 Tensor 写法、显式 Tile 写法和设备侧任务编排接在同一编程体系里，用户可按区域承担不同深度的实现责任**，但各层并非完全手工可控或完全自动。block版/CANNBot 同样有 Tensor/Tile 与低层选项；这里有区分度的是它们是否进一步接入这类通用设备侧任务依赖与调度体系，不能仅凭“也能写 Tensor 或一个完整 kernel”判断路线相同。
 
 H/I 进一步说明“下探粒度”与“程序上界”并不成正比：H 暴露物理 layout tag、搬运与 MMAD/Vector，I 暴露 layout 代数、Copy/MMA atom 与线程/warp 资源；这些接口可以减少手写高性能 kernel 时表达硬件细节的障碍，但不自动提供 C 的跨计算入口任务编排。H 的 API 封装范围与 I 的架构/experimental 层仍应逐项核对，不能借整个 C++ 模板库或一个顶层命名空间推断覆盖率。[H-readme] [H-api-copy] [I-layout] [I-mma] [I-task]
 
@@ -1994,8 +2000,8 @@ H/I 进一步说明“下探粒度”与“程序上界”并不成正比：H �
 
 | 路线 | 本地实现中的具体证据 | 正确解释 |
 | --- | --- | --- |
-| PyPTO2-普通版 | `conv` 对 transpose 分支明确报 `Conv transpose true is not supported yet.` | 有 conv API 不等于卷积的所有形态已贯通；不排除用其他分解表达同一数学结果。[A18（PyPTO2-普通版）] |
-| PyPTO2-Pro | `EmitVFExp` 检查源/目标类型一致、只收 FP16/FP32，并走 ZEROING-only 检查；precision 分支还展开额外指令 | `Vf.exp` 不等于“任意 dtype/mask 模式的一条 exp 指令”；显式低层 API 也有参数域。[B21（PyPTO2-Pro）] |
+| PyPTO2-tensor版 | `conv` 对 transpose 分支明确报 `Conv transpose true is not supported yet.` | 有 conv API 不等于卷积的所有形态已贯通；不排除用其他分解表达同一数学结果。[A18（PyPTO2-tensor版）] |
+| PyPTO2-block版 | `EmitVFExp` 检查源/目标类型一致、只收 FP16/FP32，并走 ZEROING-only 检查；precision 分支还展开额外指令 | `Vf.exp` 不等于“任意 dtype/mask 模式的一条 exp 指令”；显式低层 API 也有参数域。[B21（PyPTO2-block版）] |
 | PyPTO3（Simpler） | A2/A3 backend 注册明确排除 `tile.matmul_mx*`、相关 scale/quant 操作；片上物理分配要求静态容量 | 语言中出现 MX API 不代表 A2/A3 可用；动态 GM/有效窗口与动态物理 Tile 不是同一能力。[C22（PyPTO3（Simpler））] [C10（PyPTO3（Simpler））] |
 | CANNBot DSL | `reg.vstore_pack` 的 `b64_to_b32` 分支抛出 NotImplementedError，指明 arch3510 的 mask 约束 | 具体硬件/形式受限；不能把 raw-register 命名空间当完整 ISA 映射。[D19（CANNBot DSL）] |
 | PyPTO on GPU | native tile 程序入口检查只有一个函数；静态 tensor 读取路径检查完全静态 shape；已有五 InCore + Orchestration 历史失败 | 这是当前集成支持域，不是 TensorIR/MLIR/GPU 在原理上不能承载多阶段程序。[E15（PyPTO on GPU）] [E2（PyPTO on GPU）] [E7（PyPTO on GPU）] |
@@ -2041,7 +2047,7 @@ H 的 `shape/stride` 描述物理存放，`origin_shape` 描述逻辑有效范�
 
 H 的 `allocate` 当前只接受静态容量和片上地址空间；`auto_sync="v0"` 只生成单 AIC 或 AIV 内的流水同步，跨核 flag、`vec.func` 内线程同步仍须显式写。I 的架构特定 API 及例子也有 target、对齐、dtype 和 CTA/cluster 限制；Blackwell MLA 的约束见第 2.6 节。本次没有因 API 可导入或源文件存在而把它们全部标为“可运行”。[H-api-allocate] [H-dsl] [I-mla]
 
-另外，原文 F 的 Inductor 组合调度中出现的 CATLASS template 路径生成 C++ 模板代码；它与此处 H 的 `catlass.tla` Python DSL 是两个具体入口。不能从 F 能选择 CATLASS 模板，直接推断 H 已接入同一套 Inductor 自动融合。[F10（Triton-Ascend）] [H-inductor-template]
+F 的 Inductor 组合调度中的 CATLASS template 路径生成 C++ 模板代码，与 H 的 `catlass.tla` Python DSL 是两个具体入口。不能从 F 能选择 CATLASS 模板，直接推断 H 已接入同一套 Inductor 自动融合。[F10（Triton-Ascend）] [H-inductor-template]
 
 最后看 Host 写法。H 的 basic mixed 示例先桥接好四个 tensor，再显式编译和执行；以下为其 Host 调用摘录，完整输入/golden 在源文件中。[H-mixed]
 
@@ -2105,27 +2111,27 @@ L10 不是最后才执行：它横跨 L1/L2/L4/L5/L8/L9。
 静态编译时 schedule 与 L9 的运行时派发也不是同一件事。
 ```
 
-这张图是责任分层，不是所有系统都必须经过的统一 pass 顺序。A（PyPTO2-普通版）/C（PyPTO3（Simpler）） 的 L2/L9 紧密耦合；B（PyPTO2-Pro）/D（CANNBot DSL）/F（Triton-Ascend） 可把很多控制和合作直接写进 L4/L6；G（AutoFuse + Inductor） 则把大量 L2/L4 决策交给编译器。
+这张图是责任分层，不是所有系统都必须经过的统一 pass 顺序。A（PyPTO2-tensor版）/C（PyPTO3（Simpler）） 的 L2/L9 紧密耦合；B（PyPTO2-block版）/D（CANNBot DSL）/F（Triton-Ascend） 可把很多控制和合作直接写进 L4/L6；G（AutoFuse + Inductor） 则把大量 L2/L4 决策交给编译器。
 
 ### 3.2 用户与编译层责任矩阵
 
-| 层 | A（PyPTO2-普通版） | B（PyPTO2-Pro） | C（PyPTO3（Simpler）） | D（CANNBot DSL） | E（PyPTO on GPU） | F（Triton-Ascend） | G（AutoFuse + Inductor） | H（CATLASS DSL） | I（CuTe DSL） |
+| 层 | A（PyPTO2-tensor版） | B（PyPTO2-block版） | C（PyPTO3（Simpler）） | D（CANNBot DSL） | E（PyPTO on GPU） | F（Triton-Ascend） | G（AutoFuse + Inductor） | H（CATLASS DSL） | I（CuTe DSL） |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | L0 客户入口 | Tensor DSL | Tile / VF / Cube DSL | Tensor / Tile、多级 scope | Python Host / kernel / Channel | PyPTO DSL + operator API | Triton DSL；或 PyTorch | 主要是 PyTorch；开发者 ASCIR 接口 | Python TLA、layout/存储/Vector/MMAD | Python CuTe、layout/atom/线程分区 |
 | L1 框架入口 | 自有 JIT/运行接口；不据此认定 Inductor 原生后端 | 直接 kernel 接口 | 自有 JIT / model zoo | JIT/AOT Host 接口 | 集成包 `compile_graph` | 指定 torch_npu Inductor 路径 | 指定 TorchAir experimental Inductor 路径 | `tla.compile` + tensor bridge/直接调用；不是已验证的 Python DSL Inductor 后端 | CuTe JIT/compile + tensor bridge；本次无框架集成实测 |
 | L2 分组与程序 | TileFwk 图 / 函数 / task 编译 | 用户 kernel 边界及核内 passes | InCore / Orchestration / Group / SPMD | Host 与 Device 分阶段 | 当前支持的单图模式；包装层可多 launch | Inductor 融合或用户独立 kernel | Inductor 分组 + AutoFuse schedule | 显式 kernel + 内联设备 helper；mixed 函数再拆核种 | Host JIT 与 kernel launcher；一个 Host 可多 launch |
-| L3 主 IR | PIL / 自有 IR → TileFwk | 共享基础自有 IR + Pro 操作 | 自有 IR → PTO MLIR | MLIR CANNIR / Asc / vector 等 | 自有 IR → NVIDIA TensorIR | TTIR → 适配 MLIR → HFusion/HIVM 等 | ASCIR / FusedScheduledResult | TLA MLIR → HIVM/AVE/标准 dialect | CuTe/相关 MLIR → NVVM/CUDA 编译链 |
+| L3 主 IR | PIL / 自有 IR → TileFwk | 共享基础自有 IR + block版 操作 | 自有 IR → PTO MLIR | MLIR CANNIR / Asc / vector 等 | 自有 IR → NVIDIA TensorIR | TTIR → 适配 MLIR → HFusion/HIVM 等 | ASCIR / FusedScheduledResult | TLA MLIR → HIVM/AVE/标准 dialect | CuTe/相关 MLIR → NVVM/CUDA 编译链 |
 | L4 tiling / 映射 | tile 设置 + 编译分解 | 物理 tile、block-stride、Host 策略 | 编译 tile + runtime task；可手写 SPMD | tile 与 Host/block 分工显式 | schedule tile / pattern → grid | constexpr tile + grid + 后端再映射 | 自动模板 / cost model / ATT tiling | Host 选 tile/常量，kernel block-stride/有效范围 | tile/atom/thread-value layout；静态 persistent 或 CLC 等 |
 | L5 片上规划 | 图编译及核内 codegen | 显式地址/TileGroup + passes | PyPTO memory/layout passes + PTOAS | Buffer / Channel + MLIR passes | TensorIR / Tile 编译器 | AscendNPU-IR PlanMemory/layout | buffer/queue allocator、reuse、代码生成 | 静态 allocate + 按空间对齐递增偏移；非此 pass 自动 last-use 复用 | 显式 SMEM/TMEM/fragment；TS 可声明 phase alias |
 | L6 流水与同步 | 编译生成及用户策略 | section、mutex、pipeline、显式同步 | InCore passes / PTOAS；可显式混合核事件 | Channel、软件流水、同步推断 | GPU lowering / tile compiler | CV pipeline、MultiBuffer、InjectSync/GSS | schedule、queue、生成的同步与模板 | flag/mutex/CV 事件；受限局部 AutoSync | pipeline/mbarrier/warp 角色；TS 生成已声明协议 |
 
 “用户显式”不等于“编译器不优化”，“自动”也不等于“客户无需理解资源限制”。这些词表达的是默认责任分工。
 
-H/I 新增列的依据是各自前端、pipeline 与局部分配实现：[H-dsl] [H-passes] [H-scratch]、[I-dsl] [I-layout] [I-ts-memory]。其中“作者选策略”与“编译器生成指令/协议”可以同时成立，不宜压缩成全手工或全自动两档。
+H/I 的分层依据是各自前端、pipeline 与局部分配实现：[H-dsl] [H-passes] [H-scratch]、[I-dsl] [I-layout] [I-ts-memory]。其中“作者选策略”与“编译器生成指令/协议”可以同时成立，不宜压缩成全手工或全自动两档。
 
 ### 3.3 二进制、启动与全局运行层矩阵
 
-| 层 | A（PyPTO2-普通版） | B（PyPTO2-Pro） | C（PyPTO3（Simpler）） | D（CANNBot DSL） | E（PyPTO on GPU） | F（Triton-Ascend） | G（AutoFuse + Inductor） | H（CATLASS DSL） | I（CuTe DSL） |
+| 层 | A（PyPTO2-tensor版） | B（PyPTO2-block版） | C（PyPTO3（Simpler）） | D（CANNBot DSL） | E（PyPTO on GPU） | F（Triton-Ascend） | G（AutoFuse + Inductor） | H（CATLASS DSL） | I（CuTe DSL） |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | L7 常见末端 | CCE codegen + 工具链 | CCECodegen + 工具链 | PTOAS 默认 C++ 路径 + PTO tile 库 / 工具链 | AscendC source + 工具链 | TensorIR → CUDA Tile IR → Cubin | bishengir/HIVM 及目标编译器 → npubin | 生成 AscendC / 相关模板 → 工具链 | TLA lowering + CANN `hivmc-a5` → device object/产物 | CuTe 编译 pipeline/配套编译组件 → cubin |
 | L8 launch | CTRL/SCHE/AICore 组合，视配置 | `kernel<<<blockDim,...,stream>>>` | runtime worker + `kernel_entry(args)` task ABI | Host C++ 的 `kernel<<<blockDim,0,stream>>>` | `cuLaunchKernelEx`，显式 grid / artifact block / stream | `cann_launch_kernel(func,blockNum,stream,...)` | wrapper 调 tiling、分配 workspace、调用 launch | artifact 参数打包、block_num/stream → AscendCL | kernel launcher `.launch(grid, block, …)` → CUDA |
@@ -2139,7 +2145,7 @@ H 的产物、参数与 AscendCL 调用见 [H-execution] [H-runtime]；I 的编�
 
 ### 3.4 H/I 放回同一责任分层
 
-| 原文层级 | H（CATLASS DSL） | I（CuTe DSL） |
+| 责任层级 | H（CATLASS DSL） | I（CuTe DSL） |
 | --- | --- | --- |
 | L0/L1 客户与框架 | 显式 Python kernel；例子由 torch_npu 分配张量，再桥接 TLA | 显式 Python kernel/Host JIT；例子用 CUDA tensor/DLPack；不能据此宣称自动编译整个 PyTorch 模型 |
 | L2/L3 程序/IR | 作者选定 kernel 边界；Python lowering 生成 TLA/标准 MLIR | 作者选定 Host/device 边界；CuTe、GPU/标准 MLIR，扩展路径另有 LIR/PyIR 选项 |
@@ -2152,7 +2158,7 @@ H 的产物、参数与 AscendCL 调用见 [H-execution] [H-runtime]；I 的编�
 
 ## 4. 九条实际调用链与组件边界
 
-### 4.1 A（PyPTO2-普通版）：新 Python IR 入口，仍接入 TileFwk 执行体系
+### 4.1 A（PyPTO2-tensor版）：新 Python IR 入口，仍接入 TileFwk 执行体系
 
 ```text
 @pypto.frontend.jit
@@ -2167,25 +2173,25 @@ H 的产物、参数与 AscendCL 调用见 [H-execution] [H-runtime]；I 的编�
  → 依赖解析 / ready queue / task dispatch
 ```
 
-源码：[A1（PyPTO2-普通版）]—[A6（PyPTO2-普通版）]、[A9（PyPTO2-普通版）]、[A10（PyPTO2-普通版）]。
+源码：[A1（PyPTO2-tensor版）]—[A6（PyPTO2-tensor版）]、[A9（PyPTO2-tensor版）]、[A10（PyPTO2-tensor版）]。
 
 当前实现的 `new_ir=True` 不能忽略；也不能据“新 SSA 前端”推断其底层已更换为 MLIR/PTOAS。`IsAicoreResolveEnabled()` 会改变是否启动独立 SCHE 路径，不能把某一运行配置的 launch 拓扑当所有配置的事实。
 
-### 4.2 B（PyPTO2-Pro）：与 A（PyPTO2-普通版） 共享基础设施，不共享主执行模型
+### 4.2 B（PyPTO2-block版）：与 A（PyPTO2-tensor版） 共享基础设施，不共享主执行模型
 
 ```text
 @pypto_pro.language.jit
  → AST / shape policy / 自有 IR
- → Pro 核内 passes、mutex/pipeline 等
+ → block版 核内 passes、mutex/pipeline 等
  → CCECodegen.generate_single(...)
  → kernel.cpp + Host call_kernel.cpp → .so
  → ctypes call_kernel
  → kernel<<<blockDim,nullptr,stream>>>(...)
 ```
 
-源码：[B1（PyPTO2-Pro）]—[B6（PyPTO2-Pro）]、[B8（PyPTO2-Pro）]。A（PyPTO2-普通版）/B（PyPTO2-Pro） 共享同仓 `pypto.pypto_impl`、原生 IR 及部分编译基础设施；Pro 的 bootstrap / IR 导入对此是直接证据。它们的 Python 前端、编程抽象、codegen 路径、参数契约、运行时入口仍不同。
+源码：[B1（PyPTO2-block版）]—[B6（PyPTO2-block版）]、[B8（PyPTO2-block版）]。A（PyPTO2-tensor版）/B（PyPTO2-block版） 共享同仓 `pypto.pypto_impl`、原生 IR 及部分编译基础设施；block版 的 bootstrap / IR 导入对此是直接证据。它们的 Python 前端、编程抽象、codegen 路径、参数契约、运行时入口仍不同。
 
-`pypto` loader 加载了某个包含 runtime 的库，不等于 Pro launch 时执行 A（PyPTO2-普通版） 的 AICPU scheduler。B（PyPTO2-Pro） 的 runtime 仍负责 JIT、缓存、参数、TilingData、stream 与错误处理，因此“完全没有 runtime”也不准确。
+`pypto` loader 加载了某个包含 runtime 的库，不等于 block版 launch 时执行 A（PyPTO2-tensor版） 的 AICPU scheduler。B（PyPTO2-block版） 的 runtime 仍负责 JIT、缓存、参数、TilingData、stream 与错误处理，因此“完全没有 runtime”也不准确。
 
 ### 4.3 C（PyPTO3（Simpler））：任务图编译与核内编译分开，库层可以主动选择融合
 
@@ -2220,7 +2226,7 @@ Python 调 @jit Host 函数
 
 源码：[D1（CANNBot DSL）]—[D4（CANNBot DSL）]、[D6（CANNBot DSL）]—[D9（CANNBot DSL）]。允许 Host 中出现多个 kernel launch，不代表 Device kernel 里也允许随意调用另一个全局 kernel；调用矩阵有明确边界。
 
-D（CANNBot DSL） 的 `aicpu/kernel.py` 提供独立 AICPU kernel 的编译/launch能力 [D5（CANNBot DSL）]，但没有因此自动得到 A（PyPTO2-普通版）/C（PyPTO3（Simpler）） 的通用任务图 scheduler。这个区分也适用于所有“支持编写 AICPU 代码”的系统。
+D（CANNBot DSL） 的 `aicpu/kernel.py` 提供独立 AICPU kernel 的编译/launch能力 [D5（CANNBot DSL）]，但没有因此自动得到 A（PyPTO2-tensor版）/C（PyPTO3（Simpler）） 的通用任务图 scheduler。这个区分也适用于所有“支持编写 AICPU 代码”的系统。
 
 ### 4.5 E（PyPTO on GPU）：TensorIR 是核内后端，不是 Simpler 的 GPU 替身
 
@@ -2294,13 +2300,13 @@ operator builder / PyPTO JIT specialize
 G（AutoFuse + Inductor）的客户入口是 PyTorch，ASCIR Python/C++ API 面向集成开发者；它与独立 kernel DSL 的差别见第 2.9 节。
 
 <a id="focused-comparisons"></a>
-### 4.8 重点对比：PyPTO2-普通版与 PyPTO3（Simpler）
+### 4.8 重点对比：PyPTO2-tensor版与 PyPTO3（Simpler）
 
 **最接近之处在外层程序/任务执行，主要差别在“用户怎样指定分解与协作”以及具体编译/runtime 契约；不能用“自动 tiling 对手工 tiling”二分。**
 
-#### 先纠正 tiling 判断：普通版确实让用户切 tile，也让用户干预合图
+#### tiling 与合图：tensor版的用户控制范围
 
-普通版文档给出的原生配置如下。这是嵌入 Tensor 程序/配置作用域的 API 摘录，不是独立可执行的 kernel：[A8（PyPTO2-普通版）] [A8b（PyPTO2-普通版）]
+tensor版文档给出的原生配置如下。这是嵌入 Tensor 程序/配置作用域的 API 摘录，不是独立可执行的 kernel：[A8（PyPTO2-tensor版）] [A8b（PyPTO2-tensor版）]
 
 ```python
 pypto.set_vec_tile_shapes(1, 1, 8, 8)
@@ -2311,7 +2317,7 @@ pypto.set_cube_tile_shapes(
 
 第一个调用指定四个 Vector 维度的 tile。第二个的三个列表依次对应 M、K、N，每个列表是 `[L0,L1]`：例如 K 的 L0 tile 是 256、L1 tile 是 512。`enable_split_k=True` 则开放多核切 K 策略，源码接口还区分 GM 累加与不启用 split-K 的累加方式。它不是“由调度器随便决定 tile”的空提示，也不能不经编译产物就把某个 tile 设置换算成固定 task 数或固定物理核分配。
 
-而且，普通版不只是设置尺寸。真实 attention 程序里有以下连续片段：[A13（PyPTO2-普通版）]
+而且，tensor版不只是设置尺寸。真实 attention 程序里有以下连续片段：[A13（PyPTO2-tensor版）]
 
 ```python
 pypto.set_pass_options(sg_set_scope=3)
@@ -2323,11 +2329,11 @@ max_update[:] = tilda_mij
 pypto.set_pass_options(sg_set_scope=-1)
 ```
 
-这里用户明确划出一个合图作用域。配置定义描述相邻、同非默认 scope 的操作合并；`Function::AddRawOperation` 将 scope 写入操作，`SuperNodeGraphBuilder` 收集/合并 scope 并检查 Cube/Vector 平台约束。[A14（PyPTO2-普通版）]—[A16（PyPTO2-普通版）] 因而 **“普通版连计算子图边界都不能干预”也不成立**。不过，编译 scope、一个可执行函数、一个动态 task 实例和一个物理核并非一一对应，最终仍需检查图展开与 runtime 任务描述。
+这里用户明确划出一个合图作用域。配置定义描述相邻、同非默认 scope 的操作合并；`Function::AddRawOperation` 将 scope 写入操作，`SuperNodeGraphBuilder` 收集/合并 scope 并检查 Cube/Vector 平台约束。[A14（PyPTO2-tensor版）]—[A16（PyPTO2-tensor版）] 因而 **“tensor版连计算子图边界都不能干预”也不成立**。不过，编译 scope、一个可执行函数、一个动态 task 实例和一个物理核并非一一对应，最终仍需检查图展开与 runtime 任务描述。
 
 #### 用户逻辑感知：同样“切块”，控制对象并不完全相同
 
-| 用户要控制什么 | PyPTO2-普通版 | PyPTO3（Simpler） |
+| 用户要控制什么 | PyPTO2-tensor版 | PyPTO3（Simpler） |
 | --- | --- | --- |
 | 数学计算 | Tensor 算术、matmul/reduce、切片/赋值；普通 softmax 也是五步数学运算 | Tensor/Tile API；教学 softmax 也可保持 Tensor 风格，不必手写任务提交 |
 | 算法级分块 | `pypto.loop`、`view`、`valid_shape`，例如 PA 的 batch/group/sequence 分段 | `pl.parallel/range`、切片、`pl.at` 等；PA 可以自己组织请求/head/page 循环 |
@@ -2339,12 +2345,12 @@ pypto.set_pass_options(sg_set_scope=-1)
 | 动态长度/shape | DYNAMIC、符号 shape、设备程序循环及有效窗口；仍需 tile/策略/缓存契约 | 动态 Tensor/有效窗口、设备读取和任务编排；物理片上容量仍受静态/资源约束 |
 | 从“能跑”到“很快”的排错对象 | Tensor 图→tile/子图/task、核内代码、依赖/dispatch、GM 图 | 层次 scope→InCore/Orchestration→PTOAS/Simpler；专家模式还需核对自己写的依赖/传递协议 |
 
-对应证据既有普通版的完整组合程序 [A13（PyPTO2-普通版）]，也有 PyPTO3 的普通 softmax、强融合 PA 和模型程序 [C15（PyPTO3（Simpler））]—[C20（PyPTO3（Simpler））]。**不能用普通版的简短教学程序，去对比 PyPTO3 专家手写的整层代码，再把代码长度或可见细节误认为框架的全部能力。**
+对应证据既有tensor版的完整组合程序 [A13（PyPTO2-tensor版）]，也有 PyPTO3 的普通 softmax、强融合 PA 和模型程序 [C15（PyPTO3（Simpler））]—[C20（PyPTO3（Simpler））]。**不能用tensor版的简短教学程序，去对比 PyPTO3 专家手写的整层代码，再把代码长度或可见细节误认为框架的全部能力。**
 
 #### 实际架构：相同的是责任层，不同的是中间契约
 
 ```text
-PyPTO2-普通版
+PyPTO2-tensor版
   Tensor/PIL + tile/scope 策略
     → TileFwk 图分解、编译、任务描述
     → CCE 核内代码 + TileFwk 控制/依赖/worker 协议
@@ -2357,15 +2363,15 @@ PyPTO3（Simpler）
 
 这解释了为什么二者整体相近，却不能互换某个 scheduler 库就完成迁移。任务参数 ABI、shape/stride、读写效应、完成/提前发布、GM 生命周期、异常协议都跨越编译器与 runtime；PTOAS 本身不承担这些上层协议。第 10 章的适配范围仍然适用。
 
-**megaKernel 的区别在性能协同接口，不只是 scheduler 是否存在。** PyPTO3 库直接示范“强融合 PA + 显式依赖 + 多阶段程序”；普通版更多通过图编译配置及任务体系优化。专家控制与维护责任同时增加，性能需按第 6.13 节的两组对照验证。
+**megaKernel 的区别在性能协同接口，不只是 scheduler 是否存在。** PyPTO3 库直接示范“强融合 PA + 显式依赖 + 多阶段程序”；tensor版更多通过图编译配置及任务体系优化。专家控制与维护责任同时增加，性能需按第 6.13 节的两组对照验证。
 
-### 4.9 重点对比：PyPTO2-Pro 与 CANNBot DSL
+### 4.9 重点对比：PyPTO2-block版 与 CANNBot DSL
 
 **两者相近的是“用户编写资源受约束的 kernel，并主动安排 tile、数据通路和时序”；差异不止后端格式，还包括 Python 分阶段语义和缓冲协作契约。**
 
 #### 先看相同 softmax 中最能体现用户差别的一段
 
-PyPTO2-Pro 的完整 softmax（第 2.3 节）从 TileGroup 取得轮转 tile，再发 load。下面把声明与使用处摘在一起；`tile_type/VA_IN*/valid_rows/cols` 等均在原 kernel 中定义，`auto_mutex=True` 也是该例子的前提：[B14（PyPTO2-Pro）]
+PyPTO2-block版 的完整 softmax（第 2.3 节）从 TileGroup 取得轮转 tile，再发 load。下面把声明与使用处摘在一起；`tile_type/VA_IN*/valid_rows/cols` 等均在原 kernel 中定义，`auto_mutex=True` 也是该例子的前提：[B14（PyPTO2-block版）]
 
 ```python
 in_group = pl.make_tile_group(
@@ -2387,65 +2393,65 @@ x_r = self.ch_x.wait()
 
 原 kernel 在最后一次使用 `x_r` 后执行 `self.ch_x.release(x_r)`。这两种写法都在解决缓冲复用与异步访问安全，但不能逐词替换：
 
-- **Pro TileGroup** 是带轮转 cursor 的 tile 集合，支持 `next/current/previous` 和下标；parser 将其展开为 IR handle，并保留 tile↔mutex 元数据供 `auto_mutex` 推断/插入同步。[B18（PyPTO2-Pro）] [B19（PyPTO2-Pro）]
+- **block版 TileGroup** 是带轮转 cursor 的 tile 集合，支持 `next/current/previous` 和下标；parser 将其展开为 IR handle，并保留 tile↔mutex 元数据供 `auto_mutex` 推断/插入同步。[B18（PyPTO2-block版）] [B19（PyPTO2-block版）]
 - **CANNBot Channel** 是带读写双 cursor 的有界 ring：生产者 `acquire→commit`，消费者 `wait→release`；这些操作进入 CANNIR。Buffer 用于不需要 ring 协议的局部存储；Channel/Buffer 的地址可以由 pass 规划，且存在固定地址选项。[D16（CANNBot DSL）]
-- Pro 的 `.next()` **本身不能解释为** Channel 的“等待生产完成”；CANNBot 的 `wait()` **也不是** Simpler 的“从 task ready queue 取一个核间任务”。Channel 还可表达特定跨核通道，但与通用设备任务图调度仍属于不同协议层。
+- block版 的 `.next()` **本身不能解释为** Channel 的“等待生产完成”；CANNBot 的 `wait()` **也不是** Simpler 的“从 task ready queue 取一个核间任务”。Channel 还可表达特定跨核通道，但与通用设备任务图调度仍属于不同协议层。
 
 #### 用户使用逻辑与实际架构逐项对齐
 
-| 维度 | PyPTO2-Pro | CANNBot DSL | 用户真正感知到的差别 |
+| 维度 | PyPTO2-block版 | CANNBot DSL | 用户真正感知到的差别 |
 | --- | --- | --- | --- |
-| 编译对象/入口 | `@pl.jit` kernel，普通 Python Host 使用 `[stream, blockDim, ...]` launch | `@jit` Host 调 `@kernel[block_dim]`；Host/Device 形成分阶段编译链 | Pro 示例的 Host 策略常留在 Python；CANNBot 可把 Host 控制流和 launch 一起生成 native 产物 |
+| 编译对象/入口 | `@pl.jit` kernel，普通 Python Host 使用 `[stream, blockDim, ...]` launch | `@jit` Host 调 `@kernel[block_dim]`；Host/Device 形成分阶段编译链 | block版 示例的 Host 策略常留在 Python；CANNBot 可把 Host 控制流和 launch 一起生成 native 产物 |
 | Python 语义 | ASTParser 遍历受支持 DSL，构造自有 IR；声明、常量计算和运行时值有区分 | 先分析/改写源码，再 materialize 为生成 MLIR 的可调用体；helper 可 trace-time inline | **两者都有前端分析，不是“一个有 Python，另一个只有构图”或“AST 与完全无 AST”的对立** |
 | 值/存储操作 | `pl.add(out, lhs, rhs)` 等 out-first Tile 操作；TileType 指定 memory/layout，make_tile/group 绑定地址 | Tensor/view/Buffer/Channel 加 out-first math；逻辑/物理 layout、搬运格式是显式对象 | 二者都不像单纯的高层纯函数 Tensor 图；需理解写入、别名与存储 |
 | 缓冲复用/同步 | 用户选择地址/槽/mutex；auto_mutex/pipeline 基于操作效应等落实局部同步 | 用户声明 Buffer/Channel 容量、depth、通道类型，并按协议使用；pass 分配/降低同步 | 控制意图相近，承载它的 IR、生命周期和验证规则不同 |
 | Cube/Vector 与寄存器 | section_cube/section_vector、Tile matmul、`pl.Vf`/system 等 | Cube 路径、VF/`reg.*`、copy engine、Channel 等 | 都可下探核内硬件工程；各自 API/目标约束仍不同，见第 2.11 节 |
 | 多核分工 | 核内读取 block/subblock 标识，用户编 loop；Host 选 blockDim/策略 | 核内读取 block/subblock 标识，用户编分工；Host launch 指定 block_dim | 没有 AICPU DAG 也可以用多核；硬件运行 block，不替用户分解业务工作 |
 | 动态 shape | DYNAMIC 参数、静态物理 tile+valid_shape、Host 分工参数/可选 TilingData | JIT/AOT TensorSpec/Dim、动态参数和有界资源；策略可留 Host 或编入 Host 部分 | 两者都不因 shape 变化必然要求客户新增一个独立 tiling 函数 |
-| 主 IR/后端 | 共享 PyPTO2 基础 native IR 上的 Pro 操作 → CCECodegen | CANNIR/其他 MLIR dialect → passes → AscendC/Host C++ | 不是把最终打印格式换一下即可互用 passes 或二进制 |
-| 外层设备调度 | 本次主路径是直接 kernel launch，不走普通版 AICPU task 图 | 本次主路径是 Host launch；能编 AICPU 函数不代表有通用 scheduler | 两者若要任务式整层执行，都要额外完成外层运行协议/集成 |
+| 主 IR/后端 | 共享 PyPTO2 基础 native IR 上的 block版 操作 → CCECodegen | CANNIR/其他 MLIR dialect → passes → AscendC/Host C++ | 不是把最终打印格式换一下即可互用 passes 或二进制 |
+| 外层设备调度 | 本次主路径是直接 kernel launch，不走tensor版 AICPU task 图 | 本次主路径是 Host launch；能编 AICPU 函数不代表有通用 scheduler | 两者若要任务式整层执行，都要额外完成外层运行协议/集成 |
 
-源码：[B1（PyPTO2-Pro）]—[B4（PyPTO2-Pro）] [B17（PyPTO2-Pro）]—[B20（PyPTO2-Pro）]、[D1（CANNBot DSL）]—[D9（CANNBot DSL）] [D16（CANNBot DSL）]—[D18（CANNBot DSL）]。
+源码：[B1（PyPTO2-block版）]—[B4（PyPTO2-block版）] [B17（PyPTO2-block版）]—[B20（PyPTO2-block版）]、[D1（CANNBot DSL）]—[D9（CANNBot DSL）] [D16（CANNBot DSL）]—[D18（CANNBot DSL）]。
 
 #### 相近思路落实到 softmax、PA 和 megaKernel 的代价
 
-尾轴 softmax 中，两者都能将五步数学计算放进一个 kernel，算子作者承担 tile 容量、尾块、局部复用和多核分工。前面 Pro 示例已经写了 multicore stride，CANNBot 的所选 softmax 示例则是 `block_dim=1`；这是**例子完成度的差别**，不能当成 CANNBot 架构只能单核。
+尾轴 softmax 中，两者都能将五步数学计算放进一个 kernel，算子作者承担 tile 容量、尾块、局部复用和多核分工。前面 block版 示例已经写了 multicore stride，CANNBot 的所选 softmax 示例则是 `block_dim=1`；这是**例子完成度的差别**，不能当成 CANNBot 架构只能单核。
 
-Paged attention 中，两者都可把真实长度作为数据、以固定物理 tile 循环处理；Host 均衡分工是否随长度更新，取决于算法设计。Pro 的 paged prefill 代码有 `build_work_ranges`，同一实现的单 token decode 已在 A5 通过；CANNBot 已找到 `FlashAttnNoquant(paged=True)`，也通过了选定 decode。因而可以用两个实际对象比较分工与流水；但 Pro 已测页大小变化及同批异长，CANNBot 此次 decode 只测 KV=512，覆盖范围和算子契约仍不相同，不能按“attention”名称直接声称等价覆盖或等价性能。[B-pa-test] [D-pa-test] [RUN-results]
+Paged attention 中，两者都可把真实长度作为数据、以固定物理 tile 循环处理；Host 均衡分工是否随长度更新，取决于算法设计。block版 的 paged prefill 代码有 `build_work_ranges`，同一实现的单 token decode 已在 A5 通过；CANNBot 已找到 `FlashAttnNoquant(paged=True)`，也通过了选定 decode。因而可以用两个实际对象比较分工与流水；但 block版 已测页大小变化及同批异长，CANNBot 此次 decode 只测 KV=512，覆盖范围和算子契约仍不相同，不能按“attention”名称直接声称等价覆盖或等价性能。[B-pa-test] [D-pa-test] [RUN-results]
 
 走向整层时，相近的难题是：多个不同并行分解阶段如何衔接、哪些结果必须全局归并、谁拥有 scratch、哪些核必须同时进展。TileGroup 和 Channel 都有助于表达局部/指定协作域的流水，但**单靠缓冲协议不能自动补出整层 task DAG 与 scheduler**。共享 buffer/effect 测试契约、矩阵/向量语义与 profiling 口径有意义；直接共用现有内存规划 pass 或 runtime 则需要 IR/ABI 适配，不能由思路接近推出。
 
-纳入 H/I 后，这组比较仍解释同一 NPU 上 TileGroup 与 Channel 的作者责任；H 又提供了“显式 layout/allocate/搬运 + 较早 MLIR”的对照对象，因此在编译分层上与 D 更直接相近。I 也有资源所有权与流水 helper，但其单位是 GPU fragment/warp/SMEM/TMEM；比较方法可共用，物理协议需单独映射。第 4.13 节保留两者逐项差异。[H-dsl] [H-passes] [I-layout] [I-pipeline]
+B/D 的比较体现同一 NPU 上 TileGroup 与 Channel 的作者责任；H 通过显式 layout/allocate/搬运和较早的 MLIR 入口，在编译分层上与 D 更直接相近。I 也有资源所有权与流水 helper，但其单位是 GPU fragment/warp/SMEM/TMEM；比较方法可共用，物理协议需单独映射。逐项差异见第 4.13 节。[H-dsl] [H-passes] [I-layout] [I-pipeline]
 
-### 4.10 PyPTO2-Pro 的 SPMD 与 PyPTO3（Simpler）的 MPMD：局部很像，整体不一样
+### 4.10 PyPTO2-block版 的 SPMD 与 PyPTO3（Simpler）的 MPMD：局部很像，整体不一样
 
-**按当前主要编程入口归类，PyPTO2-Pro 以 SPMD kernel 编程与直接 launch 为主；PyPTO3（Simpler）则提供支持 MPMD 的程序/任务执行体系，任务内部也可以采用 SPMD。**因此，“Pro 主要是 SPMD、PyPTO3 的核心差异在 MPMD 任务编排”是成立的架构概括；“Pro 只能 SPMD、PyPTO3 不做 SPMD”则不成立。这里比较的是已有的用户契约和运行时职责，不是理论表达能力的互斥分类，也不是性能排名。
+**按当前主要编程入口归类，PyPTO2-block版 以 SPMD kernel 编程与直接 launch 为主；PyPTO3（Simpler）则提供支持 MPMD 的程序/任务执行体系，任务内部也可以采用 SPMD。**因此，“block版 主要是 SPMD、PyPTO3 的核心差异在 MPMD 任务编排”是成立的架构概括；“block版 只能 SPMD、PyPTO3 不做 SPMD”则不成立。这里比较的是已有的用户契约和运行时职责，不是理论表达能力的互斥分类，也不是性能排名。
 
 #### 4.10.1 SPMD/MPMD 应按哪一层定义
 
-- **SPMD（Single Program, Multiple Data，单程序多数据）**：多个逻辑工作实例运行同一份计算程序/模板，按逻辑索引处理不同数据。它们可以走不同条件分支、循环不同次数；不要求像 SIMD 指令那样锁步执行，也不意味着 shape 必须静态。在 Pro 中，典型组织是一次 kernel launch 内按 block ID 划分 tile。
+- **SPMD（Single Program, Multiple Data，单程序多数据）**：多个逻辑工作实例运行同一份计算程序/模板，按逻辑索引处理不同数据。它们可以走不同条件分支、循环不同次数；不要求像 SIMD 指令那样锁步执行，也不意味着 shape 必须静态。在 block版 中，典型组织是一次 kernel launch 内按 block ID 划分 tile。
 - **MPMD（Multiple Program, Multiple Data，多程序多数据）**：工作集合可以包含不同计算程序及不同数据，例如 norm、GEMM、attention、residual 等任务。在本文的 PyPTO3 语境中，重点是这些程序有独立的可调用入口与任务描述，可由外层依赖关系组织，再交给运行时派发；不是要求“某个物理核永远只运行某一种程序”。
 - **静态/动态调度是另一条轴**：MPMD 可以静态安排，SPMD 也可以在同一程序里动态领取工作。不能从缩写本身推出“MPMD 一定有 AICPU”“SPMD 一定没有动态调度”。PyPTO3 的设备 scheduler 是当前实现提供的额外机制，不是 MPMD 一词的定义。
 
-NPU 的 Cube/Vector 还需要区分逻辑与物理：Pro 的一个 mixed kernel 可以包含不同的 Cube/Vector section，并在相应执行域展开逻辑 block；两类核显然不执行相同指令。本文称它“SPMD 为主”，指的是**重复实例化同一个逻辑合作模板**，不是所有 AIC/AIV 必须共用一份二进制。反过来，Simpler 的多个 AICore 即使先进入同一个 executor，也可以通过不同函数地址执行不同任务；公共 executor 不会把上层任务体系变成只有一种计算程序。[B13（PyPTO2-Pro）] [B10（PyPTO2-Pro）] [C33（PyPTO3（Simpler））]
+NPU 的 Cube/Vector 还需要区分逻辑与物理：block版 的一个 mixed kernel 可以包含不同的 Cube/Vector section，并在相应执行域展开逻辑 block；两类核显然不执行相同指令。本文称它“SPMD 为主”，指的是**重复实例化同一个逻辑合作模板**，不是所有 AIC/AIV 必须共用一份二进制。反过来，Simpler 的多个 AICore 即使先进入同一个 executor，也可以通过不同函数地址执行不同任务；公共 executor 不会把上层任务体系变成只有一种计算程序。[B13（PyPTO2-block版）] [B10（PyPTO2-block版）] [C33（PyPTO3（Simpler））]
 
 #### 4.10.2 同层比较：差别在程序由谁组织，而非有没有 block ID
 
-必须把比较边界对齐：**Pro 的 kernel 编译能力，应先对比 PyPTO3 的 InCore/融合 SPMD kernel 子路径；随后单独比较外层程序执行能力。**
+必须把比较边界对齐：**block版 的 kernel 编译能力，应先对比 PyPTO3 的 InCore/融合 SPMD kernel 子路径；随后单独比较外层程序执行能力。**
 
-| 同层问题 | PyPTO2-Pro | PyPTO3（Simpler） | 判断 |
+| 同层问题 | PyPTO2-block版 | PyPTO3（Simpler） | 判断 |
 | --- | --- | --- | --- |
 | 一个核内计算如何写 | 显式 Tile/section/VF/地址/mutex | Tensor 降到 Tile，或直接 Tile/MemRef/system/extern | 有相近的核内工程需求，但 API 粒度、操作覆盖和后端不同 |
 | 多核跑同一算法 | Host 选 blockDim，kernel 自己按 block ID 分工 | SPMD task 指定 logical blocks，kernel 内同样可以 block-stride | 两者都能 SPMD；整体区别在外层是否已有多程序任务契约 |
 | norm→GEMM→PA→GEMM 等异构阶段 | 普通 Host 多次 launch，或作者设计更大的合作 kernel；当前主路径未提供同等外层 DAG | 可由 Orchestration/Simpler 组织多个 InCore/SPMD/extern task | 整体能力边界不同：一个主要编 kernel，另一个还编设备侧程序与任务关系 |
 | 一个 kernel 完成后谁推进下一阶段 | Host/stream 顺序，或已经写进单 kernel 的协作协议 | 外层 task 依赖、ready/dispatch/完成协议；kernel 内仍有自己的同步 | 库名含 runtime，不意味着它们在同一层做相同工作 |
-| 增加一个自定义高性能核 | 直接编为 Pro kernel 并 launch | 可写对应 InCore，也可适配 extern task ABI | 存在组合可能；Pro 原 Host launcher 不能原封不动变成 Simpler 的 task entry |
+| 增加一个自定义高性能核 | 直接编为 block版 kernel 并 launch | 可写对应 InCore，也可适配 extern task ABI | 存在组合可能；block版 原 Host launcher 不能原封不动变成 Simpler 的 task entry |
 
-表中的关键区别是**谁有权、也有责任选择下一份计算程序**：Pro 常见路径中，作者通过 Host 调用或 kernel 内部控制流表达；PyPTO3 则把多个可调用程序及依赖交给任务系统。后一种情况下，不同就绪任务在资源允许时可以并发，但存在依赖的阶段不会因为称为 MPMD 就自动重叠。
+表中的关键区别是**谁有权、也有责任选择下一份计算程序**：block版 常见路径中，作者通过 Host 调用或 kernel 内部控制流表达；PyPTO3 则把多个可调用程序及依赖交给任务系统。后一种情况下，不同就绪任务在资源允许时可以并发，但存在依赖的阶段不会因为称为 MPMD 就自动重叠。
 
-#### 4.10.3 PyPTO2-Pro：用户先写一个逻辑 block 怎样工作，再将它展开到多核
+#### 4.10.3 PyPTO2-block版：用户先写一个逻辑 block 怎样工作，再将它展开到多核
 
-Pro 的多核指南明确采用 SPMD 的跨步切分方式。真实 softmax 中，Host 调用 `softmax_tile_group_kernel[None, num_cores](x, y)`；下面是核内工作分配的摘录，依赖原函数中的 Tensor、Tile 与 `TILE_ROWS` 定义，不是另一个完整 softmax：[B13（PyPTO2-Pro）] [B14（PyPTO2-Pro）]
+block版 的多核指南明确采用 SPMD 的跨步切分方式。真实 softmax 中，Host 调用 `softmax_tile_group_kernel[None, num_cores](x, y)`；下面是核内工作分配的摘录，依赖原函数中的 Tensor、Tile 与 `TILE_ROWS` 定义，不是另一个完整 softmax：[B13（PyPTO2-block版）] [B14（PyPTO2-block版）]
 
 ```python
 rows = x.shape[0]
@@ -2461,9 +2467,9 @@ for tile_id in pl.range(core_id, num_tiles, num_cores):
 
 含义是：逻辑核 `core_id` 依次处理 `core_id, core_id + num_cores, ...` 对应的行块；每个行块内部完成 max→sub→exp→sum→div。这里循环中的“工作项”不是自动提交给外层 scheduler 的独立 task。作者决定 tile 大小、尾块、每核分配和局部流水，JIT 负责把这个程序编成可启动的 kernel。
 
-实际启动链为 `JITKernel.__getitem__ → launcher → _launch → entry/call_kernel`；`_generate_caller_cpp` 生成 `kernel<<<blockDim, nullptr, stream>>>(...)`。因此，`python/pypto_pro/runtime` 中存在 runtime 代码，并不意味着这条路径使用了普通版的 AICPU 任务调度器。[B3（PyPTO2-Pro）] [B30（PyPTO2-Pro）]
+实际启动链为 `JITKernel.__getitem__ → launcher → _launch → entry/call_kernel`；`_generate_caller_cpp` 生成 `kernel<<<blockDim, nullptr, stream>>>(...)`。因此，`python/pypto_pro/runtime` 中存在 runtime 代码，并不意味着这条路径使用了tensor版的 AICPU 任务调度器。[B3（PyPTO2-block版）] [B30（PyPTO2-block版）]
 
-这里的 block ID 是逻辑索引，不应承诺它永久绑定特定物理核；mixed kernel 的 Vector 域还需按 subblock 语义计算工作单元数。`num_cores=32` 等样例常量也不是所有芯片通用的硬件结论。这个 softmax 测试标记的目标为 `soc("950")`，本 session 已在 A5 执行其六组 FP32 输入并通过，含 `777×300` 及 `2049×100` 尾块；这为分工公式提供了设备正确性对象，仍不是所有几何或性能的证明。[B13（PyPTO2-Pro）] [B14（PyPTO2-Pro）] [RUN-smoke]
+这里的 block ID 是逻辑索引，不应承诺它永久绑定特定物理核；mixed kernel 的 Vector 域还需按 subblock 语义计算工作单元数。`num_cores=32` 等样例常量也不是所有芯片通用的硬件结论。这个 softmax 测试标记的目标为 `soc("950")`，本 session 已在 A5 执行其六组 FP32 输入并通过，含 `777×300` 及 `2049×100` 尾块；这为分工公式提供了设备正确性对象，仍不是所有几何或性能的证明。[B13（PyPTO2-block版）] [B14（PyPTO2-block版）] [RUN-smoke]
 
 #### 4.10.4 PyPTO3：外层可派发不同程序，一个 task 内又可以 SPMD
 
@@ -2496,21 +2502,21 @@ dispatch_payload.function_bin_addr = callable->resolved_addr();
 
 #### 4.10.5 对 softmax、attention 和整层 megaKernel，用户代价具体差在哪里
 
-1. **可在核内完成的 softmax：SPMD/MPMD 不是融合程度的分界。**Pro 可以让每个逻辑核在自己的 UB Tile 上串起五项运算；PyPTO3 也可以写一个融合 InCore，并通过多个独立 tile task 或一个 SPMD task 展开。若在 PyPTO3 中将五项运算人为拆为五类 task，就额外引入了任务依赖和中间存储边界；MPMD 不会自动省掉这些 GM 往返。超长 reduce 则需要正确的分段统计/合并算法，两条路线都不能靠执行模型标签解决。具体融合写法见第 8.3 节。
+1. **可在核内完成的 softmax：SPMD/MPMD 不是融合程度的分界。**block版 可以让每个逻辑核在自己的 UB Tile 上串起五项运算；PyPTO3 也可以写一个融合 InCore，并通过多个独立 tile task 或一个 SPMD task 展开。若在 PyPTO3 中将五项运算人为拆为五类 task，就额外引入了任务依赖和中间存储边界；MPMD 不会自动省掉这些 GM 往返。超长 reduce 则需要正确的分段统计/合并算法，两条路线都不能靠执行模型标签解决。具体融合写法见第 8.3 节。
 
-2. **paged decode：外层调度与核内动态长度要分别设计。**按 Pro 的 kernel 编程方式，作者需要在合作 kernel 中设计 QK、softmax、PV 及实际长度循环，或通过 Host 拆成多个 launch；第 2.6 节保留 prefill 的分工示例，并已补充同一实现的 A5 单 token decode 正确性验证；核内分工是否适合真实 decode 长度分布仍需性能测量。PyPTO3 既可将阶段拆成不同任务，也可像 `pypto-lib` native PA 一样保留为融合的多 block SPMD task。后者一旦将请求按固定 stride 分给 logical blocks，外层 Simpler 就不会自动把长请求的剩余 pages 迁移给短请求已经空闲的核。拆成更细任务可能增加调度机会，也可能增加中间 GM、依赖和调度开销；应按算法/数据生命周期决定，而不是一律拆开。
+2. **paged decode：外层调度与核内动态长度要分别设计。**按 block版 的 kernel 编程方式，作者需要在合作 kernel 中设计 QK、softmax、PV 及实际长度循环，或通过 Host 拆成多个 launch；第 2.6 节保留 prefill 的分工示例，并已补充同一实现的 A5 单 token decode 正确性验证；核内分工是否适合真实 decode 长度分布仍需性能测量。PyPTO3 既可将阶段拆成不同任务，也可像 `pypto-lib` native PA 一样保留为融合的多 block SPMD task。后者一旦将请求按固定 stride 分给 logical blocks，外层 Simpler 就不会自动把长请求的剩余 pages 迁移给短请求已经空闲的核。拆成更细任务可能增加调度机会，也可能增加中间 GM、依赖和调度开销；应按算法/数据生命周期决定，而不是一律拆开。
 
-3. **整层 Transformer：PyPTO3 更直接提供程序级组织能力，Pro 更集中于 kernel 内部工程。**norm、各次 GEMM、attention、MLP 的并行度、核类型及 tile 形状通常不同。PyPTO3 可让这些阶段保持不同入口、不同 block 数及依赖，复用现成任务系统推进；作者仍需设计任务粒度、局部融合及中间 Tensor。Pro 作者可通过 Host/stream 组织多次 launch；若要求将整层留在一个更大的合作 kernel 中，则需要额外处理阶段转换、工作重分配、跨核同步与缓冲复用，或接入另一套任务 runtime。**前者降低的是程序级 megaKernel 的组织成本，不是对极致性能的保证。**详细性能机会与差距见第 6 章，不能用本节的源码证据代替实测。
+3. **整层 Transformer：PyPTO3 更直接提供程序级组织能力，block版 更集中于 kernel 内部工程。**norm、各次 GEMM、attention、MLP 的并行度、核类型及 tile 形状通常不同。PyPTO3 可让这些阶段保持不同入口、不同 block 数及依赖，复用现成任务系统推进；作者仍需设计任务粒度、局部融合及中间 Tensor。block版 作者可通过 Host/stream 组织多次 launch；若要求将整层留在一个更大的合作 kernel 中，则需要额外处理阶段转换、工作重分配、跨核同步与缓冲复用，或接入另一套任务 runtime。**前者降低的是程序级 megaKernel 的组织成本，不是对极致性能的保证。**详细性能机会与差距见第 6 章，不能用本节的源码证据代替实测。
 
-动态 shape 也不随这一分类自动分出高下：Pro 的运行时 shape/长度、固定 tile 循环、Python 策略和 TilingData，都可以承载 tiling 决策；PyPTO3 的决策可以在 Orchestration、SPMD 核内、Host Python 或专门 tiling task 中。**SPMD 不强制单独 Host tiler，MPMD/AICPU 也不消灭 tiling 逻辑。**具体何时重算参数、何时改写函数、何时重新编译，见第 7.8—7.9 节。
+动态 shape 也不随这一分类自动分出高下：block版 的运行时 shape/长度、固定 tile 循环、Python 策略和 TilingData，都可以承载 tiling 决策；PyPTO3 的决策可以在 Orchestration、SPMD 核内、Host Python 或专门 tiling task 中。**SPMD 不强制单独 Host tiler，MPMD/AICPU 也不消灭 tiling 逻辑。**具体何时重算参数、何时改写函数、何时重新编译，见第 7.8—7.9 节。
 
 #### 4.10.6 能否跨过边界：可以组合，但当前不等于已经兼容
 
-SPMD 不是理论禁令：同一个程序可以按角色分支执行不同阶段，或在适用硬件机制上实现工作队列；Pro 已有 Cube/Vector section 和跨核同步配套。这说明它可以表达合作程序，但不能据此补出一套已经交付、可复用的 Simpler 式异构任务 DAG。若作者自行增加这样的调度器，负载分配、进展性、依赖、缓存一致性和资源回收也成为作者要实现和验证的内容。[B30（PyPTO2-Pro）]
+SPMD 不是理论禁令：同一个程序可以按角色分支执行不同阶段，或在适用硬件机制上实现工作队列；block版 已有 Cube/Vector section 和跨核同步配套。这说明它可以表达合作程序，但不能据此补出一套已经交付、可复用的 Simpler 式异构任务 DAG。若作者自行增加这样的调度器，负载分配、进展性、依赖、缓存一致性和资源回收也成为作者要实现和验证的内容。[B30（PyPTO2-block版）]
 
-可组合方向是 **Pro/CANNBot 专门核 → Simpler task ABI 适配 → PyPTO3 外层程序提交**，具体参数、逻辑索引、完成/依赖等契约见第 10.3 节；这是待验证的集成方向。接入后，专门核仍可采用 SPMD，只是外层由 MPMD-capable 的任务系统组织。核内子域相近，不改变 PyPTO3 与普通版在程序/任务层更近的整体判断。
+可组合方向是 **block版/CANNBot 专门核 → Simpler task ABI 适配 → PyPTO3 外层程序提交**，具体参数、逻辑索引、完成/依赖等契约见第 10.3 节；这是待验证的集成方向。接入后，专门核仍可采用 SPMD，只是外层由 MPMD-capable 的任务系统组织。核内子域相近，不改变 PyPTO3 与tensor版在程序/任务层更近的整体判断。
 
-**最终表述应是：PyPTO2-Pro 的主要抽象单位是“一个多核合作 kernel”；PyPTO3（Simpler）的主要架构识别点是“由不同计算程序构成、允许 task 内 SPMD 的设备任务系统”。**选用不同粒度会改变用户责任、调度空间和数据搬运边界，不能仅按是否含 SPMD/MPMD 字样判断完整能力。
+**最终表述应是：PyPTO2-block版 的主要抽象单位是“一个多核合作 kernel”；PyPTO3（Simpler）的主要架构识别点是“由不同计算程序构成、允许 task 内 SPMD 的设备任务系统”。**选用不同粒度会改变用户责任、调度空间和数据搬运边界，不能仅按是否含 SPMD/MPMD 字样判断完整能力。
 
 H 的 mixed kernel 拆出 AIC/AIV，I 的 kernel 为 warp 指定载入、矩阵计算或归约等角色，也属于应按层命名的例子。它们可以承载一个合作计算体；若要放进本节的多程序任务体系，还需设备可调用入口、逻辑 ID、资源组及完成语义。单靠 mixed/warp 分支或 TS 的 `Task` 名称，不能推断已有整层 MPMD runtime。[H-mixed-pass] [I-gqa] [I-task]
 
@@ -2621,8 +2627,8 @@ PyPTO 自有 IR 同样可以实现 SSA、类型、visitor、pass、控制流和 
 
 | 路线 | MLIR 进入位置与输入 | 到这里哪些事情通常已确定 | MLIR 区间做什么/输出什么 | 不在这个区间内的关键职责 |
 | --- | --- | --- | --- | --- |
-| A（PyPTO2-普通版） | 当前审计主链不是 MLIR 主导：Python/PIL/自有 IR → TileFwk/CCE | Tensor 程序、tile 配置、图/任务构造在本栈处理 | 不应凭末端编译器名称宣称其前端是 MLIR | TileFwk 任务执行和图级 GM 管理不能由 PTOAS 代替 |
-| B（PyPTO2-Pro） | Pro 自有原生 IR → CCECodegen；不是 PTOAS/HIVM 接口 | 用户选的 TileType、地址/槽位、core-stride、Vector/Cube body | 自有 pass 与 codegen 承担对应编译职责；没有“因为不用 MLIR 就无法优化”的结论 | Host JIT/shape ABI/launch；默认不启动普通版任务 scheduler |
+| A（PyPTO2-tensor版） | 当前审计主链不是 MLIR 主导：Python/PIL/自有 IR → TileFwk/CCE | Tensor 程序、tile 配置、图/任务构造在本栈处理 | 不应凭末端编译器名称宣称其前端是 MLIR | TileFwk 任务执行和图级 GM 管理不能由 PTOAS 代替 |
+| B（PyPTO2-block版） | block版 自有原生 IR → CCECodegen；不是 PTOAS/HIVM 接口 | 用户选的 TileType、地址/槽位、core-stride、Vector/Cube body | 自有 pass 与 codegen 承担对应编译职责；没有“因为不用 MLIR 就无法优化”的结论 | Host JIT/shape ABI/launch；默认不启动tensor版任务 scheduler |
 | C（PyPTO3（Simpler）） | 自有 IR 后端输出 InCore 的 PTO dialect MLIR | task/scope 边界、核内职责、部分 tile/layout/内存决策 | PTO pass、memory/sync/合法化，当前集成常用 EmitC→C++ | Orchestration、TaskId、Simpler 依赖与跨 task GM 生命周期 |
 | D（CANNBot DSL） | Python tracing 较早建立 CANNIR；Host 与 kernel 可同处编译流程 | 作者显式选择的 tile/Channel/Buffer/流水结构 | layout、Channel lowering、VF grouping、mixed split、Asc 相关 dialect→AscendC | Python 专门化/AOT 契约、调用 runtime；无自动全模型动态 task scheduler |
 | E（PyPTO on GPU） | 自有 IR/模式识别→typed `nv_tensor_ir` MLIR module | 高层已接受的模式、静态规格与调度配置；被拒绝的图根本到不了此处 | NVIDIA TensorIR→CUDA Tile IR→prepared/assembled artifact | PyPTO 图覆盖、shape guard、API 多 executable 分组与 CUDA launch |
@@ -2631,7 +2637,7 @@ PyPTO 自有 IR 同样可以实现 SSA、类型、visitor、pass、控制流和 
 | H（CATLASS DSL） | Python TLA builder 较早生成 TLA/标准 MLIR | 作者已选物理 tile/layout tag、内存空间/容量、MMAD/Vector 与搬运策略 | 分类/AutoMutex、mixed 拆分、tensor/ptr lowering、HIVM/AVE/标准转换；末端交 `hivmc-a5` | Host 编译缓存、ABI/launch 与 kernel 外 GM；不会因此获得 F 的完整高层 tiling 或模型任务 runtime。[H-passes] [H-compile] |
 | I（CuTe DSL） | Python DSL 生成 CuTe/相关 MLIR，Host 与 Device 分阶段处理 | layout/atom、线程/warp 角色、tile/pipeline 和 launch 配置由作者/模板给出 | 调用 `cute-to-nvvm` 等编译 pipeline，再由配套组件形成 CUDA 产物 | Python 专门化、CUDA 上下文/stream、全局 workspace 和模型调度；仅此源码树不足以认定完整编译器可重建。[I-dsl] [I-compiler] [I-executor] |
 
-对应证据：A（PyPTO2-普通版）[A2（PyPTO2-普通版）]—[A6（PyPTO2-普通版）]；B（PyPTO2-Pro）[B1（PyPTO2-Pro）]；C（PyPTO3（Simpler））[C1（PyPTO3（Simpler））]—[C3（PyPTO3（Simpler））]；D（CANNBot DSL）[D2（CANNBot DSL）]—[D4（CANNBot DSL）]；E（PyPTO on GPU）[E2（PyPTO on GPU）]—[E3（PyPTO on GPU）] [E13（PyPTO on GPU）]；F（Triton-Ascend）[F1（Triton-Ascend）] [F2（Triton-Ascend）] [F8（Triton-Ascend）]；G（AutoFuse + Inductor）[G2（AutoFuse + Inductor）]—[G5（AutoFuse + Inductor）]。
+对应证据：A（PyPTO2-tensor版）[A2（PyPTO2-tensor版）]—[A6（PyPTO2-tensor版）]；B（PyPTO2-block版）[B1（PyPTO2-block版）]；C（PyPTO3（Simpler））[C1（PyPTO3（Simpler））]—[C3（PyPTO3（Simpler））]；D（CANNBot DSL）[D2（CANNBot DSL）]—[D4（CANNBot DSL）]；E（PyPTO on GPU）[E2（PyPTO on GPU）]—[E3（PyPTO on GPU）] [E13（PyPTO on GPU）]；F（Triton-Ascend）[F1（Triton-Ascend）] [F2（Triton-Ascend）] [F8（Triton-Ascend）]；G（AutoFuse + Inductor）[G2（AutoFuse + Inductor）]—[G5（AutoFuse + Inductor）]。
 
 **同用 MLIR 的两个后端，优化自由度也可能不同。** 输入已变成具体 buffer 和低层搬运时，后端能重排/复用这些动作，不代表还能可靠恢复跨 task 的 tensor 语义、重新分组整层或撤销前端做出的所有布局选择。
 
@@ -2809,7 +2815,7 @@ H 是“下游本体能力与集成入口能力分开”的第三个 NPU 例子�
 
 ### 5.8 AscendC 应作为下层参照，而不是额外的同等级平台
 
-AscendC 直接暴露 LocalTensor / GlobalTensor、TBuf / TQue / TPipe、搬运、Vector/Cube API 与同步等设备编程构件，Host 侧可组织 tiling、workspace 和 launch。这使它在用户感知上最接近 B（PyPTO2-Pro）/D（CANNBot DSL） 的核内工程层，在 G（AutoFuse + Inductor） 中则往往由生成器替用户使用。
+AscendC 直接暴露 LocalTensor / GlobalTensor、TBuf / TQue / TPipe、搬运、Vector/Cube API 与同步等设备编程构件，Host 侧可组织 tiling、workspace 和 launch。这使它在用户感知上最接近 B（PyPTO2-block版）/D（CANNBot DSL） 的核内工程层，在 G（AutoFuse + Inductor） 中则往往由生成器替用户使用。
 
 本工作区可直接从 D（CANNBot DSL） 的 AscendC translator、G（AutoFuse + Inductor） 的 codegen 和 C（PyPTO3（Simpler）） 的 CCE extern 看到实际使用。[D4（CANNBot DSL）] [G5（AutoFuse + Inductor）] [C19（PyPTO3（Simpler））]
 
@@ -2826,8 +2832,8 @@ H 的选定 Python TLA 链经 HIVM/AVE lowering 与 `hivmc-a5` 形成设备产�
 
 | 路线 | A2/A3 | A5 | GPU |
 | --- | --- | --- | --- |
-| A（PyPTO2-普通版） | TileFwk执行及相应目标代码 | 同仓存在A5/950目标与测试；逐算子确认 | 本文不将E（PyPTO on GPU）视为A（PyPTO2-普通版）的同一个GPU后端 |
-| B（PyPTO2-Pro） | 有架构/后端选择；不能把A5例子当A2/A3实测 | 本文双动态softmax、VF/paged prefill例子主要在此 | 选定路径非GPU |
+| A（PyPTO2-tensor版） | TileFwk执行及相应目标代码 | 同仓存在A5/950目标与测试；逐算子确认 | 本文不将E（PyPTO on GPU）视为A（PyPTO2-tensor版）的同一个GPU后端 |
+| B（PyPTO2-block版） | 有架构/后端选择；不能把A5例子当A2/A3实测 | 本文双动态softmax、VF/paged prefill例子主要在此 | 选定路径非GPU |
 | C（PyPTO3（Simpler）） | Simpler架构目录；pypto-lib native PA驱动在此 | PyPTO/PTOAS/runtime有对应目标；native PA该驱动未给A5入口 | E（PyPTO on GPU）为独立checkout和集成路径，不自动继承 |
 | D（CANNBot DSL） | AscendC/CANNIR按目标处理 | 有arch35/VF等特化及例子 | 选定路径非GPU |
 | E（PyPTO on GPU） | 非此路径目标 | 非此路径目标 | TensorIR/CUDA Tile；历史softmax是sm89，PA库另有sm120示例 |
@@ -2838,7 +2844,7 @@ H 的选定 Python TLA 链经 HIVM/AVE lowering 与 `hivmc-a5` 形成设备产�
 
 表中“有分支/测试”不是“当前机器实测可用”，更不是所有 dtype、layout、shape 和融合形式的通用覆盖保证。
 
-### 5.10 H/I 的 MLIR：新增的具体共享点与不能共用的边界
+### 5.10 H/I 的 MLIR：共享点与兼容边界
 
 H 的 `buildTlaPipeline()` 提供了明确的 pass 顺序：先区分 AIC/AIV/MIX，再处理自动 mutex、extern、pointer、mixed 函数拆分和 tensor descriptor；随后降低 Vector/Cube 区域、block 索引、flag/mutex，最后进入 HIVM/AVE、regbase intrinsic 及 SCF→CF。还有一个能联系第 8 章的局部优化例子：AVE 合并可将 `vsub` 后接 `vexp` 的序列组合为 `vexpdif`。这是**具体核内指令序列优化**，不是自动把任意两个 attention/task 融合。[H-passes]
 
@@ -2874,8 +2880,8 @@ NPU mixed kernel 可能有 AIC/AIV 不同机器码；应记录其运行协议、
 
 | 路线 | 当前源码最强的直接证据 | 一层Transformer的路线判断 | 主要缺口或必须验证的项 |
 | --- | --- | --- | --- |
-| A（PyPTO2-普通版） | 多阶段Tensor程序、设备任务runtime；[A13（PyPTO2-普通版）]已有预处理/投影/cache/attention组合 | K1/K3方向与架构匹配；不必把整层写成一个巨大SPMD body | graph/task分解、所有算子覆盖、runtime开销、实际launch及GM图；本次无整层同口径测量 |
-| B（PyPTO2-Pro） | 单kernel内vector/cube/流水、动态TND及paged prefill | 可手工扩展合作kernel；不是SPMD理论上做不了整层 | 全局归约/重分片/跨阶段进展、scratch、代码体积、核利用率；未确认整层通用实现 |
+| A（PyPTO2-tensor版） | 多阶段Tensor程序、设备任务runtime；[A13（PyPTO2-tensor版）]已有预处理/投影/cache/attention组合 | K1/K3方向与架构匹配；不必把整层写成一个巨大SPMD body | graph/task分解、所有算子覆盖、runtime开销、实际launch及GM图；本次无整层同口径测量 |
+| B（PyPTO2-block版） | 单kernel内vector/cube/流水、动态TND及paged prefill | 可手工扩展合作kernel；不是SPMD理论上做不了整层 | 全局归约/重分片/跨阶段进展、scratch、代码体积、核利用率；未确认整层通用实现 |
 | C（PyPTO3（Simpler）） | pypto-lib `decode_fwd`；显式TaskId、SPMD attention、跨阶段/层组织 | K1/K3已有具体模型程序；更强物理融合可逐子图推进 | 需清点worker/control/task entry；不能把整层程序称作一个物理kernel或零GM |
 | D（CANNBot DSL） | Host/Device DSL、完整FA/paged混合流水、显式缓冲与控制；已通过选定A5 decode | 手写大合作kernel有表达基础；也可由Host组合多kernel | 尚缺整层原生运行及性能证据；PA尾页/异长范围还需扩展，不能仅凭API覆盖宣布整层完成 |
 | E（PyPTO on GPU） | 受支持operator图、直接launch；PA有合并和分头分支 | 当前通用多task程序受frontend/emitter限制；先扩大图覆盖与融合 | 六函数程序历史拒绝、shape模式限制、跨CTA合作、安全进展、真实单kernel覆盖 |
@@ -2884,7 +2890,7 @@ NPU mixed kernel 可能有 AIC/AIV 不同机器码；应记录其运行协议、
 | H（CATLASS DSL） | mixed MMAD+add、连续 FA，A5 有编译/数值及 mixed lowering 产物；另有 StreamK | 可沿显式 CV 合作 kernel 扩展局部融合；单入口与局部中间数据复用有对象 | Q=1 连续 decode 先补正确性；分页/设备异长、整层重分片/全局进展/GM 仍需实现验收，不能由一份 FA 推为 K1—K5 全满足。[H-run-results] [H-run-artifacts] [H-streamk] |
 | I（CuTe DSL） | 分页 MLA、连续 GQA 两阶段、persistent/CLC 与 experimental warp TS 源码 | 合作 kernel 的角色、资源与调度协议有较具体工具；Host JIT 也可组织多 kernel | 本机未运行；GQA 两个 launch 和 partial GM、TS 粒度/有界检查、整层跨 CTA 进展须分别验收。[I-mla] [I-gqa] [I-task] [I-checker] |
 
-以上不是可达成性概率排名。A（PyPTO2-普通版）/C（PyPTO3（Simpler）） 的已有程序执行框架减少的是跨阶段组织工作的重复；B（PyPTO2-Pro）/D（CANNBot DSL）/F（Triton-Ascend） 的核内控制让局部强融合更直接；G（AutoFuse + Inductor） 的优势方向是客户无需重写模型而自动融合；E（PyPTO on GPU） 的当前限制需要在具体 emitter 层判断。
+以上不是可达成性概率排名。A（PyPTO2-tensor版）/C（PyPTO3（Simpler）） 的已有程序执行框架减少的是跨阶段组织工作的重复；B（PyPTO2-block版）/D（CANNBot DSL）/F（Triton-Ascend） 的核内控制让局部强融合更直接；G（AutoFuse + Inductor） 的优势方向是客户无需重写模型而自动融合；E（PyPTO on GPU） 的当前限制需要在具体 emitter 层判断。
 
 H/I 也归入这个责任分析：H 为 NPU CV 合作提供更多局部可控对象，I 为 GPU warp/资源与 persistent 工作提供工具；两者能减少某些核内协议工程，但所选源码没有据此交付任意 Transformer 整层的设备任务系统。性能机会与工程缺口应继续按 K1—K5 分项判断。
 
@@ -2987,7 +2993,7 @@ div: 读 exponent，写 Y
 - 单合作 kernel 内归并也要证明跨核进展和存储可见性；不能用普通 block barrier 替代。
 - 是否更快取决于长行长度、独立行数、内存/指数瓶颈与同步成本，不存在“一 kernel 必胜”的一般规则。
 
-这说明 B（PyPTO2-Pro）的完整 `MAX_N=512` softmax、C（PyPTO3（Simpler））固定行 tile 教学例、F（Triton-Ascend）的单行 reduce 都只能证明各自覆盖的局部问题；不能据它们的短代码直接推导超长 reduce 的整机最优解。
+这说明 B（PyPTO2-block版）的完整 `MAX_N=512` softmax、C（PyPTO3（Simpler））固定行 tile 教学例、F（Triton-Ascend）的单行 reduce 都只能证明各自覆盖的局部问题；不能据它们的短代码直接推导超长 reduce 的整机最优解。
 
 #### decode attention：GQA 复用、page 流式算法和阶段流水往往比 launch 计数更重要
 
@@ -3049,15 +3055,15 @@ H/I 的资源配置使“换阶段需重做分解”有更具体的输入：第 
 
 | 机制 | 极致性能机会 | 主要代价/退化条件 | 主要对应路线 |
 | --- | --- | --- | --- |
-| 设备任务图 + 各阶段专门 kernel | 各阶段保留合适 tile、核心数和代码资源；可重叠独立任务、隐藏 Host 间隔 | task 太细则构图/依赖/派发占比高；task 边界多 GM；资源组/affinity 不佳影响流水 | A（PyPTO2-普通版）、C（PyPTO3（Simpler）） |
-| 大合作 kernel / persistent SPMD，含角色分工 | 阶段间直接通信、细粒度流水和局部复用；减少部分调度边界 | 全局同步、资源最重分支、代码/寄存器压力、动态不均衡、进展/退出协议 | B（PyPTO2-Pro）、D（CANNBot DSL）；C（PyPTO3（Simpler））的 SPMD task；F（Triton-Ascend）须在后端/协议支持范围内；H（CATLASS DSL）的 CV 合作、I（CuTe DSL）的 warp/persistent/CLC/TS 也在此层比较，均不据此认定整层已实现。[H-mixed] [I-task] [I-dynamic] |
+| 设备任务图 + 各阶段专门 kernel | 各阶段保留合适 tile、核心数和代码资源；可重叠独立任务、隐藏 Host 间隔 | task 太细则构图/依赖/派发占比高；task 边界多 GM；资源组/affinity 不佳影响流水 | A（PyPTO2-tensor版）、C（PyPTO3（Simpler）） |
+| 大合作 kernel / persistent SPMD，含角色分工 | 阶段间直接通信、细粒度流水和局部复用；减少部分调度边界 | 全局同步、资源最重分支、代码/寄存器压力、动态不均衡、进展/退出协议 | B（PyPTO2-block版）、D（CANNBot DSL）；C（PyPTO3（Simpler））的 SPMD task；F（Triton-Ascend）须在后端/协议支持范围内；H（CATLASS DSL）的 CV 合作、I（CuTe DSL）的 warp/persistent/CLC/TS 也在此层比较，均不据此认定整层已实现。[H-mixed] [I-task] [I-dynamic] |
 | 图编译器逐步扩大自动融合域 | 客户少改代码；可以统一搜索融合/tiling，避免人为过早切 kernel | 模式/模板/成本模型覆盖不足就拆分或 fallback；编译搜索预算；跨阶段 effect/循环难 | G（AutoFuse + Inductor）、F（Triton-Ascend）的 Inductor 路径；E（PyPTO on GPU）当前受集成 emitter 限制 |
 
 这三种策略可组合，而不是只能三选一。**任务图可以包含强融合合作 kernel；自动图编译器也可以生成任务图或合作 kernel，只是本地实现不能用理论可扩展性代替现状。**
 
 两个特别容易被忽略的上限：
 
-1. **调度带宽上限。** 若实测任务派发能力是 `Q_dispatch` 个 task/s，则一个请求 `N_task` 的依赖推进存在相应吞吐约束；串行链还受每条边可暴露延迟限制。粗化 task 可缓解，但也可能降低并行和增加资源需求。A（PyPTO2-普通版）/C（PyPTO3（Simpler））不能只报告“所有核忙”，应报告 task 粒度、派发速率、关键链空洞和 scheduler 占用。
+1. **调度带宽上限。** 若实测任务派发能力是 `Q_dispatch` 个 task/s，则一个请求 `N_task` 的依赖推进存在相应吞吐约束；串行链还受每条边可暴露延迟限制。粗化 task 可缓解，但也可能降低并行和增加资源需求。A（PyPTO2-tensor版）/C（PyPTO3（Simpler））不能只报告“所有核忙”，应报告 task 粒度、派发速率、关键链空洞和 scheduler 占用。
 2. **驻留/进展上限。** 一个巨大的 GPU kernel 的寄存器/shared memory、线程数和代码路径会限制可驻留 CTA。仅在普通 launch 中给跨 CTA 自旋加原子/fence，并不能保证未被调度的生产者有机会运行；合作 launch 或其他经过证明的协议才构成正确的前提。CUDA 的 cooperative grid 同步有明确 launch/资源约束，并非普通 grid 的默认能力。[CUDA Cooperative Groups](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cooperative-groups.html)
 
 NPU 不能照搬 GPU 的寄存器占用公式或 grid 限制，但同样要审核 AIC/AIV 参与集合、资源组、等待事件来源及 worker 协议。`sync_start`、`allow_early_resolve`、AIV sub-block 都是具体契约，不是“加了同步即可安全”的装饰参数。[C6（PyPTO3（Simpler））] [C14（PyPTO3（Simpler））]
@@ -3066,13 +3072,13 @@ NPU 不能照搬 GPU 的寄存器占用公式或 grid 限制，但同样要审�
 
 当前实现概览见第 6.2 节，调用链和源码见第 4 章；以下集中比较性能上探、用户代价与差距。“可能性”是补齐缺口后可争取的方向，不是已达到的硬件峰值比例。
 
-#### A（PyPTO2-普通版）：程序级组织已有基础，极限取决于 task 粒度与核内质量是否协同
+#### A（PyPTO2-tensor版）：程序级组织已有基础，极限取决于 task 粒度与核内质量是否协同
 
 - **性能上探**：能够保留多个专门阶段，用设备侧推进/重叠来接近整层关键路径下界；对形状不齐、阶段分工差异大的程序，具有避免手写整层大 body 的架构空间。核内生成质量、跨 task GM 和调度粒度仍决定实际极限。
 - **用户代价**：客户迁移到 Tensor DSL 并处理布局/动态契约；普通算子作者可少写显式流水，但追求极限时仍需 tile/pass 选项、task 切分和图级诊断。调度框架降低的是跨阶段组织的重复实现，不免除性能工程。
 - **差距**：本次没有整层统一 trace、task 数/代价、GM 读写和最优库基线，不能声称整层性能已领先。下一步应先输出一个真实层的 task DAG/GM 图，定位是 dispatch-limited、memory-limited 还是 kernel-limited，再决定粗化或融合哪一段。
 
-#### B（PyPTO2-Pro）：低层控制直接，整层协作协议与可复用策略仍需作者/框架承担
+#### B（PyPTO2-block版）：低层控制直接，整层协作协议与可复用策略仍需作者/框架承担
 
 - **性能上探**：针对固定/分桶负载，可主动安排 double buffer、核心分工、矩阵/向量流水和局部数据传递，争取接近手工优化核内实现的效果；没有“SPMD 必然比 MPMD 低一个性能上限”的理论约束。
 - **用户代价**：更容易把性能意图写到核内，也更直接承担有效窗口、地址容量、局部别名、同步和策略输入一致性。prefill 的 Host 分配策略依赖实际长度时，服务系统要提供/更新这些信息，不能无代价读取设备长度后再回 Host。
@@ -3126,8 +3132,8 @@ persistent 的收益取决于局部效率和工作不均衡；更多专门化 wa
 
 | 路线 | 客户接入/迁移 | 追求整层极限的专家工作 | 动态能力带来的持续维护 | 主要排错对象 |
 | --- | --- | --- | --- | --- |
-| A（PyPTO2-普通版） | Tensor DSL/布局/运行集成 | tile/pass、任务粒度、融合、核内生成质量 | shape/valid-window、任务展开、缓存与资源配置 | 图/子图/task、设备控制与算子两个层次 |
-| B（PyPTO2-Pro） | 调用库可很轻；原生开发需 Pro DSL | TileGroup/地址/mutex、Host partition、跨阶段协议 | 容量、metadata 策略一致性、kernel 变体 | 核内内存/同步、Host 参数及编译 ABI |
+| A（PyPTO2-tensor版） | Tensor DSL/布局/运行集成 | tile/pass、任务粒度、融合、核内生成质量 | shape/valid-window、任务展开、缓存与资源配置 | 图/子图/task、设备控制与算子两个层次 |
+| B（PyPTO2-block版） | 调用库可很轻；原生开发需 block版 DSL | TileGroup/地址/mutex、Host partition、跨阶段协议 | 容量、metadata 策略一致性、kernel 变体 | 核内内存/同步、Host 参数及编译 ABI |
 | C（PyPTO3（Simpler）） | 可封装模型 API；开发需 Tensor/scope 概念 | 普通 scope 到 manual TaskId/extern/SPMD 的能力跨度很大 | task/workspace 生命周期、batch window、page/shape 变体 | Orchestration、Simpler、InCore/PTOAS、库层手工协议 |
 | D（CANNBot DSL） | 库调用轻；原生开发需 Host/Device staging | Channel/Buffer/VF、layout、流水、全局协作 | 动态 TensorSpec、有效访问、策略及架构特化 | Python staging→CANNIR→生成 AscendC→硬件 |
 | E（PyPTO on GPU） | 支持模式内轻，NPU 程序迁移受限 | emitter/图覆盖、Tile IR 调度、CTA 协作、分桶 | shape/stride cache、bucket、合并/分头分支 | 模式拒绝、编译 artifact、CUDA trace |
@@ -3144,9 +3150,9 @@ persistent 的收益取决于局部效率和工作不均衡；更多专门化 wa
 
 | 验收关卡 | 必须交付的证据 | 当前本地证据与仍缺的部分 |
 | --- | --- | --- |
-| 完整数学/状态语义 | 整层数值、KV cache 写入、残差、尾块与 shape 契约 | C（PyPTO3（Simpler））有模型程序；A（PyPTO2-普通版）有组合程序；其他路线的局部例子不能替代完整层验收；H 的 Q=1 连续 decode 已失败，应先处理数值；I 的源码/协议检查不等于分页 MLA 或整层数值通过。[H-run-diagnostics] [I-checker] |
+| 完整数学/状态语义 | 整层数值、KV cache 写入、残差、尾块与 shape 契约 | C（PyPTO3（Simpler））有模型程序；A（PyPTO2-tensor版）有组合程序；其他路线的局部例子不能替代完整层验收；H 的 Q=1 连续 decode 已失败，应先处理数值；I 的源码/协议检查不等于分页 MLA 或整层数值通过。[H-run-diagnostics] [I-checker] |
 | 用户入口与图覆盖 | 哪些节点进编译器、哪些外部调用、哪些 graph break | G（AutoFuse + Inductor）/F（Triton-Ascend）需展开 Inductor 分组；E（PyPTO on GPU）先过 emitter 支持边界 |
-| 提交与调度收敛 | Host API、设备 entry、控制/worker、内部 task 分别计数 | A（PyPTO2-普通版）/C（PyPTO3（Simpler））已有 device runtime；整层 K2 仍需 trace；H mixed 产物的函数数不能代替事件数，I GQA 两次源码 launch 仍需目标 trace。[H-run-artifacts] [I-gqa] |
+| 提交与调度收敛 | Host API、设备 entry、控制/worker、内部 task 分别计数 | A（PyPTO2-tensor版）/C（PyPTO3（Simpler））已有 device runtime；整层 K2 仍需 trace；H mixed 产物的函数数不能代替事件数，I GQA 两次源码 launch 仍需目标 trace。[H-run-artifacts] [I-gqa] |
 | 跨阶段数据融合 | buffer 生命周期图、分配峰值、实际 GM/L2/HBM 流量 | C（PyPTO3（Simpler））已有显式 transfer，可定位差距；其他后端必须检查生成物，不能只数源码 tensor；H 的静态分配和 I 的 phase alias 可检查局部复用责任，仍需最终峰值、GM 及硬件计数。[H-scratch] [I-ts-memory] |
 | 全设备合作正确性 | 每个等待的生产者/参与集合、资源驻留/进展、压力测试 | 不能从单 softmax/FA 的正确性升级为整层无死锁保证；H 的局部 AutoSync、I 的 TS 有界 checker 各有作用域，不能据其存在免除整层进展测试。[H-auto-sync] [I-checker] |
 | 端到端性能优势 | 同硬件/精度/输入/缓存/并发的最优分 kernel 基线；p50/p99/吞吐 | 本次没有跨路线结果；不提供性能名次 |
@@ -3173,7 +3179,7 @@ H 的直接机会是将已有 CV 数据路径扩展到自然相邻的计算链�
 <a id="scheduler-performance"></a>
 ### 6.13 专题：设备动态 scheduler 到底让 megaKernel 的“极致性能可达成”容易了多少？
 
-**有条件地支持“PyPTO3 更容易走向程序级 megaKernel”这个判断：现成的设备任务体系减少了组织整层的基础设施工作，显式 InCore/SPMD/extern 接口又提供了核内与跨任务协同优化的接缝。但相对于同样有设备任务体系的 PyPTO2-普通版，不能仅凭 scheduler 存在判定 PyPTO3 更容易达到性能极限。**
+**有条件地支持“PyPTO3 更容易走向程序级 megaKernel”这个判断：现成的设备任务体系减少了组织整层的基础设施工作，显式 InCore/SPMD/extern 接口又提供了核内与跨任务协同优化的接缝。但相对于同样有设备任务体系的 PyPTO2-tensor版，不能仅凭 scheduler 存在判定 PyPTO3 更容易达到性能极限。**
 
 #### 先区分四种“更容易”，它们不是同一结论
 
@@ -3205,7 +3211,7 @@ for task in pl.range(core, num_tasks, ATTN_SPMD_BLOCKS):
 
 同理，不同请求长度很不均衡时，固定 stride 分配可能留下长尾；Simpler 能管理这个 SPMD task 的外层依赖，不代表能任意拆开正在运行的 page 循环重新均衡。`sync_start=True`/资源组协议有助于合作任务进展，也会约束任务什么时候能一起启动，不能当作零代价的“随时填空闲核”。
 
-这也解释一个看似相反的现象：Pro 的所选 paged prefill 示例虽然没有通用设备 DAG scheduler，却在 Host `build_work_ranges` 中主动做了分工策略；某种静态/分桶长度分布下，这类分工可能很有效。反过来，若长度只有设备端知道、请求变化快，Host 策略元数据维护又可能增加成本。两者必须比较**实际采用的分工算法**，不能只凭“动态 scheduler 对静态 launch”预测负载均衡。[B15（PyPTO2-Pro）]
+这也解释一个看似相反的现象：block版 的所选 paged prefill 示例虽然没有通用设备 DAG scheduler，却在 Host `build_work_ranges` 中主动做了分工策略；某种静态/分桶长度分布下，这类分工可能很有效。反过来，若长度只有设备端知道、请求变化快，Host 策略元数据维护又可能增加成本。两者必须比较**实际采用的分工算法**，不能只凭“动态 scheduler 对静态 launch”预测负载均衡。[B15（PyPTO2-block版）]
 
 #### 性能极限：scheduler 能改善哪项，不能替代哪项
 
@@ -3235,18 +3241,18 @@ T_layer ≥ max(
 
 | 对比问题 | 当前可以下的结论 | 不能省略的验证 |
 | --- | --- | --- |
-| PyPTO3 对 Pro/CANNBot 的程序级组织优势 | 已有外层设备任务体系与整层/多层程序入口，可少从零实现一套任务 runtime；Pro/CANNBot 的当前主路径没有同等外层体系 | 最优强融合 kernel/Host 提交基线、调度开销、跨阶段 GM、并发与进展；不能直接推为更快 |
-| PyPTO3 对 PyPTO2-普通版的优势 | 显式 TaskId/SPMD/extern 组合在当前库中有直接示范；普通版也有 tiling、合图和设备任务体系 | 同目标任务分解、相近核内质量下的 ready/dispatch/finish trace；分别找双方最佳分解，不只比较默认教学代码 |
+| PyPTO3 对 block版/CANNBot 的程序级组织优势 | 已有外层设备任务体系与整层/多层程序入口，可少从零实现一套任务 runtime；block版/CANNBot 的当前主路径没有同等外层体系 | 最优强融合 kernel/Host 提交基线、调度开销、跨阶段 GM、并发与进展；不能直接推为更快 |
+| PyPTO3 对 PyPTO2-tensor版的优势 | 显式 TaskId/SPMD/extern 组合在当前库中有直接示范；tensor版也有 tiling、合图和设备任务体系 | 同目标任务分解、相近核内质量下的 ready/dispatch/finish trace；分别找双方最佳分解，不只比较默认教学代码 |
 | 单物理合作 kernel 是否比任务图更优 | 某些固定负载可少付 dispatch/中间传递代价；任务图则可保留阶段特化与更灵活组织 | 全局进展、资源预算、重分片、代码体积、尾部不均衡；二者理论上没有固定胜负关系 |
 | 哪一种用户代价更低 | 使用已封装库都可以很轻；新增 kernel/形状/整层策略的责任分布不同 | 区分客户接入、算子作者调优、编译/runtime 团队维护，不能拿“一行调用”比较底层工程量 |
 
-若要进一步区分 PyPTO2-普通版与 PyPTO3，建议做两组对照：第一组尽可能统一核内算法/数据布局，观察任务组织本身；第二组允许各自选择最佳融合/tiling/任务粒度，观察真实整层可达性能与实现代价。前一组帮助定位 scheduler，后一组才代表路线整体；只做其中一组都可能误判。当前没有这些 NPU 对照结果，本文的判断停留在**已实现机制、具体差距和工程可达路径**，不把推断写成性能名次。
+若要进一步区分 PyPTO2-tensor版与 PyPTO3，建议做两组对照：第一组尽可能统一核内算法/数据布局，观察任务组织本身；第二组允许各自选择最佳融合/tiling/任务粒度，观察真实整层可达性能与实现代价。前一组帮助定位 scheduler，后一组才代表路线整体；只做其中一组都可能误判。当前没有这些 NPU 对照结果，本文的判断停留在**已实现机制、具体差距和工程可达路径**，不把推断写成性能名次。
 
 ---
 
 相对 H/I，本节“设备任务体系减少整层组织工作”的判断仍成立于跨计算入口这一层；但若目标是一个已划定合作 kernel 的局部角色流水，则 I 的 TS/pipeline 也能减少协议维护，H 也有受限 AutoSync。应按具体被省去的工程工作比较，而不是把存在不同粒度的 scheduler 归为同一种优势；相应源码与性能模型映射见第 6.14 节。[H-auto-sync] [I-task-manager]
 
-### 6.14 新增专题：CATLASS / CuTe 的 scheduler 应放在哪一层比较
+### 6.14 CATLASS / CuTe 的 scheduler：调度粒度与责任层次
 
 #### 6.14.1 五种具体机制，不用一个 scheduler 标签合并
 
@@ -3258,7 +3264,7 @@ T_layer ≥ max(
 | I CLC 动态 persistent | 待执行 CTA/cluster 对应的 tile | 利用 Cluster Launch Control 获取尚未启动的工作，并处理取消/接管结果 | 动态补充 tile，改善某些长尾；工作域与 kernel 已确定，不是多算子 ready DAG |
 | I 实验性 TS | 同一 kernel 内由若干连续 warp 执行的任务及资源阶段 | 编译期声明 schedule/dependency，运行时执行 acquire/commit/wait/release 协议 | 降低复杂 warp 专门化流水的协议编写成本；不能直接当成设备端模型任务 runtime |
 
-来源：[H-fa] [H-streamk] [I-static] [I-dynamic] [I-task] [I-schedule]；A/C 的原有证据与性能分析保留在第 4.8/4.10/6.13 节。
+来源：[H-fa] [H-streamk] [I-static] [I-dynamic] [I-task] [I-schedule]；A/C 的证据与性能分析见第 4.8/4.10/6.13 节。
 
 这也使 SPMD/MPMD 的讨论更具体：I 的 CTA grid 可以总体执行同一 kernel，CTA 内又让不同 warp 执行 TMA、MMA、softmax、修正等不同程序段；H mixed kernel 则由 AIC/AIV 执行不同角色。二者都可体现**局部角色专门化**。A/C 外层派发不同核内入口时的 MPMD 属于另一层；不能依据局部角色分工就宣布已有相同的整层任务系统。
 
@@ -3270,7 +3276,7 @@ T_layer ≥ max(
 
 `work_tile_loop` 与 `domain_loop` 又是两条不同的轴：前者推进 tile，后者遍历一个 tile 内的 K/序列等计算域。静态 WorkQueue 可以不需要单独的工作获取流水；CLC 队列需要动态获取工作及配套协议；dynamic domain 则可能只是在当前 tile 内读取运行时 offset 后循环。**运行时循环次数变化，不必意味着工作分配也是动态的。**[I-schedule] [I-ts-tutorial]
 
-#### 6.14.3 用原有性能模型评估新增机制
+#### 6.14.3 用关键路径与资源模型评估调度机制
 
 假设相同算法与工作集合下，固定分配产生的末尾空闲为 `T_tail`，动态机制能够减少其中的 `ΔT_tail`，但增加工作获取、同步及资源占用导致的时间，则可用下式作一阶分析：
 
@@ -3311,8 +3317,8 @@ T_layer ≥ max(
 
 | 路线 | 必须另写一个注册式 tiling 函数吗 | 当前策略位置 / 接口 | 物理tile与缓存边界 |
 | --- | --- | --- | --- |
-| A（PyPTO2-普通版） | 不作为此编程模型的普遍要求 | tile设置、Tensor程序/loop、编译器分解 | 动态标记与CheckArgs/产物选择仍重要 |
-| B（PyPTO2-Pro） | **Python JIT 不强制；文档所示离线自定义算子包接入需要 Host C++ TilingFunc** | 普通Python计算blockDim/TilingData/work_ranges；或kernel内计算；包接入按Host ABI填参 | 动态axis可复用；静态参数/tiling key/物理tile变化可产生变体 |
+| A（PyPTO2-tensor版） | 不作为此编程模型的普遍要求 | tile设置、Tensor程序/loop、编译器分解 | 动态标记与CheckArgs/产物选择仍重要 |
+| B（PyPTO2-block版） | **Python JIT 不强制；文档所示离线自定义算子包接入需要 Host C++ TilingFunc** | 普通Python计算blockDim/TilingData/work_ranges；或kernel内计算；包接入按Host ABI填参 | 动态axis可复用；静态参数/tiling key/物理tile变化可产生变体 |
 | C（PyPTO3（Simpler）） | 不强制；也绝不是“不需要tiling” | 编译tile、Orchestration、Host Python tiler、AIV tiling task均有例子 | 动态GM descriptor ≠ 动态物理TileType；库例子也可能专门化 |
 | D（CANNBot DSL） | 不强制C++ TilingFunc | Python表达的分阶段Host程序、动态TensorSpec、结构数据、kernel循环；有bounded tiler描述符 | 直接JIT取具体shape契约；Dim与静态capacity内的运行时tile是不同能力 |
 | E（PyPTO on GPU） | 用户不提供NPU式tiler，但提供静态bucket/geometry/schedule | operator wrapper / graph编译的tile策略 | high-level shape/stride专门化；内容mask可以动态 |
@@ -3321,11 +3327,11 @@ T_layer ≥ max(
 | H（CATLASS DSL） | 不强制独立注册 TilingFunc | 普通 Python/dataclass/编译常量、block_num，以及 kernel 动态逻辑范围/循环 | MMAD 两组 M/N/K 复用同一产物；FA 当前读取 Host 全局常量，实际长度参数未用于设备体，二者不能合称全动态。[H-mmad-example] [H-fa] [H-run-artifacts] |
 | I（CuTe DSL） | 不强制 NPU 式 TilingFunc | Python/Host JIT 选 tile、atom、stage、grid/split；kernel 读动态 metadata，调度器领取工作 | runtime shape/stride、constexpr 资源与 CLC 工作调度是三种不同契约；动态长度不自动搜索新 tile。[I-tensor-runtime] [I-gqa] [I-dynamic] |
 
-### 7.3 Pro 的具体 tiling 提供方式，不止 dataclass
+### 7.3 block版 的具体 tiling 提供方式，不止 dataclass
 
-Pro 的 Python JIT 可使用普通 launch 策略、运行时标量、TilingData、work_ranges tensor 或 kernel 内计算；具体写法与限制见第 7.8.1—7.8.5 节。TilingData 不是任意 Python 对象，也不存在通用 `@jit(tiling_func=...)` 注册接口。[B7（PyPTO2-Pro）] [B8（PyPTO2-Pro）]
+block版 的 Python JIT 可使用普通 launch 策略、运行时标量、TilingData、work_ranges tensor 或 kernel 内计算；具体写法与限制见第 7.8.1—7.8.5 节。TilingData 不是任意 Python 对象，也不存在通用 `@jit(tiling_func=...)` 注册接口。[B7（PyPTO2-block版）] [B8（PyPTO2-block版）]
 
-文档所示离线自定义算子包则要求 Host C++ TilingFunc，见第 7.8.6 节；自动生成数据结构不等于自动翻译 Python 策略。策略读取设备内容的成本、计划更新与缓存契约统一见第 7.13 节。[B9（PyPTO2-Pro）]
+文档所示离线自定义算子包则要求 Host C++ TilingFunc，见第 7.8.6 节；自动生成数据结构不等于自动翻译 Python 策略。策略读取设备内容的成本、计划更新与缓存契约统一见第 7.13 节。[B9（PyPTO2-block版）]
 
 ### 7.4 PyPTO3 的动态能力要看具体入口，不把示例变量名当复用证明
 
@@ -3352,17 +3358,17 @@ native PA 的 `B/P/T` 测试与几何编译签名见第 2.6 节；Host、Orchest
 | 划分核心或任务的工作 | 工作集合及代价 → blockDim、task集合、work_ranges、split-KV | 不一定，但复杂策略适合独立封装 | Host计算、设备生成计划，或运行时任务派发 |
 | 满足框架 launch ABI | shape、资源限制 → TilingData、TilingKey、workspace、blockDim | **由交付接口决定** | 例如自定义算子包的Host TilingFunc，或AutoFuse自动生成的tiling函数 |
 
-这里的“函数”不能按名字判断。普通 Python 的 `build_work_ranges(...)` 是算法意义上的 tiler；Pro 的 `TilingData` 是数据结构，不是算法；CANNBot 的 `make_bounded_tiler(...)` 是有界分块描述符构造接口，不等于一个会自动搜索最佳分块的 Host 回调。
+这里的“函数”不能按名字判断。普通 Python 的 `build_work_ranges(...)` 是算法意义上的 tiler；block版 的 `TilingData` 是数据结构，不是算法；CANNBot 的 `make_bounded_tiler(...)` 是有界分块描述符构造接口，不等于一个会自动搜索最佳分块的 Host 回调。
 
 **不另写 tiler 的常见充分条件**是：输入始终符合已编译的 dtype/layout/shape 契约；物理 tile 容量固定且合法；所有需要变化的循环、偏移和尾块窗口都由运行时值导出；分工覆盖所有工作且互不重复；没有依赖本次长度却未更新的缓存计划。在这些条件下，改变 shape 可以只改变参数和执行次数。
 
 反过来，仅把类型中的数字改成 `DYNAMIC`，不会自动补齐跨块归约、split-KV 合并、workspace 分配或负载均衡算法。设备 scheduler 同样不能替代这些语义。
 
-### 7.7 PyPTO2-普通版：把分块写在 Tensor 程序中，不要求另注册 Host tiler
+### 7.7 PyPTO2-tensor版：把分块写在 Tensor 程序中，不要求另注册 Host tiler
 
-普通版不是“用户完全不管 tile”。用户可以设置 `set_vec_tile_shapes`、Cube tiling，也可以显式写 `loop → view(valid_shape) → 计算 → assemble`。编译器和 TileFwk 执行体系继续承担 Tensor 算子分解、依赖及任务执行；用户没有因此获得 Pro 那样完整的物理 buffer / TileGroup 编程责任。[A8（PyPTO2-普通版）] [A8b（PyPTO2-普通版）]
+tensor版不是“用户完全不管 tile”。用户可以设置 `set_vec_tile_shapes`、Cube tiling，也可以显式写 `loop → view(valid_shape) → 计算 → assemble`。编译器和 TileFwk 执行体系继续承担 Tensor 算子分解、依赖及任务执行；用户没有因此获得 block版 那样完整的物理 buffer / TileGroup 编程责任。[A8（PyPTO2-tensor版）] [A8b（PyPTO2-tensor版）]
 
-下面按 `dynamic_mul_kernel` 改写，将 `tile_b` 固定为 16，突出“输入动态、分块策略不变”。[A20（PyPTO2-普通版）]
+下面按 `dynamic_mul_kernel` 改写，将 `tile_b` 固定为 16，突出“输入动态、分块策略不变”。[A20（PyPTO2-tensor版）]
 
 ```python
 import pypto
@@ -3390,17 +3396,17 @@ def dynamic_mul_fixed_tile(
 
 对应两个重点算子：
 
-- **尾轴 softmax：**第 2 章原生例子的 `Tensor([DYNAMIC, ...])` 只把首轴声明为动态，其余轴按静态策略处理。batch 变化与最后一维从 256 变成 513，不是同一个动态承诺。客户通过 Tensor reduction 和 tile 配置表达计算，不需要手写 Pro 风格的 load/store/TileGroup。[A12（PyPTO2-普通版）]
-- **paged attention：**已有程序从 `act_seq` 读取每个请求长度，再写 KV 循环、view 和有效范围；动态行为就在 Tensor 程序中。用户仍要表达怎样遍历 page、怎样做在线 softmax，不能把“存在 AICPU”理解为运行时会自动发明 PA 算法。[A13（PyPTO2-普通版）]
+- **尾轴 softmax：**第 2 章原生例子的 `Tensor([DYNAMIC, ...])` 只把首轴声明为动态，其余轴按静态策略处理。batch 变化与最后一维从 256 变成 513，不是同一个动态承诺。客户通过 Tensor reduction 和 tile 配置表达计算，不需要手写 block版 风格的 load/store/TileGroup。[A12（PyPTO2-tensor版）]
+- **paged attention：**已有程序从 `act_seq` 读取每个请求长度，再写 KV 循环、view 和有效范围；动态行为就在 Tensor 程序中。用户仍要表达怎样遍历 page、怎样做在线 softmax，不能把“存在 AICPU”理解为运行时会自动发明 PA 算法。[A13（PyPTO2-tensor版）]
 - **非常长的 reduction：**Tensor reduction 可以保留较高层表达，但最终采用怎样的分解和融合，要看编译产物。不能把高层 `softmax` 可构图，等同于已经得到理想的跨核长行实现。
 
-因此，普通版的主要用户体验是“给 Tensor 程序动态边界与 tiling 提示/切片”，而不是“编写独立的分核描述数据，再直接 launch 自己管理的物理 kernel”。
+因此，tensor版的主要用户体验是“给 Tensor 程序动态边界与 tiling 提示/切片”，而不是“编写独立的分核描述数据，再直接 launch 自己管理的物理 kernel”。
 
-### 7.8 PyPTO2-Pro：Python JIT 下的五种写法，以及何时才需要 Host C++
+### 7.8 PyPTO2-block版：Python JIT 下的五种写法，以及何时才需要 Host C++
 
 #### 7.8.1 写法一：直接读动态 shape，Host 只算 blockDim
 
-这是回答“Pro 是否必需 Python tiling API”的最小反例：第 2 章完整 `softmax_tile_group_kernel` 根本没有 TilingData 参数。它声明两个动态轴，用固定 `TileType[16,512]`，从 `x.shape` 计算 row-tile 数，从 `get_block_idx/get_block_num` 进行步进分工，并设置 `[valid_rows, cols]`。[B14（PyPTO2-Pro）]
+这是回答“block版 是否必需 Python tiling API”的最小反例：第 2 章完整 `softmax_tile_group_kernel` 根本没有 TilingData 参数。它声明两个动态轴，用固定 `TileType[16,512]`，从 `x.shape` 计算 row-tile 数，从 `get_block_idx/get_block_num` 进行步进分工，并设置 `[valid_rows, cols]`。[B14（PyPTO2-block版）]
 
 可与该完整 kernel 放在同一模块的 Host 包装如下。分核函数是本文改写的普通 Python，不是框架注册回调；范围取自原 softmax 的 `TILE_ROWS=16, MAX_N=512`。
 
@@ -3427,7 +3433,7 @@ def launch_pro_softmax(x, y):
     return y
 ```
 
-`get_platform_info` 是实际接口；查询失败可能得到 0，上例明确拒绝，不把未知硬件容量当作可 launch 数。此包装只针对原测试中的纯 Vector softmax；混合 Cube/Vector kernel 要按混合组的 blockDim 及 subblock 语义选择资源，不能直接套用 `vector_core_num`。[B22（PyPTO2-Pro）] [B13（PyPTO2-Pro）]
+`get_platform_info` 是实际接口；查询失败可能得到 0，上例明确拒绝，不把未知硬件容量当作可 launch 数。此包装只针对原测试中的纯 Vector softmax；混合 Cube/Vector kernel 要按混合组的 blockDim 及 subblock 语义选择资源，不能直接套用 `vector_core_num`。[B22（PyPTO2-block版）] [B13（PyPTO2-block版）]
 
 在这个明确边界内：
 
@@ -3466,7 +3472,7 @@ def launch_pro_softmax_with_tiling(softmax_with_tiling, x, y, vector_cores):
 
 传入的 `softmax_with_tiling` 是用户改写后的 kernel，不是内置 API：将原 kernel 签名的最后一项增加为 `tiling: SoftmaxRuntimeTiling`，把内部 `num_tiles = (rows + TILE_ROWS - 1) // TILE_ROWS` 改为 `num_tiles = tiling.num_row_tiles`，其余完整计算体不变。这个简单例子中 Host 预计算几乎没有表达上的必要；复杂的分段参数、算法开关或每核分工才更值得封装。
 
-实际机制和限制必须一起看：[B7（PyPTO2-Pro）] [B4（PyPTO2-Pro）]
+实际机制和限制必须一起看：[B7（PyPTO2-block版）] [B4（PyPTO2-block版）]
 
 - 一个 kernel 最多一个 TilingData，且必须放在参数列表末尾。
 - 字段支持 `int/float/bool` 及其定长数组，不是任意 Python 对象、list-of-dict 或可变长度树；当前数组长度要求字面常量 1—2048。`int[N]` 等写法需按文档使用延迟注解，不能当作普通 Python 内置类型的运行时下标语义。
@@ -3476,14 +3482,14 @@ def launch_pro_softmax_with_tiling(softmax_with_tiling, x, y, vector_cores):
 
 #### 7.8.3 写法三：每核工作描述用 tensor，不受 TilingData 定长数组形式束缚
 
-原生 `build_work_ranges` 就是已存在的 Python tiling 实践，而不是需要另设计的接口。它接收 Q/KV 长度列表、mask spans、head数和核数，输出 `int32[num_cores,4]`，四列为 `work_start, n_items, split_mode, two_c`。[B23（PyPTO2-Pro）]
+原生 `build_work_ranges` 就是已存在的 Python tiling 实践，而不是需要另设计的接口。它接收 Q/KV 长度列表、mask spans、head数和核数，输出 `int32[num_cores,4]`，四列为 `work_start, n_items, split_mode, two_c`。[B23（PyPTO2-block版）]
 
 源码存在两种策略：
 
 - 当 `B * n_head_q > num_cores` 时，默认使用正反配对的步进分工；该分支主要依赖工作总数与核数，不需要逐项 KV 代价模型。
 - 另一分支按每个 Q tile 将遍历的 KV block 数估算代价，搜索连续区间划分；不是简单“每核同样多 tile”。
 
-对应调用点的摘录如下；输入、`total_work` 和缓存张量均由原 `_run_case` 构造，第 2 章已有完整 attention 计算体。[B24（PyPTO2-Pro）]
+对应调用点的摘录如下；输入、`total_work` 和缓存张量均由原 `_run_case` 构造，第 2 章已有完整 attention 计算体。[B24（PyPTO2-block版）]
 
 ```python
 work_ranges = build_work_ranges(
@@ -3496,7 +3502,7 @@ flex_attention_bf16[None, min(num_cores, total_work)](
 )
 ```
 
-这份例子是 **paged prefill**，不能冒充已验证的专用 decode 实现；它足以证明 Pro 可以要求算子作者写 Python 分工策略并以 tensor 交给 kernel。
+这份例子是 **paged prefill**，不能冒充已验证的专用 decode 实现；它足以证明 block版 可以要求算子作者写 Python 分工策略并以 tensor 交给 kernel。
 
 这里有一个非常重要的更新边界：
 
@@ -3507,7 +3513,7 @@ flex_attention_bf16[None, min(num_cores, total_work)](
 
 #### 7.8.4 写法四：TilingKey 选择有限个专门化变体，不把实际长度都塞进 key
 
-Pro 已有 `@pl.jit(tiling_key=...)`，与不存在的通用 `tiling_func=` 注册参数是两回事。当前文档的真实使用形式为：[B25（PyPTO2-Pro）]
+block版 已有 `@pl.jit(tiling_key=...)`，与不存在的通用 `tiling_func=` 注册参数是两回事。当前文档的真实使用形式为：[B25（PyPTO2-block版）]
 
 ```python
 from pypto_pro.runtime.tilingkey import TilingKeyField
@@ -3529,19 +3535,19 @@ class FaTilingKey:
 | `TilingKey` | 编译时折叠、launch时选变体 | 首次遇到该key可能编译；AOT要事先交付所需变体 |
 | Tensor的`STATIC`轴或`...`静态尾轴 | 参数绑定及编译专门化 | 该轴变化可能选择/创建另一shape变体 |
 
-源码中的该 JIT 对象进程内 variant key 是 `(static_signature, dtype_hash, tilingkey_packed)`；blockDim 和 TilingData 字段值不作为该 key 的组成。这个结论不替代完整的磁盘缓存、编译选项、架构和依赖身份检查。[B26（PyPTO2-Pro）]
+源码中的该 JIT 对象进程内 variant key 是 `(static_signature, dtype_hash, tilingkey_packed)`；blockDim 和 TilingData 字段值不作为该 key 的组成。这个结论不替代完整的磁盘缓存、编译选项、架构和依赖身份检查。[B26（PyPTO2-block版）]
 
-特别注意：`Tensor[[DYNAMIC, DYNAMIC], ...]` 与 `Tensor[[DYNAMIC, ...], ...]` 不同；后者的省略号会展开成静态尾轴。对应单元测试明确检查了“首轴 Var，尾轴 Const，尾轴参与 static_signature”。这正是“看上去都写了动态，换一个维度却重编译”的具体来源之一。[B27（PyPTO2-Pro）]
+特别注意：`Tensor[[DYNAMIC, DYNAMIC], ...]` 与 `Tensor[[DYNAMIC, ...], ...]` 不同；后者的省略号会展开成静态尾轴。对应单元测试明确检查了“首轴 Var，尾轴 Const，尾轴参与 static_signature”。这正是“看上去都写了动态，换一个维度却重编译”的具体来源之一。[B27（PyPTO2-block版）]
 
 #### 7.8.5 写法五：直接在 kernel 中计算长度、分块和分工
 
-SPMD kernel完全可以自己读取 `actual_seq_len`，计算 `ceil(L/S)`，循环访问实际 page；也可以按固定步进分配 `(batch,head)`。第 2 章的 Pro attention 展示了设备长度参数与循环。此时没有独立 Host tiler，只有用户写在核内的 tiling 逻辑。
+SPMD kernel完全可以自己读取 `actual_seq_len`，计算 `ceil(L/S)`，循环访问实际 page；也可以按固定步进分配 `(batch,head)`。第 2 章的 block版 attention 展示了设备长度参数与循环。此时没有独立 Host tiler，只有用户写在核内的 tiling 逻辑。
 
-其取舍是：避免读取长度回 Host，不代表工作会自动均衡；每个核心重复计算复杂策略也可能浪费资源。如果改成设备生成一张全局分工表，还需要前置 kernel、同步或合法的共享协议。Pro 当前的直接 launch 和 TileGroup 本身，不等于已经提供 Simpler 那样的通用跨任务 DAG scheduler。
+其取舍是：避免读取长度回 Host，不代表工作会自动均衡；每个核心重复计算复杂策略也可能浪费资源。如果改成设备生成一张全局分工表，还需要前置 kernel、同步或合法的共享协议。block版 当前的直接 launch 和 TileGroup 本身，不等于已经提供 Simpler 那样的通用跨任务 DAG scheduler。
 
 #### 7.8.6 什么时候确实需要写 C++ TilingFunc：文档所示离线自定义算子包接入
 
-**Python JIT 使用方式**与**交付一个接入 CANN 算子工程的离线包**不能混为一谈。后者的当前文档明确要求实现 Host tiling，并把生成的 kernel 二进制、Host 实现及 aclnn 接口打包。[B9（PyPTO2-Pro）]
+**Python JIT 使用方式**与**交付一个接入 CANN 算子工程的离线包**不能混为一谈。后者的当前文档明确要求实现 Host tiling，并把生成的 kernel 二进制、Host 实现及 aclnn 接口打包。[B9（PyPTO2-block版）]
 
 文档回调的关键接口摘录如下，workspace赋值整理为策略变量。`total_length / tile_num / block_dim / user_workspace_bytes` 都要由 Host 按输入及策略求出；这段展示 ABI 填充，不是已经包含策略计算的完整 C++ 工程：
 
@@ -3563,9 +3569,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
 
 用户具体需要完成的是：读取本次输入形状及平台资源，计算长度/分块/分核策略，填写与 Python dataclass 一致的字段，选择合法且已交付的 key，设置 blockDim，报告足够的 workspace。若所调用接口另需系统 workspace，必须一并查询和计入，不能照搬上例中的零用户workspace假设。
 
-Pro 自动生成的是 **TilingData / TilingKey 的 C++ 头文件和布局**，不是把任意 `make_softmax_tiling` 或 `build_work_ranges` Python 算法自动翻译成 Host C++。`SetTilingKey` 接受打包值；候选值 `[16,64,128]` 中的 64 编码为候选下标 1，不能直接把 64 当作最终 key。
+block版 自动生成的是 **TilingData / TilingKey 的 C++ 头文件和布局**，不是把任意 `make_softmax_tiling` 或 `build_work_ranges` Python 算法自动翻译成 Host C++。`SetTilingKey` 接受打包值；候选值 `[16,64,128]` 中的 64 编码为候选下标 1，不能直接把 64 当作最终 key。
 
-所以，对“Pro 如何要求用户提供 tiling”最准确的回答是：**JIT 下按普通函数、标量、dataclass或tensor提供即可；该算子包接入路径按Host C++回调提供。不能把后一种要求推广成所有 Pro 调用甚至所有 AOT 形式的必选项。**
+所以，对“block版 如何要求用户提供 tiling”最准确的回答是：**JIT 下按普通函数、标量、dataclass或tensor提供即可；该算子包接入路径按Host C++回调提供。不能把后一种要求推广成所有 block版 调用甚至所有 AOT 形式的必选项。**
 
 ### 7.9 PyPTO3（Simpler）：同一任务体系中至少有四种 tiling 位置
 
@@ -3724,9 +3730,9 @@ finally:
 - 原测试对正数但不对齐的 `tile_m=24` 检查了数据操作不执行、输出保持零的 fail-closed 行为，**不是抛异常且得到正确结果**。调用者应提前校验；不能把非法值当作自动调参请求。
 - 超出capacity、改变不受支持的布局或改变物理流水结构，仍可能需要新的模板/产物。
 
-与 Pro 的相近点是“运行时参数 + 有界片上容量 + 用户分工”。具体差异是，CANNBot 在此提供命名的 BoundedTiler/Channel capacity 描述，Pro 的既有softmax用固定TileType和set_validshape。不能把“某API形态不同”概括成一方完全不能写动态分块。
+与 block版 的相近点是“运行时参数 + 有界片上容量 + 用户分工”。具体差异是，CANNBot 在此提供命名的 BoundedTiler/Channel capacity 描述，block版 的既有softmax用固定TileType和set_validshape。不能把“某API形态不同”概括成一方完全不能写动态分块。
 
-另一个使用差异是策略的执行方式：Pro例子的普通Host函数由Python执行；CANNBot的Host `@jit` 属于分阶段编译链，不能把其Python源码直接理解为每次launch都由CPython解释执行。两者外层都还可以有普通Python包装；选择把shape策略写在外层还是编译的Host程序内，会影响可用Python特性、交付方式与调用成本。[D9（CANNBot DSL）]
+另一个使用差异是策略的执行方式：block版例子的普通Host函数由Python执行；CANNBot的Host `@jit` 属于分阶段编译链，不能把其Python源码直接理解为每次launch都由CPython解释执行。两者外层都还可以有普通Python包装；选择把shape策略写在外层还是编译的Host程序内，会影响可用Python特性、交付方式与调用成本。[D9（CANNBot DSL）]
 
 ### 7.11 Triton-Ascend：grid / constexpr / runtime标量，已经构成一种Python tiling写法
 
@@ -3815,11 +3821,11 @@ compiled_softmax = torch.compile(
     → workspace分配/绑定 → 生成的kernel launch
 ```
 
-此处是 **“无需客户编写，但存在独立 tiling 函数”**，与Pro/CANNBot中“作者自己写kernel循环，所以不必有独立函数”不是同一种自动化。`task_queue` 分支可把这段动态Host工作放入Host侧队列回调，不能据此把它误认成AICPU tiler。
+此处是 **“无需客户编写，但存在独立 tiling 函数”**，与block版/CANNBot中“作者自己写kernel循环，所以不必有独立函数”不是同一种自动化。`task_queue` 分支可把这段动态Host工作放入Host侧队列回调，不能据此把它误认成AICPU tiler。
 
 `dynamic=True` 是前端编译请求，不保证每种动态控制流、数据相关长度或gather都被AutoFuse支持，也不保证guard永不失败。若代码调用 `actual_seq_len.item()` 再走Python分支，不能因为后端会自动tiling，就认定该数据相关行为被自动转成了设备PA循环。当前paged decode融合范围仍按第2章及API边界章节的证据，不扩张为完整native PA支持。
 
-**AscendC在这里的位置：**它可以作为生成的kernel代码与底层API承载；Host tiling是否由客户编写取决于上层接入。Pro离线算子包要求客户填写Host回调，AutoFuse生成Host tiling，CANNBot提供自己的Host/Device编译链；不能把“都使用AscendC/CCE工具链”推成相同的客户tiling要求。
+**AscendC在这里的位置：**它可以作为生成的kernel代码与底层API承载；Host tiling是否由客户编写取决于上层接入。block版离线算子包要求客户填写Host回调，AutoFuse生成Host tiling，CANNBot提供自己的Host/Device编译链；不能把“都使用AscendC/CCE工具链”推成相同的客户tiling要求。
 
 ### 7.13 同一个softmax / paged decode，哪些变化要重算、哪些变化要重写
 
@@ -3837,7 +3843,7 @@ compiled_softmax = torch.compile(
 | Hq/Hkv、D、page大小S变化 | 检查GQA关系、Cube几何、layout、局部容量及签名 | 只要参与策略就需要更新 | 通常更容易触及专门化或物理模板边界；不能保证仅改TilingData即可 |
 | 可用核数变化 | 同步调整blockDim、步进或work_ranges | 每核描述依赖核数时必须更新 | 混合核配比/同步协议变了，已超出原模板契约时 |
 
-表中“常见处理”是跨路线的契约分析，不宣称每个当前实现都拥有该项动态接口。GPU静态artifact、普通版静态尾轴、Pro的MAX_N和CANNBot的Dim/capacity分别约束着可用范围。
+表中“常见处理”是跨路线的契约分析，不宣称每个当前实现都拥有该项动态接口。GPU静态artifact、tensor版静态尾轴、block版的MAX_N和CANNBot的Dim/capacity分别约束着可用范围。
 
 #### 7.13.1 超长softmax：困难在归约语义，不在有没有Host回调
 
@@ -3870,7 +3876,7 @@ PA计划的正确性至少要包含这些契约：batch索引一致；GQA映射�
 
 | 缓存对象 | 保持有效需要关注什么 | 典型反例 |
 | --- | --- | --- |
-| 编译产物 | dtype/layout、静态维度、模板/key、目标与选项 | Pro动态轴变化可复用，但STATIC尾轴或TilingKey变化选新变体 |
+| 编译产物 | dtype/layout、静态维度、模板/key、目标与选项 | block版动态轴变化可复用，但STATIC尾轴或TilingKey变化选新变体 |
 | launch参数包 | 当前指针、shape、stride及产物ABI | GPU内容可变而packet仍有效；分配新buffer需要匹配新指针 |
 | tiling/work_ranges计划 | 所有被策略消费的shape、长度/内容版本、核数及模式 | L的tensor地址和shape不变，旧计划却缓存了旧page数 |
 | workspace/metadata及其复用 | 容量、别名、读写依赖、并发调用生命周期 | PyPTO3前次reader未结束就覆盖同一metadata |
@@ -3881,8 +3887,8 @@ H/I 应放进同一个缓存与成本记录：H MMAD 改 M/N/K 已有同产物�
 
 ### 7.14 从用户成本和架构相近性看，动态tiling的结论
 
-- **PyPTO2-普通版与PyPTO3（Simpler）**都允许把动态工作分解留在程序/设备任务层，客户不普遍承担Host注册式tiler。普通版用户也能显式tile切分；PyPTO3当前更直接展示了InCore/Orchestration、外部SPMD和前置AIV tiling task的接缝。设备scheduler解决已表达工作如何推进，不等于自动决定所有切分。
-- **PyPTO2-Pro与CANNBot DSL**在“用户决定核内模板和分工、runtime值控制循环、有界局部容量”上更接近。两者都不因SPMD强制独立Host TilingFunc；具体提供方式分别包括Pro标量/dataclass/tensor/TilingKey，以及CANNBot Host staging/Dim契约/BoundedTiler。Pro文档中的离线算子包则额外暴露Host C++ tiling责任。
+- **PyPTO2-tensor版与PyPTO3（Simpler）**都允许把动态工作分解留在程序/设备任务层，客户不普遍承担Host注册式tiler。tensor版用户也能显式tile切分；PyPTO3当前更直接展示了InCore/Orchestration、外部SPMD和前置AIV tiling task的接缝。设备scheduler解决已表达工作如何推进，不等于自动决定所有切分。
+- **PyPTO2-block版与CANNBot DSL**在“用户决定核内模板和分工、runtime值控制循环、有界局部容量”上更接近。两者都不因SPMD强制独立Host TilingFunc；具体提供方式分别包括block版标量/dataclass/tensor/TilingKey，以及CANNBot Host staging/Dim契约/BoundedTiler。block版文档中的离线算子包则额外暴露Host C++ tiling责任。
 - **独立Triton-Ascend**把相当一部分用户策略放在Python grid/constexpr/autotune与kernel循环；**Inductor→Triton-Ascend和AutoFuse**可把这些职责转给框架/编译器。用户代码更少不代表tiling不存在，也不保证生成策略覆盖所有算法。
 - **当前PyPTO on GPU高层路径**主要通过静态产物/bucket承载动态内容；其客户代价首先是明确geometry和bucket范围，而不是寻找一个尚未提供的通用动态Host tiler接口。
 - **CATLASS DSL 与 CuTe DSL**也不普遍要求注册式 tiler，代价集中在作者选择物理 tile、layout、槽数与角色，并声明哪些元数据可动态变化。H 的 MMAD 动态样本和 FA 常量路径要分开，I 的 runtime shape、constexpr 资源与 CLC 工作分配也要分开；各自例子不能代替完整动态域的验收。[H-mmad-example] [H-fa] [I-tensor-runtime] [I-dynamic]
@@ -3939,7 +3945,7 @@ CuTe runtime tensor 可标记动态 shape/layout；`Constexpr` 则把算法与�
 用户提出的“一个 task 包含多个 Vector 逻辑，并通过片上内存协作”是重要的典型情况，但不应把 `UB / L1 / shared memory` 当作同义词：
 
 - **NPU Tile 向量计算：**常以 UB 为操作数和中间结果的载体；L1/L0 更多涉及 Cube 数据路径和受目标约束的搬运。使用了 L1 只能说明某段数据路径，不能单独证明 Vector 链已融合。
-- **A5 的寄存器 / VF 路径：**还可以在 UB 之上，把连续的向量操作组成寄存器计算链。PyPTO2-Pro 文档明确区分这两级：Tile 链可能反复读写 UB，Reg 链在入口/出口与 UB 交互。这个接口及目标支持不能直接套给 A2/A3。[B28（PyPTO2-Pro）]
+- **A5 的寄存器 / VF 路径：**还可以在 UB 之上，把连续的向量操作组成寄存器计算链。PyPTO2-block版 文档明确区分这两级：Tile 链可能反复读写 UB，Reg 链在入口/出口与 UB 交互。这个接口及目标支持不能直接套给 A2/A3。[B28（PyPTO2-block版）]
 - **GPU：**逐元素 producer/consumer 可能由同一线程通过寄存器直接连接，完全不需要 shared memory；跨线程归约、重排等才可能需要 warp 通信或 shared memory。普通 shared memory 属于 CTA，而不是“一个 kernel 内所有 SM 的公共中间数组”。[CUDA 编程模型](https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html)
 
 因此，应问“这条中间数据边落在哪个地址空间、谁生产/消费、生命周期到哪里”，而不是仅问“代码里有没有申请 UB/shared”。
@@ -3975,8 +3981,8 @@ GM x_tile → [add → mul → exp，区域内保留中间值] → GM y_tile
 
 | 路线 | 能否达成本章的核内融合 | 用户实际写法与控制点 | 主要交给工具的工作 | 用户代价及不能依赖的假设 |
 | --- | --- | --- | --- | --- |
-| A（PyPTO2-普通版） | 能，已有 Tensor 图纵向合图及手动 scope 控制 | 在同一可编译 Tensor 程序表达连续计算；配置兼容的 tile；必要时用 `sg_set_scope` | Tensor/Tile 图分解、合图、核内 codegen、任务执行计划 | 不必逐项分配 UB，但要理解 tile 依赖、合图失败及代价；一个 Tensor op 不必对应一个 task |
-| B（PyPTO2-Pro） | 能，原生 softmax 已把五项计算写在一个核内函数 | 一个 `@pl.jit` kernel 内用 Tile/TileGroup 装载、连续运算、存储；需要时进一步写 VF | IR/backend、自动 mutex 等受支持同步处理、目标代码生成 | 作者负责 tile、UB 地址/slot、尾块、核间分工；多个单独 launch 的 kernel 不因同处 Python 函数而融合 |
+| A（PyPTO2-tensor版） | 能，已有 Tensor 图纵向合图及手动 scope 控制 | 在同一可编译 Tensor 程序表达连续计算；配置兼容的 tile；必要时用 `sg_set_scope` | Tensor/Tile 图分解、合图、核内 codegen、任务执行计划 | 不必逐项分配 UB，但要理解 tile 依赖、合图失败及代价；一个 Tensor op 不必对应一个 task |
+| B（PyPTO2-block版） | 能，原生 softmax 已把五项计算写在一个核内函数 | 一个 `@pl.jit` kernel 内用 Tile/TileGroup 装载、连续运算、存储；需要时进一步写 VF | IR/backend、自动 mutex 等受支持同步处理、目标代码生成 | 作者负责 tile、UB 地址/slot、尾块、核间分工；多个单独 launch 的 kernel 不因同处 Python 函数而融合 |
 | C（PyPTO3（Simpler）） | 能，pypto-lib softmax 已提供单个 InCore 区域内的五项计算 | 在同一个 `pl.at(CORE_GROUP)` / InCore 计算体组织 producer/consumer，外层再做并行/任务编排 | InCore outlining、Tensor/Tile lowering、PTOAS 内存/同步、Simpler 派发 | 作者决定哪些计算跨 task，哪些必须核内组合；`pl.scope()` 不是核内融合开关 |
 | D（CANNBot DSL） | 能，原生 Buffer softmax 显式保留 UB 中间量 | 一个 `@kernel` 体内用 Buffer 表达计算临时量，Channel 表达相应搬运/所有权阶段，连续调用向量 API | MLIR 片上规划、Channel/同步 lowering、适用的 VF 分组和代码生成 | 更直接承担内存空间、layout、生命周期/流水；一个 Host `@jit` 调多个 kernel 不是自动核间合图 |
 | E（PyPTO on GPU） | 能，已有 sigmoid-mul 等组合计算图 | 把支持的 Tile 计算合写进一个 kernel 图；由包装层编译并 launch 该图 | PyPTO → TensorIR/Tile IR、线程/layout/资源分配、CUDA launch | 要符合当前 lowering 模式、shape/stride/tile 契约；不能把 NPU 的完整多 InCore 编排直接视为 GPU 单 kernel |
@@ -3987,11 +3993,11 @@ GM x_tile → [add → mul → exp，区域内保留中间值] → GM y_tile
 
 表中“能”指已有源码路径，验证状态见第 12 章。下面摘录计算体；完整 kernel、Host 调用及 shape 契约见第 2、7 章。
 
-#### 8.3.1 PyPTO2-普通版：写 Tensor 链，tile 与合图策略共同决定核内区域
+#### 8.3.1 PyPTO2-tensor版：写 Tensor 链，tile 与合图策略共同决定核内区域
 
-原生 softmax 的 `amax → sub → exp → sum → div` 在一个 Tensor helper 中连续表达，调用者设置 `set_vec_tile_shapes`；并非先要求客户写五个独立的设备 task。[A12（PyPTO2-普通版）]
+原生 softmax 的 `amax → sub → exp → sum → div` 在一个 Tensor helper 中连续表达，调用者设置 `set_vec_tile_shapes`；并非先要求客户写五个独立的设备 task。[A12（PyPTO2-tensor版）]
 
-下面是按公开 `sg_set_scope` API 改写的**合图控制示意**，需置于普通版 JIT Tensor 程序中：
+下面是按公开 `sg_set_scope` API 改写的**合图控制示意**，需置于tensor版 JIT Tensor 程序中：
 
 ```python
 def softmax_with_scope(x):
@@ -4006,17 +4012,17 @@ def softmax_with_scope(x):
     return y
 ```
 
-默认先使用自动纵向合图即可，不是每段计算都必须手工标 scope。需要干预时，`sg_set_scope=1` 对后续图操作附加分组信息，`-1` 恢复未显式分组的状态；它不是 Python 词法 `with` 块，也不是设备侧 mutex。公开接口还提供是否允许并行合图、是否允许与未标记区域合图的 tuple 控制。[A21（PyPTO2-普通版）] [A22（PyPTO2-普通版）]
+默认先使用自动纵向合图即可，不是每段计算都必须手工标 scope。需要干预时，`sg_set_scope=1` 对后续图操作附加分组信息，`-1` 恢复未显式分组的状态；它不是 Python 词法 `with` 块，也不是设备侧 mutex。公开接口还提供是否允许并行合图、是否允许与未标记区域合图的 tuple 控制。[A21（PyPTO2-tensor版）] [A22（PyPTO2-tensor版）]
 
 落地条件不只有 scope ID：producer/consumer 的 tile 划分、shape/layout、循环和归约依赖必须允许合法地合并。将长归约切成多个 tile 后，局部数据依赖可能已不是一一对应；强行给所有操作相同 ID，不等于物理资源足够，也不等于能消掉所有 partial GM。
 
-源码在 `AddRawOperation` 捕获 scope，分图阶段合并同 scope 节点；混合 Cube/Vector 是否允许还有平台判断。因此，不能把旧文档对某类 CV 分离平台的限制扩大成“普通版永远不能融合 Matmul 与 Vector”。[A15（PyPTO2-普通版）] [A16（PyPTO2-普通版）]
+源码在 `AddRawOperation` 捕获 scope，分图阶段合并同 scope 节点；混合 Cube/Vector 是否允许还有平台判断。因此，不能把旧文档对某类 CV 分离平台的限制扩大成“tensor版永远不能融合 Matmul 与 Vector”。[A15（PyPTO2-tensor版）] [A16（PyPTO2-tensor版）]
 
 **用户感知：**主要操作 Tensor、tile 策略和图分组；为了这个局部融合，不要求用户直接写 UB 分配器或 AICPU scheduler。相比 PyPTO3，核内边界更多是图编译策略的结果，而非一个显式 InCore 函数体。
 
-#### 8.3.2 PyPTO2-Pro：在一个核内函数中把 UB Tile 计算串起来
+#### 8.3.2 PyPTO2-block版：在一个核内函数中把 UB Tile 计算串起来
 
-原生 softmax 中，同一个 `@pl.jit(auto_mutex=True)` kernel 的 Vector 区域内，已经为输入、输出、归约和 scratch 建好 TileGroup 并设置 valid shape。以下是其中连续计算的摘录：[B14（PyPTO2-Pro）]
+原生 softmax 中，同一个 `@pl.jit(auto_mutex=True)` kernel 的 Vector 区域内，已经为输入、输出、归约和 scratch 建好 TileGroup 并设置 valid shape。以下是其中连续计算的摘录：[B14（PyPTO2-block版）]
 
 ```python
 pl.load(in_slot, x, [row_off, 0])
@@ -4032,7 +4038,7 @@ pl.store(y, out_slot, [row_off, 0])
 
 这里 `red_slot/out_slot/tmp_slot` 是核内 Vec/UB Tile，不是交给另一个 task 的 GM tensor。用户没有为 max、sub、exp、sum、div 各 launch 一次；例子由每个 core 循环处理分配给它的行 tile。实际完整代码会在 load 后选择其余 slot、设置尾块，摘录省略了这部分设置，不能脱离第 2 章完整实现执行。
 
-还可以进一步降低 UB 往返。原生 LayerNorm 的 `@pl.vector_function` 中，归一化部分直接用 RegTensor 串联；以下摘录发生在已完成 mean/std、已设 mask 的寄存器循环中：[B29（PyPTO2-Pro）]
+还可以进一步降低 UB 往返。原生 LayerNorm 的 `@pl.vector_function` 中，归一化部分直接用 RegTensor 串联；以下摘录发生在已完成 mean/std、已设 mask 的寄存器循环中：[B29（PyPTO2-block版）]
 
 ```python
 reg = vf.load_align(in_tile, base + r * LANES)
@@ -4045,7 +4051,7 @@ out = vf.add(out, beta, mreg)
 vf.store_align(out_tile + (base + r * LANES), out, mreg)
 ```
 
-这个子链的 `xc/norm/out` 直接传递寄存器值；但完整 LayerNorm 仍多遍读取输入 UB，不能描述成“整个 LayerNorm 只读一次”。相比 Tile 版，用户要承担更多 mask、寄存器块宽度、地址偏移、归约顺序及目标 VF 支持责任。**Pro 的显式核内组合与其可选的寄存器优化，应分两级评价；不是“只有手写 VF 才能省 GM”。** [B28（PyPTO2-Pro）]
+这个子链的 `xc/norm/out` 直接传递寄存器值；但完整 LayerNorm 仍多遍读取输入 UB，不能描述成“整个 LayerNorm 只读一次”。相比 Tile 版，用户要承担更多 mask、寄存器块宽度、地址偏移、归约顺序及目标 VF 支持责任。**block版 的显式核内组合与其可选的寄存器优化，应分两级评价；不是“只有手写 VF 才能省 GM”。** [B28（PyPTO2-block版）]
 
 #### 8.3.3 PyPTO3（Simpler）：把五项计算放进一个 InCore，而非只放进一个 JIT
 
@@ -4098,7 +4104,7 @@ ch_y.commit(_ub_y)
 
 因此，**一个 kernel、一个 UB 计算链、一个 VF group 仍可能是三个不同范围**。原例中的 Channel release/acquire 就可能切开更细的 VF 分组，但并未因此变成多个 Host kernel launch，也未因此要求把全部中间量搬到 GM。默认 pipeline 可被配置改变；有分组 pass 不意味着任何链都已整段保留寄存器。
 
-**用户感知：**与 Pro 相近，必须理解核内存储、同步和切片；但 CANNBot 主要通过 Buffer/Channel/layout 与 MLIR passes 组织这些语义，不能把它等同为 Pro 的 TileGroup/mutex 或同一编译实现。
+**用户感知：**与 block版 相近，必须理解核内存储、同步和切片；但 CANNBot 主要通过 Buffer/Channel/layout 与 MLIR passes 组织这些语义，不能把它等同为 block版 的 TileGroup/mutex 或同一编译实现。
 
 #### 8.3.5 PyPTO on GPU：将连续表达放进同一受支持计算图，底层再分配线程和存储
 
@@ -4245,11 +4251,11 @@ torch.testing.assert_close(y, vector_chain(x), rtol=1e-3, atol=1e-3)
 
 例如长行 softmax 可以在**同一个核内任务**中先逐 chunk 求 max，再逐 chunk 累加 exp 的和，最后重新读取输入归一化输出：没有必要保存完整的 exp GM tensor，但输入读了多遍。若改为多个核同时归约一个长行，则各核需要交换 partial；把函数名字合并不会凭空产生合法的跨核同步或共享 UB。
 
-PyPTO2-普通版与 Inductor 路线需要编译器支持这种分解/融合，并不由“语法能写 reduce”就保证生成理想算法；Pro/CANNBot/手写 Triton/InCore 作者可更直接设计它，但也相应承担数值、分工和同步责任。第 2 章的公共长行算法是语义参考，不能冒充所有后端都会自动采用的实现。
+PyPTO2-tensor版与 Inductor 路线需要编译器支持这种分解/融合，并不由“语法能写 reduce”就保证生成理想算法；block版/CANNBot/手写 Triton/InCore 作者可更直接设计它，但也相应承担数值、分工和同步责任。第 2 章的公共长行算法是语义参考，不能冒充所有后端都会自动采用的实现。
 
 对于 paged decode，`actual_seq_len` 影响有效 KV 工作量，不天然要求把 exp、sum 各自放到不同 task；更关键的是 QK、softmax、PV 的生产消费分工和片上资源是否兼容。当前 PyPTO3 native PA 就保留 GM transfer ring，是“同一合作 task 仍有 GM 中间通信”的实际反例，见第 8.10 节。[C16（PyPTO3（Simpler））] [C23（PyPTO3（Simpler））]
 
-**新增一个 Vector 操作是否需要新的 tiling 函数？** 单纯在现有 tile 上新增受支持的 pointwise 计算，不会在接口层必然增加一个 Host tiler；但它可能增加 live buffer、寄存器占用、同步或改变最佳 tile。Pro/CANNBot 等显式策略作者需要重新核查现有函数/参数是否仍有效；自动路径由 compiler/planner 重新评估，可能改变计划或变体。不能把“用户没多写 tiling 函数”误解为“底层计划无需改变”。
+**新增一个 Vector 操作是否需要新的 tiling 函数？** 单纯在现有 tile 上新增受支持的 pointwise 计算，不会在接口层必然增加一个 Host tiler；但它可能增加 live buffer、寄存器占用、同步或改变最佳 tile。block版/CANNBot 等显式策略作者需要重新核查现有函数/参数是否仍有效；自动路径由 compiler/planner 重新评估，可能改变计划或变体。不能把“用户没多写 tiling 函数”误解为“底层计划无需改变”。
 
 H/I 也面临上述选择：H 的固定 UB/L1/L0 与 I 的 SMEM/TMEM/寄存器预算，使新增 Vector/fragment 操作可能压缩缓冲槽或拉长生命周期；没有新增 Host tiler 接口不等于计划无需复核。H 的 KV=513 尾块通过与 Q=1 精度失败是不同配置的事实，不能合成“任意动态 attention 已正确”；I 的不同 split/变量序列需按各自 kernel 约束验收。[H-run-results] [H-fa] [I-gqa] [I-mla]
 
@@ -4260,12 +4266,12 @@ H/I 也面临上述选择：H 的固定 UB/L1/L0 与 I 的 SMEM/TMEM/寄存器�
 对用户可采用分层做法：
 
 1. **先在一个 tile 的自然生产消费链内融合。** 纯 pointwise 链、softmax 行内链、matmul 的可支持 epilogue，优先查中间值是否真正不物化到 GM。
-2. **再检查是否值得进一步做 VF/寄存器融合。** UB 已消除 GM 往返后，瓶颈可能转到 UB 带宽、指令吞吐或归约；此时 Pro 的 VF、CANNBot 的 VF passes、其他后端的寄存器优化才是下一层问题。
+2. **再检查是否值得进一步做 VF/寄存器融合。** UB 已消除 GM 往返后，瓶颈可能转到 UB 带宽、指令吞吐或归约；此时 block版 的 VF、CANNBot 的 VF passes、其他后端的寄存器优化才是下一层问题。
 3. **最后讨论跨 tile、跨核、跨任务的大区域。** 明确需要哪些 partial、哪些 GM transfer、什么同步以及如何保持负载均衡，再使用第 6 章的 megaKernel 与 scheduler 分析，不能用“设备侧有动态调度器”替代这一步。
 
-这也解释了路线相似性：**Pro 与 CANNBot 在作者主动建设核内融合区域这一层更近；普通版与两条 Inductor 路线在根据较高层数据流做编译合图这一层有相似性；PyPTO3 的 InCore 与各 kernel DSL 在局部计算层相近，但其整个任务程序不能只按 kernel DSL 比较。** 局部 Vector 融合本身不足以区分谁更有整层 megaKernel 能力，也不足以决定第 14 章按整体架构选择的最相似者。
+这也解释了路线相似性：**block版 与 CANNBot 在作者主动建设核内融合区域这一层更近；tensor版与两条 Inductor 路线在根据较高层数据流做编译合图这一层有相似性；PyPTO3 的 InCore 与各 kernel DSL 在局部计算层相近，但其整个任务程序不能只按 kernel DSL 比较。** 局部 Vector 融合本身不足以区分谁更有整层 megaKernel 能力，也不足以决定第 14 章按整体架构选择的最相似者。
 
-在同一尺度上，H 与 Pro/CANNBot 都由作者主动连接核内物理数据路径；I 则以线程/值 fragment、atom 和 pipeline 承担相近责任，TS 可辅助资源协议。它们增加了设计融合区域的控制面，并未消除扩大区域造成的占用、同步和重分片代价；第 8.12 节的预算与第 6 章的关键路径模型应一起使用。[H-mixed] [I-gqa] [I-task]
+在同一尺度上，H 与 block版/CANNBot 都由作者主动连接核内物理数据路径；I 则以线程/值 fragment、atom 和 pipeline 承担相近责任，TS 可辅助资源协议。它们增加了设计融合区域的控制面，并未消除扩大区域造成的占用、同步和重分片代价；第 8.12 节的预算与第 6 章的关键路径模型应一起使用。[H-mixed] [I-gqa] [I-task]
 
 ### 8.7 验证方法：不能仅凭 profiling 中“一个 kernel”下结论
 
@@ -4296,8 +4302,8 @@ H 本次已留存源级 kernel、lowered MLIR、ABI manifest 与产物 hash，�
 
 | 路线 | 片上规划及流水 | GM/workspace | 需要重点检验的边界 |
 | --- | --- | --- | --- |
-| A（PyPTO2-普通版） | TileFwk图/核内codegen及tile策略 | 图与runtime计划、参数tensor | task依赖改变后内存复用是否仍合法 |
-| B（PyPTO2-Pro） | TileType、地址、TileGroup、mutex/pipeline；作者控制强 | 调用者分配；workspace/TilingData经参数传 | 显式地址重叠、valid_shape、双缓冲slot生命周期 |
+| A（PyPTO2-tensor版） | TileFwk图/核内codegen及tile策略 | 图与runtime计划、参数tensor | task依赖改变后内存复用是否仍合法 |
+| B（PyPTO2-block版） | TileType、地址、TileGroup、mutex/pipeline；作者控制强 | 调用者分配；workspace/TilingData经参数传 | 显式地址重叠、valid_shape、双缓冲slot生命周期 |
 | C（PyPTO3（Simpler）） | PyPTO passes + PTOAS memory/sync；可手写mixed pipeline | create_tensor、scope/runtime、显式transfer ring | auto依赖与manual_scope混用；WAR/WAW；跨task可见性 |
 | D（CANNBot DSL） | Buffer/Channel、layout、MLIR allocation/同步推断 | Host runtime/调用者及传入tensor | Channel槽位数量≠任意全局task并发；release时机 |
 | E（PyPTO on GPU） | TensorIR/Tile compiler计划tile/layout/workers | framework参数和中间tensor；operator包装 | bucket/stride符合产物；跨launch中间值实际GM流量 |
@@ -4326,7 +4332,7 @@ SPMD attention task（24 logical blocks）
 
 ### 8.11 三种同步分别验收
 
-普通版 PyPTO2 本次“前端更新后 cache 参考通过、板端却接近旧 cache”的现象，为下面的同步与别名分析增加了具体检查对象；重建 view 的局部修正有效，但仍不足以把根因直接归到某一种同步机制。[RUN-A-fail] [RUN-A-front] [RUN-A-pass]
+PyPTO2-tensor版 本次“前端更新后 cache 参考通过、板端却接近旧 cache”的现象，为下面的同步与别名分析增加了具体检查对象；重建 view 的局部修正有效，但仍不足以把根因直接归到某一种同步机制。[RUN-A-fail] [RUN-A-front] [RUN-A-pass]
 
 | 同步范围 | 典型对象 | 不能替代 |
 | --- | --- | --- |
@@ -4423,7 +4429,7 @@ E（PyPTO on GPU） 的历史产物记录 `artifact_launch_abi_block=(1,1,1)`，
 
 ### 9.3 五阶段 softmax：历史 trace 核对结果
 
-本节保留旧环境记录的完整表格、数值及失败诊断，用于支撑 launch ABI、物理 worker 与程序边界的讨论。原始 trace/summary 本次未迁入，下面“解析得到”的过程发生于旧环境；本次未重跑 profiling，也未重新验证旧二进制。历史记录来源为[原文归档][GPU-history]。
+本节列出历史 GPU 实验的完整表格、数值及失败诊断，用于分析 launch ABI、物理 worker 与程序边界。原始 trace/summary 未迁入当前环境；下列解析结果来自历史实验，当前环境未重跑 profiling 或重新验证旧二进制。记录来源为[历史实验归档][GPU-history]。
 
 实验输入 `[4096,128]` FP32；设备为 RTX 1000 Ada Generation Laptop GPU，20 SM、sm89。[E7（PyPTO on GPU）]
 
@@ -4453,7 +4459,7 @@ TensorIR emission rejected: native RMSNorm input/output must be identical rank-2
 
 ### 9.4 NPU 不能直接套 CUDA grid/block 定义
 
-B（PyPTO2-Pro）/D（CANNBot DSL）/G（AutoFuse + Inductor） 的 `blockDim` 是NPU launch并行配置，必须结合AIC/AIV/mixed和sub-block理解，不是“一个block内有多少CUDA线程”。
+B（PyPTO2-block版）/D（CANNBot DSL）/G（AutoFuse + Inductor） 的 `blockDim` 是NPU launch并行配置，必须结合AIC/AIV/mixed和sub-block理解，不是“一个block内有多少CUDA线程”。
 
 F（Triton-Ascend） 更明确地分开：
 
@@ -4492,11 +4498,11 @@ CuTe GQA simple 的源码给 decode 配置 12 个 warp（384 线程），然后�
 | --- | --- | --- | --- |
 | C（PyPTO3（Simpler））的InCore后端从PTOAS换成AscendNPU-IR | PyPTO用户表达、外层Orchestration、Simpler可望保留 | PTO/custom IR→目标dialect；tile/layout/effects；ABI、资源、sync/workspace；与现有wrapper衔接 | 中高；需要限定算子子集 |
 | F（Triton-Ascend）改用PTOAS | Triton语法、部分TTIR/Inductor入口 | TTIR或适配IR→PTO；显式memory/layout责任；dynamic loop、dot/reduce、metadata/launch协议 | 高；不能只把HIVM文件喂给PTOAS |
-| B（PyPTO2-Pro）接PTOAS或AscendNPU-IR | Pro前端、自有IR部分、Host API可能保留 | private ops、地址/TileGroup/mutex/VF语义；CCECodegen位置新增lowering；验证架构覆盖 | 中高 |
+| B（PyPTO2-block版）接PTOAS或AscendNPU-IR | block版前端、自有IR部分、Host API可能保留 | private ops、地址/TileGroup/mutex/VF语义；CCECodegen位置新增lowering；验证架构覆盖 | 中高 |
 | D（CANNBot DSL）接另一MLIR后端 | Python tracing、部分标准arith/scf/memref表示 | CANNIR/Channel/缓冲所有权及AscendC专用语义转换；Host Device边界 | 中高；同为MLIR降低基础设施摩擦，不消除语义差异 |
 | G（AutoFuse + Inductor）把Device codegen改为PTO/HIVM | Inductor入口、ASCIR、已有schedule/Host tiling可部分保留 | 明确转换发生在schedule前还是后；重写kernel renderer或较高层lowering；保持tiling/workspace ABI | 高；不能让两个后端重复做互相矛盾的规划 |
 | E（PyPTO on GPU）复用NPU后端 | 只能共享目标无关语义与上层分析部分 | SM/CTA/warp、地址空间、tensor指令、同步与二进制全部目标相关 | 跨硬件重定向，不是局部插件替换 |
-| A（PyPTO2-普通版）换核内codegen后端 | Tensor/TileFwk图任务体系理论上可保留 | 从已分解计算导出稳定kernel IR/ABI、动态参数、与设备runtime的调用协议 | 中高；若同时替runtime则显著扩大 |
+| A（PyPTO2-tensor版）换核内codegen后端 | Tensor/TileFwk图任务体系理论上可保留 | 从已分解计算导出稳定kernel IR/ABI、动态参数、与设备runtime的调用协议 | 中高；若同时替runtime则显著扩大 |
 | H（CATLASS DSL）改接另一 NPU 核内后端 | Python staging、算法、可被目标表达的 TLA 语义 | 选定转换层，重建 layout tag、地址空间/MMAD/Vector、mixed split、异步效应、ABI/metadata；接 PTOAS 也不是只换命令 | 中高；与 F 共用部分下游不等于 TLA 和 TTIR 输入可互换。[H-passes] [H-mixed-pass] |
 | E（PyPTO on GPU）改用 I（CuTe DSL）生成核内实现 | 上层数学接口、部分 wrapper 与正确性契约 | 从 PyPTO 图/模式选 CuTe 模板或生成 layout/atom/线程分区，适配编译缓存、参数、CUDA artifact/launch | 中高至高，取决于限定模板还是通用新后端；当前仅工程设想。[I-dsl] [I-executor] |
 | H（CATLASS DSL）与 I（CuTe DSL）跨硬件重定向 | 数学语义、tile/资源/异步依赖的部分描述 | NPU CV/MTE/FIX/L0/UB 与 GPU warp/TMA/TMEM 的计算、存储、同步及进展映射 | 跨硬件编译设计；不能把 layout API 改名即视为移植完成。[H-api-copy] [I-copy] [I-mma] |
@@ -4524,11 +4530,11 @@ CuTe GQA simple 的源码给 decode 配置 12 个 warp（384 线程），然后�
 | task图GM | 统一依赖/alias/完成事件模型，再做跨task复用 | kernel内linear liveness结果 |
 | 框架图GM | Inductor buffer ownership、stream/event完成与cache契约 | 把Simpler scope释放规则当通用框架allocator语义 |
 
-A（PyPTO2-普通版）/C（PyPTO3（Simpler）） 在跨task tensor计划方面接近；B（PyPTO2-Pro）/D（CANNBot DSL）/F（Triton-Ascend）/G（AutoFuse + Inductor）在局部buffer领域有重叠；E（PyPTO on GPU）共享的是分析思想与部分算法，目标内存约束仍不同。不是“同一个planner一定更好”，而是统一输入/输出契约后才有可比较的正确性和维护边界。
+A（PyPTO2-tensor版）/C（PyPTO3（Simpler）） 在跨task tensor计划方面接近；B（PyPTO2-block版）/D（CANNBot DSL）/F（Triton-Ascend）/G（AutoFuse + Inductor）在局部buffer领域有重叠；E（PyPTO on GPU）共享的是分析思想与部分算法，目标内存约束仍不同。不是“同一个planner一定更好”，而是统一输入/输出契约后才有可比较的正确性和维护边界。
 
 H/I 的具体 planner 也应接入上述契约：H 的对齐递增分配可作为最基础的 offset 计划，若加生命周期复用，必须补 alias/异步完成分析；I 的 TS phase alias 已让作者表达部分复用关系，但 SMEM 字节、TMEM 列及 warp 资源仍有独立目标约束。两者都可参与局部资源描述和验证器的共用讨论，不能直接把结果当 task 图 GM 的释放计划。[H-scratch] [I-ts-memory]
 
-### 10.3 把 B（PyPTO2-Pro）/D（CANNBot DSL）/F（Triton-Ascend）/G（AutoFuse + Inductor）/H（CATLASS DSL）kernel 接入 Simpler：可行方向，但当前不是直接兼容
+### 10.3 把 B（PyPTO2-block版）/D（CANNBot DSL）/F（Triton-Ascend）/G（AutoFuse + Inductor）/H（CATLASS DSL）kernel 接入 Simpler：可行方向，但当前不是直接兼容
 
 C（PyPTO3（Simpler））已有extern kernel、SPMD task、mixed kernel和tiling task这些接缝。[C6（PyPTO3（Simpler））] [C13（PyPTO3（Simpler））] [C19（PyPTO3（Simpler））] 一个分阶段原型可以这样界定：
 
@@ -4554,9 +4560,9 @@ Host编译 / tiling / allocation（先保留现有工具）
 | tiling位置 | 保留Host tiler、生成device tiler、或设备读取长度；不能默认为任意Host策略可搬到AICPU |
 | 生命周期和异常 | scratch归谁、何时回收、异步完成、超时/失败如何传到scheduler |
 
-B（PyPTO2-Pro）/D（CANNBot DSL）通常需要把直接launch模型封装为task ABI；F（Triton-Ascend）还需维护compiler metadata、AutoBlockify与workspace索引的契约；G（AutoFuse + Inductor）需保留或替换生成tiling及wrapper中的职责。
+B（PyPTO2-block版）/D（CANNBot DSL）通常需要把直接launch模型封装为task ABI；F（Triton-Ascend）还需维护compiler metadata、AutoBlockify与workspace索引的契约；G（AutoFuse + Inductor）需保留或替换生成tiling及wrapper中的职责。
 
-这是一条有明确接口工作的集成路线，不是架构不可能；但也没有足够证据说当前Pro/CANNBot/Triton/AutoFuse产物已经可不改地放入Simpler。A（PyPTO2-普通版）/C（PyPTO3（Simpler）） scheduler互换更大：其任务图格式、依赖、内存计划、设备代码及控制协议一起耦合。
+这是一条有明确接口工作的集成路线，不是架构不可能；但也没有足够证据说当前block版/CANNBot/Triton/AutoFuse产物已经可不改地放入Simpler。A（PyPTO2-tensor版）/C（PyPTO3（Simpler）） scheduler互换更大：其任务图格式、依赖、内存计划、设备代码及控制协议一起耦合。
 
 H 应按同样八项验收：现成 PyACL/AscendCL artifact 是 Host 启动对象，需另外解决 worker 可调用入口、参数打包、逻辑 block ID、AIC/AIV 资源组、flag/workspace 重入及完成通知。当前并未完成该适配。I 的 CUDA cubin 则不能直接送入 NPU Simpler worker；可借鉴其资源协议或在 GPU 任务体系中设计适配，跨硬件实现转换是另一项工程。[H-execution] [H-runtime] [H-mixed-pass] [I-executor] [I-task]
 
@@ -4573,7 +4579,7 @@ H 应按同样八项验收：现成 PyACL/AscendCL artifact 是 Host 启动对�
 
 H 可以作为 NPU kernel 提供者参与 Host 组合或 extern 适配原型；是否进入 Simpler 取决于上一节契约，不取决于同用 Python/MLIR。I 可在 GPU 上保留自己的 CUDA kernel/Host 编译，TS 则服务核内资源协作；将它们纳入统一程序 IR 或跨设备调度，需要额外的目标与完成事件语义。第 10.5 节保留这些方向的逐项可保留/需重做清单。[H-execution] [I-executor] [I-task]
 
-### 10.5 H/I 加入后的替代与公共契约
+### 10.5 H/I 的替代关系与公共契约
 
 | 设想 | 可以保留什么 | 还需具体实现什么 | 当前判断 |
 | --- | --- | --- | --- |
@@ -4586,7 +4592,7 @@ H 可以作为 NPU kernel 提供者参与 Host 组合或 extern 适配原型；�
 
 H 的编译产物可以由 Host 装载/执行，只能证明其现有 launch ABI 完整，不能证明它已经满足任意设备 runtime 的调用规约。I 的 JIT executor 提供 cubin 与导出相关逻辑，也不能消除设备二进制架构、参数布局、stream/上下文和全局同步上的差异。[H-runtime] [H-execution] [I-executor] [I-task] [H-scratch]
 
-因此第 10.1—10.4 节的公共契约分析继续成立；新增 H/I 的作用，是把资源规划、layout、异步协议和 kernel artifact 这些接缝落实到更多具体代码。先实现一个小 kernel 的适配并检验动态参数、重入和完成通知，再扩大到 PA/整层，才有证据谈现成替代关系。
+H/I 的资源规划、layout、异步协议和 kernel artifact 为第 10.1—10.4 节的公共契约提供了具体代码参照。适配应先在一个小 kernel 上检验动态参数、重入和完成通知，再扩大到 PA/整层；这些原型结果才是判断现成替代关系的依据。
 
 ## 11. 多维相似性、优化空间和开发成本
 
@@ -4594,15 +4600,15 @@ H 的编译产物可以由 Host 装载/执行，只能证明其现有 launch ABI
 
 | 比较维度 | 最明显的相似组 | 容易被遗漏的差别 |
 | --- | --- | --- |
-| 前端代码/基础IR血缘 | A（PyPTO2-普通版）—B（PyPTO2-Pro）；C（PyPTO3（Simpler））—E（PyPTO on GPU，独立 checkout） | 血缘并不决定runtime；C（PyPTO3（Simpler））/E（PyPTO on GPU）能力演进未自动同步 |
-| 程序级设备任务系统 | A（PyPTO2-普通版）—C（PyPTO3（Simpler）） | TileFwk与Simpler不是同一套实现 |
-| 显式核内控制 | B（PyPTO2-Pro）—D（CANNBot DSL）；C（PyPTO3（Simpler））的SPMD/InCore亦接近 | C（PyPTO3（Simpler））还带外层task语义；B（PyPTO2-Pro）不以MLIR为主IR |
+| 前端代码/基础IR血缘 | A（PyPTO2-tensor版）—B（PyPTO2-block版）；C（PyPTO3（Simpler））—E（PyPTO on GPU，独立 checkout） | 血缘并不决定runtime；C（PyPTO3（Simpler））/E（PyPTO on GPU）能力演进未自动同步 |
+| 程序级设备任务系统 | A（PyPTO2-tensor版）—C（PyPTO3（Simpler）） | TileFwk与Simpler不是同一套实现 |
+| 显式核内控制 | B（PyPTO2-block版）—D（CANNBot DSL）；C（PyPTO3（Simpler））的SPMD/InCore亦接近 | C（PyPTO3（Simpler））还带外层task语义；B（PyPTO2-block版）不以MLIR为主IR |
 | MLIR贯穿较长kernel编译链 | D（CANNBot DSL）—F（Triton-Ascend） | D（CANNBot DSL）偏显式硬件/Host staging，F（Triton-Ascend）偏逻辑tile program；dialect不兼容 |
 | 自有前端IR→专用MLIR后端 | C（PyPTO3（Simpler））—E（PyPTO on GPU） | C（PyPTO3（Simpler））的PTOAS不负责整个task系统；E（PyPTO on GPU）当前受pattern限制 |
 | Inductor用户入口/融合kernel生成 | F（Triton-Ascend）—G（AutoFuse + Inductor） | F（Triton-Ascend）有独立kernel DSL，G（AutoFuse + Inductor）有自动生成Host tiler；两者有extern/template边界 |
 | 自动核内buffer/同步与直接launch | E（PyPTO on GPU）—F（Triton-Ascend）；G（AutoFuse + Inductor）也有同类分工 | GPU/NPU硬件映射不同；F（Triton-Ascend）/G（AutoFuse + Inductor）自动化责任不完全相同 |
-| 固定物理tile + runtime有效尺寸 | B（PyPTO2-Pro）—C（PyPTO3（Simpler））—D（CANNBot DSL）—F（Triton-Ascend） | 语法、合法上界、cache特化和同步协议各异 |
-| 单独生成Host tiling | G（AutoFuse + Inductor）最明确；B（PyPTO2-Pro）的AOT客户场景接近 | G（AutoFuse + Inductor）是编译器生成；B（PyPTO2-Pro）通常是客户普通Python或Host C++策略 |
+| 固定物理tile + runtime有效尺寸 | B（PyPTO2-block版）—C（PyPTO3（Simpler））—D（CANNBot DSL）—F（Triton-Ascend） | 语法、合法上界、cache特化和同步协议各异 |
+| 单独生成Host tiling | G（AutoFuse + Inductor）最明确；B（PyPTO2-block版）的AOT客户场景接近 | G（AutoFuse + Inductor）是编译器生成；B（PyPTO2-block版）通常是客户普通Python或Host C++策略 |
 | tiling也可作为设备task | C（PyPTO3（Simpler））有直接实例 | 不是Simpler自动替客户写所有tiling |
 | Python layout/atom/显式局部资源 | H（CATLASS DSL）—I（CuTe DSL）；同硬件工程再对照 B/D | H 更侧重物理 layout tag 与 NPU 通路；I 有线程/值 layout 代数与 GPU atom，名字相近不证明代码血缘。[H-api-layout] [I-layout] |
 | 显式 NPU 核内控制且较早进入 MLIR | D（CANNBot DSL）—H（CATLASS DSL）；下游基础设施另比较 F | D 的 Channel/Host staging/CANNIR 与 H 的 TLA/helper/mixed/HIVM 不同；共享 MLIR 不等于共享语义。[H-dsl] [H-passes] |
@@ -4614,8 +4620,8 @@ H 的编译产物可以由 Host 装载/执行，只能证明其现有 launch ABI
 
 | 路线 | 可直接发力的维度 | 典型代价 / 风险 |
 | --- | --- | --- |
-| A（PyPTO2-普通版） | 图/task粒度、依赖、tile、GM复用、跨阶段并发 | 编译与runtime耦合较深；过细task导致调度/metadata开销 |
-| B（PyPTO2-Pro） | 物理tile、VF/Cube布局、地址、double-buffer、角色分工 | 用户与算子维护者承担资源证明；架构特化和尾块组合增多 |
+| A（PyPTO2-tensor版） | 图/task粒度、依赖、tile、GM复用、跨阶段并发 | 编译与runtime耦合较深；过细task导致调度/metadata开销 |
+| B（PyPTO2-block版） | 物理tile、VF/Cube布局、地址、double-buffer、角色分工 | 用户与算子维护者承担资源证明；架构特化和尾块组合增多 |
 | C（PyPTO3（Simpler）） | task融合/拆分、Simpler并发、SPMD子图、核内PTO优化、manual依赖 | 显式依赖和GM一致性难度；大SPMD task可降低外层调度弹性 |
 | D（CANNBot DSL） | Channel/SWP、搬运布局、memory reuse、低层vector/cube控制 | 生命周期与事件协议复杂；高性能例子与动态/AOT契约需同时维护 |
 | E（PyPTO on GPU） | pattern覆盖、tile/layout、CTA规模、bucket、head合并、减少多launch/GM | 静态专门化与编译器覆盖；更大融合可能增加资源/编译压力 |
@@ -4628,12 +4634,12 @@ H 的编译产物可以由 Host 装载/执行，只能证明其现有 launch ABI
 
 ### 11.3 成本分客户、算子作者和基础设施三方
 
-| 成本承担者 | A（PyPTO2-普通版）/C（PyPTO3（Simpler）） | B（PyPTO2-Pro）/D（CANNBot DSL） | E（PyPTO on GPU）/F（Triton-Ascend） | G（AutoFuse + Inductor） | H（CATLASS DSL） | I（CuTe DSL） |
+| 成本承担者 | A（PyPTO2-tensor版）/C（PyPTO3（Simpler）） | B（PyPTO2-block版）/D（CANNBot DSL） | E（PyPTO on GPU）/F（Triton-Ascend） | G（AutoFuse + Inductor） | H（CATLASS DSL） | I（CuTe DSL） |
 | --- | --- | --- | --- | --- | --- | --- |
 | 客户写数学程序 | 需学习Tensor/scope/task模型；库封装可降低负担 | 若直接写kernel则门槛高；调用封装库则低 | E（PyPTO on GPU）取决于pattern/API；F（Triton-Ascend）可直接DSL或PyTorch | PyTorch入口最少改写，但可见fallback/动态guard | 封装调用可轻；自写需 TLA/物理存储与编译契约 | 封装调用可轻；自写需 CuTe layout/atom/Host-device staging |
 | 高性能算子作者 | 同时理解任务粒度和核内分工 | 低层资源/同步/尾块责任更多 | 理解tile program、compiler lowering和特化策略 | 若只用现成图很少写kernel；扩模板/新lowering责任转到后端开发者 | NPU 数据路径、静态容量、mask/尾块、CV/线程同步 | 线程/值映射、架构 atom、warp/pipeline、split/合并与资源预算 |
 | 编译器开发者 | 图语义、核内编译、runtime契约联动 | 核内IR、硬件语义与JIT/Host边界 | 跨IR及target lowering、autotune与ABI | Inductor接入+图schedule+tiling+codegen+模板覆盖 | TLA passes、mixed/Vector lowering、固定 NPU IR/CANN 兼容 | CuTe/相关 dialect 到目标编译、Host launcher、配套组件版本 |
-| runtime开发者 | A（PyPTO2-普通版）/C（PyPTO3（Simpler））的任务依赖/派发/内存/异常体系较重 | 相对集中在JIT/cache/ABI/launch；复杂合作kernel仍有协议 | E（PyPTO on GPU）为CUDA artifact/launch；F（Triton-Ascend）为CANN及compiler metadata | Host wrapper、generated tiling、workspace、框架/stream集成 | 参数打包、artifact/cache、AscendCL、mixed metadata/stream | JIT/export/cubin、CUDA context/stream、workspace 与 kernel 资源协议 |
+| runtime开发者 | A（PyPTO2-tensor版）/C（PyPTO3（Simpler））的任务依赖/派发/内存/异常体系较重 | 相对集中在JIT/cache/ABI/launch；复杂合作kernel仍有协议 | E（PyPTO on GPU）为CUDA artifact/launch；F（Triton-Ascend）为CANN及compiler metadata | Host wrapper、generated tiling、workspace、框架/stream集成 | 参数打包、artifact/cache、AscendCL、mixed metadata/stream | JIT/export/cubin、CUDA context/stream、workspace 与 kernel 资源协议 |
 | 测试与维护 | task和kernel两级验证 | 物理资源、同步、shape边界 | 图覆盖/特化/target/toolchain组合 | 前端分组/模板/extern、动态tiling、框架版本组合 | 数值/动态复用/同步/产物一致性；现有 Q=1 失败回归 | SM/布局/尾块/变量序列/split，TS 有界检查加数值与硬件验证 |
 
 这是责任位置比较，不是“代码越少开发成本越低”的排名；性能调优、诊断、版本适配和客户支持可能大于首个kernel实现成本。
@@ -4654,31 +4660,31 @@ H/I 两列可结合实际分工核对：[H-dsl] [H-passes] [H-runtime]、[I-dsl]
 
 H 的公开说明将当前实现定位为 TLA API 封装，更完整的 CATLASS C++ 分层抽象仍有后续建设空间。因此不能把 C++ 模板库里所有 schedule/算子自动计入 H。I 也应分开核心 CuTe API、`cute_ext`/experimental 和具体架构示例；依赖文件与目录名称本身不是接口长期稳定性的保证。[H-readme] [I-requirements] [I-task] [I-gqa]
 
-对 megaKernel 项目管理最有用的新增信息，是**显式控制与自动化之间存在多种责任分配方式**：H 已有受限自动同步，I TS 可自动组织已声明的资源协议；它们都不是简单的“所有同步全手写”，也都没有因此自动获得任意模型整层融合。原有客户/算子作者/基础设施三方成本分析继续适用。
+从 megaKernel 的工程成本看，**显式控制与自动化之间存在多种责任分配方式**：H 已有受限自动同步，I TS 可自动组织已声明的资源协议；它们都不是简单的“所有同步全手写”，也都没有因此自动获得任意模型整层融合。相应成本应分别计入客户、算子作者和基础设施三方。
 
 ## 12. 证据口径、验证结果与后续测试边界
 
 ### 12.1 验证范围与已记录结果
 
-以下保留源码分析阶段的验证记录，并补充本次 A5 环境准备与 PA 执行结果。旧 CPU/GPU 数值标识其历史来源，A5 日志另有随文快照；理论模型、源码机制、编译执行正确性和硬件性能四类证据分别解释，不以其中一项替代另一项。总表同时列 A—I：A—G 保留本 session 已完成的测试，H 的构建与现有用例结果在总表标明并于第 12.1.3 节展开，I 明确列为源码分析。本次章节覆盖补充复用这些记录，没有重新跑全套 NPU 性能实验。
+本节汇总源码核对、历史 CPU/GPU 实验和 A5 环境及算子验证，分别标注来源与适用范围；A5 日志提供随文快照。理论模型、源码机制、编译执行正确性和硬件性能是四类不同证据，不能相互替代。总表覆盖 A—I：A—G 的测试逐项列出，H 的构建与用例结果详见第 12.1.3 节，I 仅有源码分析；没有九路线同口径的整层或跨硬件性能实验。
 
 | 事项 | 已记录状态 | 能支持什么结论 |
 | --- | --- | --- |
-| 九条主链、关键分支、IR/launch/tiling源码 | 已检查本地HEAD及相关函数/调用点 | 实现结构、接口约束、责任归属；H/I 的具体新增对象另列下方两行，固定来源见第 13 章 |
-| 普通版/Pro/PyPTO3/CANNBot 重点对比 | 已核对tile/scope、TileGroup/Channel、PA分工、动态策略、核内融合及片上复用 | 用户控制与实际编译/运行责任；不据此给性能排序 |
-| Pro SPMD / PyPTO3 MPMD 任务组织 | 已核对 Pro 分核/launcher、PyPTO3 三阶段 SPMD 示例、Simpler kernel-ID 派发及完成路径；未执行新增 NPU 片段 | SPMD kernel 与多程序任务体系可组合；调度粒度不等于核内循环粒度 |
+| 九条主链、关键分支、IR/launch/tiling源码 | 已检查本地HEAD及相关函数/调用点 | 实现结构、接口约束、责任归属；H/I 的具体对象另列下方两行，固定来源见第 13 章 |
+| tensor版/block版/PyPTO3/CANNBot 重点对比 | 已核对tile/scope、TileGroup/Channel、PA分工、动态策略、核内融合及片上复用 | 用户控制与实际编译/运行责任；不据此给性能排序 |
+| block版 SPMD / PyPTO3 MPMD 任务组织 | 已核对 block版 分核/launcher、PyPTO3 三阶段 SPMD 示例、Simpler kernel-ID 派发及完成路径；未执行新增 NPU 片段 | SPMD kernel 与多程序任务体系可组合；调度粒度不等于核内循环粒度 |
 | 九路线前端/API 边界 | 已核对公开表面、参数/目标/融合限制、原生计算链及PyTorch入口 | 区分有 Python DSL、构图接口、API/后端支持；不是完整 ISA 覆盖测试；包含 H 的 TLA/AutoSync 与 I 的 layout/atom/Host-device/TS 边界 |
-| 动态tiling写法及契约 | 已核对Pro dataclass/key/cache/离线Host回调、CANNBot Dim/bounded tiler、Simpler两种显式tiler及Triton/GPU/AutoFuse入口 | 谁需写函数、怎样传参、策略与产物何时失效 |
-| 用户代码到核内融合 | 已核对普通版纵向合图/scope、Pro Tile/VF、InCore outlining、CANNBot VF passes、GPU组合算子、Triton softmax和AutoFuse局部值/输出处理 | 存在何种融合机制、怎样编写及限制在哪里；不证明特定shape的kernel数、无spill或性能 |
+| 动态tiling写法及契约 | 已核对block版 dataclass/key/cache/离线Host回调、CANNBot Dim/bounded tiler、Simpler两种显式tiler及Triton/GPU/AutoFuse入口 | 谁需写函数、怎样传参、策略与产物何时失效 |
+| 用户代码到核内融合 | 已核对tensor版纵向合图/scope、block版 Tile/VF、InCore outlining、CANNBot VF passes、GPU组合算子、Triton softmax和AutoFuse局部值/输出处理 | 存在何种融合机制、怎样编写及限制在哪里；不证明特定shape的kernel数、无spill或性能 |
 | softmax Host分核公式 | 源码分析阶段CPU执行162组合法输入、4组拒绝输入，检查tile覆盖与尾行总数 | 本文Host策略及整数分工公式；不证明原生kernel尾块正确 |
-| Pro原生Python work_ranges | 源码分析阶段抽取原函数与hybrid_bounds在CPU执行360组计划；按kernel编号公式检查无漏项/重复 | 两种分工模式的元数据覆盖性；不证明NPU执行、最优均衡或性能 |
+| block版原生Python work_ranges | 源码分析阶段抽取原函数与hybrid_bounds在CPU执行360组计划；按kernel编号公式检查无漏项/重复 | 两种分工模式的元数据覆盖性；不证明NPU执行、最优均衡或性能 |
 | pypto-lib softmax/native PA/CCE tiling task | 已核对完整入口和关键实现 | C（PyPTO3（Simpler））同时容纳task与SPMD、不同tiling位置 |
 | Markdown中的Python片段 | 全部Python代码块逐段AST解析；不导入执行NPU DSL | 排除语法损坏；不证明上下文依赖完整、后端支持或 NPU 数值正确 |
 | MLIR 专章 | 核对本地 PTO/CANNIR/HIVM/TensorIR 源码与官方机制文档；未编译本文 IR 摘录 | 表示/编译/执行的边界及具体使用位置 |
 | PTOAS / AscendNPU-IR 编译与 launch 边界 | 核对 Group/多函数输入、VPTO Host stub/fatobj、HFusion 多 kernel/tiling、HACC Host launch、HIVMC Host 编译及 Triton launcher；未运行新增目标测试 | 区分后端本体与集成入口、函数数与 launch 数；不证明任意模型图可运行或存在 AICPU 动态任务 runtime |
 | megaKernel 定量推导 | 复核 softmax 逻辑访问、PA transfer 容量、GQA/权重强度公式 | 分析模型；不是 PMU 实测、性能预测或路线名次 |
-| 公共softmax语义参考 | 前次文档重构已在CPU执行，torch `2.11.0+cu128`；保留原算法与结果 | 分段算法与torch.softmax一致 |
-| 公共paged decode参考与padded表达 | 前次文档重构已在CPU执行，同shape不同L内容 | 数值在给定容差内一致，不是逐位等价 |
+| 公共softmax语义参考 | 历史 GPU 环境中的 CPU 实验，torch `2.11.0+cu128`；算法与结果见下文 | 分段算法与torch.softmax一致 |
+| 公共paged decode参考与padded表达 | 历史 GPU 环境中的 CPU 实验，同shape不同L内容 | 数值在给定容差内一致，不是逐位等价 |
 | 既有GPU原始trace/summary | 保留旧环境文档中的解析记录；本次未迁入原始材料，未重跑profiling | 说明当时记录的五阶段launch/grid/block/stream；不能称为本次原始trace复核 |
 | NPU原生kernel编译及执行 | 已完成选定A5 PA的编译执行与数值校验，逐项见下表；A2/A3未在本轮执行 | 支持指定用例和环境的正确性结论；不能推广到所有硬件、shape或整层性能 |
 | 九路线整层Transformer、跨硬件性能 | 未执行 | 不提供速度、利用率或成熟度数值排名 |
@@ -4695,13 +4701,13 @@ H 的公开说明将当前实现定位为 TLA API 封装，更完整的 CATLASS 
 | `[3,1]` | `0` |
 | `[1,1025]` | `9.313225746154785e-10` |
 
-以上为前次文档重构执行并记录的 FP32 CPU 测试：`torch.manual_seed(0)` 后按表中顺序生成 `torch.randn` 输入，`torch.set_num_threads(4)`、`chunk=1024`，校验 `atol=1e-6,rtol=1e-5`。PA 使用本文 `make_decode_case` 的 BF16 输入/输出，`L=[1,129,513]` 和 `[127,128,512]` 的最大绝对差分别为 `1.9073486328125e-6` 和 `0.000244140625`，均通过 `atol=2e-2,rtol=2e-2`。CPU 线程/归约实现会影响有限精度结果，不要求逐位一致。
+以上为历史 GPU 环境中的 FP32 CPU 测试：`torch.manual_seed(0)` 后按表中顺序生成 `torch.randn` 输入，`torch.set_num_threads(4)`、`chunk=1024`，校验 `atol=1e-6,rtol=1e-5`。PA 使用本文 `make_decode_case` 的 BF16 输入/输出，`L=[1,129,513]` 和 `[127,128,512]` 的最大绝对差分别为 `1.9073486328125e-6` 和 `0.000244140625`，均通过 `atol=2e-2,rtol=2e-2`。CPU 线程/归约实现会影响有限精度结果，不要求逐位一致。
 
-这些测试只验证本文公共golden，不是B（PyPTO2-Pro）/D（CANNBot DSL）/F（Triton-Ascend）等NPU DSL实现的验证。这些描述对应旧 GPU 环境的 CPU 检查；当前 A5 的依赖安装、工具链构建及本地兼容性改动另见本节环境记录。
+这些测试只验证本文公共golden，不是B（PyPTO2-block版）/D（CANNBot DSL）/F（Triton-Ascend）等NPU DSL实现的验证。这些描述对应旧 GPU 环境的 CPU 检查；当前 A5 的依赖安装、工具链构建及本地兼容性改动另见本节环境记录。
 
-已记录的CPU计划检查使用现有 `gpu/PyPTO-LOVE-TensorIR/envs/ada-sm89` 环境，torch `2.11.0+cu128`，单CPU线程；不导入Pro DSL或运行NPU代码。softmax检查覆盖M为`0/1/15/16/17/33/65/777/2049`、N为`1/300/512`、核数为`1/2/8/24/32/64`的笛卡尔积，并拒绝负M、零N、N超容量和零核数。work_ranges检查覆盖Q长度列表`[1]`、`[1,1,1]`、`[127,128,129]`、`[512,256,200]`、`[128]*8`，head数`1/4/16`、核数`1/2/8/24`、默认/连续/步进配对三种选择以及两组KV长度/可见范围。检查的是每个工作编号恰好覆盖一次、单核编号递增及未launch核心无工作，不是完整attention数值测试或成本模型最优性证明。
+已记录的CPU计划检查使用现有 `gpu/PyPTO-LOVE-TensorIR/envs/ada-sm89` 环境，torch `2.11.0+cu128`，单CPU线程；不导入block版 DSL或运行NPU代码。softmax检查覆盖M为`0/1/15/16/17/33/65/777/2049`、N为`1/300/512`、核数为`1/2/8/24/32/64`的笛卡尔积，并拒绝负M、零N、N超容量和零核数。work_ranges检查覆盖Q长度列表`[1]`、`[1,1,1]`、`[127,128,129]`、`[512,256,200]`、`[128]*8`，head数`1/4/16`、核数`1/2/8/24`、默认/连续/步进配对三种选择以及两组KV长度/可见范围。检查的是每个工作编号恰好覆盖一次、单核编号递增及未launch核心无工作，不是完整attention数值测试或成本模型最优性证明。
 
-旧稿记录的检查包括58个 Python 代码块 AST、196个本地引用、61张表格、99个代码块及13个导航锚点。本次在保留这些示例与讨论的基础上更新引用并添加A5证据，重新检查代码块保留情况、AST、引用、表格和导航。4个 MLIR 代码块及 AscendC 摘录仍未逐段调用目标工具链编译；SPMD/派发及 PTOAS/HACC/HFusion 的额外测试也不能由通用 PA 通过代为验收。文档检查不等于浏览器渲染或新增硬件测试。
+历史文档校验记录包括58个 Python 代码块 AST、196个本地引用、61张表格、99个代码块及13个导航锚点；这些是对应快照的统计。当前文档校验同样覆盖代码块、AST、引用、表格和导航。4个 MLIR 代码块及 AscendC 摘录仍未逐段调用目标工具链编译；SPMD/派发及 PTOAS/HACC/HFusion 的额外测试也不能由通用 PA 通过代为验收。文档检查不等于浏览器渲染或硬件测试。
 
 
 #### 12.1.1 A5 环境、基础算子与逐路线 PA 验证
@@ -4714,8 +4720,8 @@ H 的公开说明将当前实现定位为 TLA API 封装，更完整的 CATLASS 
 
 | 路线 | 本次实际输入 | 已记录结果与对应对象 |
 | --- | --- | --- |
-| A：普通版 | FP32 softmax `[32,32,1,256]` | 原 softmax 例子通过；对应 Tensor 运算与 tile 配置。[A12（PyPTO2-普通版）] |
-| B：Pro | FP32 softmax `[2048,64]`、`[4096,128]`、`[1000,200]`、`[777,300]`、`[100,512]`、`[2049,100]` | 原测试6组通过；对应固定物理 tile、动态 valid shape 及多核尾行。[B14（PyPTO2-Pro）] |
+| A：tensor版 | FP32 softmax `[32,32,1,256]` | 原 softmax 例子通过；对应 Tensor 运算与 tile 配置。[A12（PyPTO2-tensor版）] |
+| B：block版 | FP32 softmax `[2048,64]`、`[4096,128]`、`[1000,200]`、`[777,300]`、`[100,512]`、`[2049,100]` | 原测试6组通过；对应固定物理 tile、动态 valid shape 及多核尾行。[B14（PyPTO2-block版）] |
 | C：PyPTO3 | FP32 softmax `[512,256]`，另有 hello world `[1024,512]`、matmul `[256,256]` | pypto-lib 的3个例子以 A5 入口通过；softmax 对应本章 `pl.parallel/CORE_GROUP` 写法。[C15（PyPTO3（Simpler））] |
 | D：CANNBot | arena RMSNorm：FP16 `[4096,2304]`、FP32 `[768,12288]`；MatMul：M/K/N=`4096/3840/384`，FP16/BF16 | 原 arena 数值测试通过；为 DSL 编译、混合精度矩阵/向量入口提供对象。[D-arena-rms] [D-arena-mm] |
 | E：PyPTO on GPU | 本轮 NPU 环境未执行 CUDA 基础算子 | 旧 SM89 softmax 记录仍见第 9.3 节，不计入本轮 A5 通过数。[E7（PyPTO on GPU）] [E9（PyPTO on GPU）] |
@@ -4730,8 +4736,8 @@ H 的公开说明将当前实现定位为 TLA API 封装，更完整的 CATLASS 
 
 | 标识与路线 | 完整实现 / 原测试来源 | 本轮 PA 结果 | 已验证的范围 |
 | --- | --- | --- | --- |
-| A — PyPTO2 普通版 | [ctrl_perf_kernel][A-pa] | **原版精度失败；本地修正版通过** | 前处理→KV写入→PA；FP16，B=4，Hq/Hkv=8/1，D=128，页大小128，L=127/128/129/513 |
-| B — PyPTO2 Pro | [flex_attention_bf16][B-pa]、[页大小测试][B-pa-test] | **通过** | BF16；页大小128/256/512的prefill，以及补充的单token decode；后者L=127/128/129/513 |
+| A — PyPTO2-tensor版 | [ctrl_perf_kernel][A-pa] | **原版精度失败；本地修正版通过** | 前处理→KV写入→PA；FP16，B=4，Hq/Hkv=8/1，D=128，页大小128，L=127/128/129/513 |
+| B — PyPTO2-block版 | [flex_attention_bf16][B-pa]、[页大小测试][B-pa-test] | **通过** | BF16；页大小128/256/512的prefill，以及补充的单token decode；后者L=127/128/129/513 |
 | C — PyPTO3（Simpler） | [通用 PA 程序][C-pa]、[PTOAS 测试][C-pa-test] | **2例通过** | B=64，Hq/Hkv=16/1，D=128，页大小128，L=8192及8100；BF16输入、FP32输出 |
 | D — CANNBot DSL | [paged kernel][D-pa]、[原测试][D-pa-test] | **2个原用例及1个decode用例通过** | FP16，D=128，页大小128；无mask多query attention；B=4、Hq/Hkv=9/1、Q长度1、L=512的decode |
 | E — PyPTO on GPU | [paged_attention_decode][E-pa]、[benchmark入口][E-pa-test] | **本轮未执行** | 当前是NPU环境；保留代码事实，历史GPU测量另行说明 |
@@ -4742,9 +4748,9 @@ H 的公开说明将当前实现定位为 TLA API 封装，更完整的 CATLASS 
 
 这张表不能简化成“所有原版 PA 已通过”。A 有已复现的原版失败；C 的实测对象是通用多任务 PA；G 验证的是图表达及其混合执行结果。各路线的布局、dtype、scale、reference 和规模不一致。[完整结果与容差][RUN-results]
 
-##### 三项需要据实更新的判断
+##### 三项实测结论与能力边界
 
-**普通版 PyPTO2：运行成功不等于 KV 更新语义正确。** 原文件是控制CPU性能看护程序，未提供 attention golden。新增完整参考计算后，原版最大绝对误差为 `0.7950679659843445`；板端输出却与更新前cache的PA吻合，误差为 `0.0001582503318786621`。使用更新后cache的golden时，前端解释器日志为 `index 13 result PASS`，板端失败。[原代码][A-pa]、[原版板端日志][RUN-A-fail]、[前端日志][RUN-A-front]
+**PyPTO2-tensor版：运行成功不等于 KV 更新语义正确。** 原文件是控制CPU性能看护程序，未提供 attention golden。新增完整参考计算后，原版最大绝对误差为 `0.7950679659843445`；板端输出却与更新前cache的PA吻合，误差为 `0.0001582503318786621`。使用更新后cache的golden时，前端解释器日志为 `index 13 result PASS`，板端失败。[原代码][A-pa]、[原版板端日志][RUN-A-fail]、[前端日志][RUN-A-front]
 
 在 `LOOP_PRE` 完成后、PA 开始前重建两个 view，完整参考计算通过，最大误差为 `0.0002454519271850586`，仍使用 `atol=1e-3, rtol=1e-2`。下面两行来自本轮本地修正，**未合入上游**；只验证了B=4，不替代原B=16性能门禁，也未定位到具体编译Pass或runtime根因。[补丁][RUN-A-patch]、[修正版日志][RUN-A-pass]
 
@@ -4759,7 +4765,7 @@ v_cache_2d = pypto.reshape(v_cache, kv_2d_shape, inplace=True)
 
 ##### 验证边界
 
-- Pro补充decode已通过；原先“只有prefill证据”的限制被本轮结果更新。页大小测试还检查三个布局的输出逐位一致。[Pro原测试][B-pa-test]、[本地结果][RUN-results]
+- block版 的 prefill 和单 token decode 均有通过记录；页大小测试还检查三个布局的输出逐位一致。[block版原测试][B-pa-test]、[本地结果][RUN-results]
 - PyPTO3通用PA原测试使用 `scale=1.0`，同一用例内请求长度相同。它验证了8192/8100长度，不能推出整个动态shape矩阵已通过。[测试与reference][C-pa-test]
 - PyPTO3的Qwen3-14B融合SPMD PA也有完整源码，含前置处理与缓存写入；其测试CLI只接受 `a2a3/a2a3sim`，本轮未移植或运行其A5路径。通用PA通过不能替它背书。[融合PA][C-qwen]、[平台限制][C-qwen-platform]
 - 旧环境的Ada SM89五阶段softmax trace/summary本轮未迁入当前GPU checkout，不再列为可复核的当前测量；当前GPU代码按本次checkout及其公开source lock核对。[GPU版本锁][E-lock]
@@ -4768,7 +4774,7 @@ v_cache_2d = pypto.reshape(v_cache, kv_2d_shape, inplace=True)
 
 本仓库的 `tests/npu_gpu_programming_stacks_comparison.a5.json` 归档了脱敏后的[环境记录][RUN-env]、[PA清单][RUN-results]、驱动源码、[复跑脚本][RUN-script]、[Triton JUnit][RUN-F-xml]、[PyPTO3 JUnit][RUN-C-xml]、[CANNBot JUnit][RUN-D-xml]及原版/修正版日志与补丁。实验引用固定到该快照的GitHub commit，用于核验本机测量；各工具仓库的代码引用用于核验实现。二进制、张量及完整生成目录仍保留在本机。
 
-以下命令用于本session已经完成安装的workspace，在根目录运行，每次创建新的日志目录。快照中的驱动和脚本可供核对与恢复；仅克隆本文所在仓库不会自动得到工具链及运行环境。普通版明确选择本地修正版；不替换仓库原始文件。
+以下命令用于本session已经完成安装的workspace，在根目录运行，每次创建新的日志目录。快照中的驱动和脚本可供核对与恢复；仅克隆本文所在仓库不会自动得到工具链及运行环境。tensor版明确选择本地修正版；不替换仓库原始文件。
 
 ```bash
 bash .npu-stack/paged-attention/run.sh pypto2_rebind 4
@@ -4824,7 +4830,7 @@ python ../.npu-stack/catlass/run_examples.py --prefill-control
 
 主用例脚本和 decode 复核脚本当前预期返回非零，并分别留下 `results.json`、`decode-diagnostics.json`；默认 FA 对照通过，记录在 `prefill-control.json`。如需重建，本机入口为 `PYPTO_BUILD_JOBS=16 bash .npu-stack/catlass/build-ir.sh` 和 `PYPTO_BUILD_JOBS=16 bash .npu-stack/catlass/build-dsl.sh`，从 workspace 根目录运行。快照中的过程总耗时包含编译、Host golden 和检查，**不是 kernel latency**。[H-run-replay]
 
-I 的全部新增判断来自固定 CUTLASS checkout 的代码核对。本次未安装/运行 CuTe 的 CUDA kernel，也未生成其性能数据；E 的旧 GPU 实验不代替 I 的实测。H 的连续 attention、I 的分页 MLA 与原 A—G PA 用例分别记录，不汇成同口径性能排名。
+I 的分析依据固定 CUTLASS checkout 的代码。本机未安装/运行 CuTe 的 CUDA kernel，也没有其性能数据；E 的历史 GPU 实验不代替 I 的实测。H 的连续 attention、I 的分页 MLA 与 A—G 的 PA 用例采用不同契约，分别记录，不构成同口径性能排名。
 
 ### 12.2 后续若要测性能，建议统一验收表
 
@@ -4864,13 +4870,13 @@ I 的全部新增判断来自固定 CUTLASS checkout 的代码核对。本次未
 
 ### 13.1 版本快照
 
-#### 13.1.1 旧环境版本（保留原分析与GPU实验的来源上下文）
+#### 13.1.1 历史 GPU 环境版本与实验来源
 
 下表是2026-09-06文档记录的版本与旧目录布局，保留用于追溯；不是当前A5安装版本。
 
 | 对象 | 目录 | Git HEAD |
 | --- | --- | --- |
-| A（PyPTO2-普通版）/B（PyPTO2-Pro） | `npu/pypto2` | `d8586de9743e34fcab949378f46f6b6a58ce3114` |
+| A（PyPTO2-tensor版）/B（PyPTO2-block版） | `npu/pypto2` | `d8586de9743e34fcab949378f46f6b6a58ce3114` |
 | C（PyPTO3（Simpler）） | `npu/pypto` | `b8165168ec16198fa2b26a0f88b1c08415d5668c` |
 | C（PyPTO3（Simpler）） runtime | `npu/pypto/runtime` | `77fa0171c24a4e1c323fb29a6a86239df93edb58` |
 | C（PyPTO3（Simpler）） 用户算子库 | `npu/pypto-lib` | `57e9d6a9294d9c38edd042f1edb5bdc50b4622bb` |
@@ -4897,7 +4903,7 @@ Triton-Ascend HEAD中 `third_party/ascend/AscendNPU-IR` 的gitlink是 `aea934a66
 
 | 对象 | 本轮源码版本 | 固定版本代码入口 |
 | --- | --- | --- |
-| A/B：cann/pypto | `85c9484e236e` | [普通版][A-entry] / [Pro][B-jit] |
+| A/B：cann/pypto | `85c9484e236e` | [tensor版][A-entry] / [block版][B-jit] |
 | C：hw-native-sys/pypto | `9f657f37ed20` | [PTO后端][C-backend] / [通用PA][C-pa] |
 | C：hw-native-sys/simpler | `4e4d3a4ad1e5` | [A5 scheduler][R-dispatch] / [A5 executor][R-executor] |
 | C：hw-native-sys/pypto-lib | `c6bc0bf50d6b` | [Qwen模型程序][C-decode-layer] |
@@ -4935,19 +4941,19 @@ GPU bundle的`origin_url`标识上游来源，不保证fork commit可在上游Gi
 | [E6（PyPTO on GPU）] | PyPTO | `docs/en/dev/backend/02-nvidia-executable.md`：runtime约定 |
 | [E13（PyPTO on GPU）]、[E14（PyPTO on GPU）] | TensorIR | `include/tensor_ir/Dialect/TensorDialect.td`、`README.md` |
 
-[恢复脚本][E-bootstrap]及[source lock][E-lock]提供bundle路径、SHA256、shallow boundary和head tree。原GPU profiler及trace未随当前checkout提供，因此[E7（PyPTO on GPU）]—[E9（PyPTO on GPU）]链接到已发布的历史文档记录；第2、9章保留相应内容与限制，不用当前bundle冒充当时测量的二进制来源。普通版PyPTO2的新增完整golden驱动则保存在[A5证据快照][RUN-A-driver]。
+[恢复脚本][E-bootstrap]及[source lock][E-lock]提供bundle路径、SHA256、shallow boundary和head tree。原GPU profiler及trace未随当前checkout提供，因此[E7（PyPTO on GPU）]—[E9（PyPTO on GPU）]链接到已发布的历史文档记录；第2、9章保留相应内容与限制，不用当前bundle冒充当时测量的二进制来源。PyPTO2-tensor版的新增完整golden驱动则保存在[A5证据快照][RUN-A-driver]。
 
 ### 13.2 编译与runtime主链定位
 
 | 对象 | 关键位置与符号 |
 | --- | --- |
-| A（PyPTO2-普通版）前端 | [A1（PyPTO2-普通版）] `jit(new_ir=True)`；[A2（PyPTO2-普通版）] `compile_new/compile`；[A3（PyPTO2-普通版）] PIL pipeline |
-| A（PyPTO2-普通版）编译/执行 | [A4（PyPTO2-普通版）]/[A4b（PyPTO2-普通版）] finalize与compile queue；[A5（PyPTO2-普通版）] CCE codegen；[A6（PyPTO2-普通版）] DeviceLauncher |
-| A（PyPTO2-普通版）任务 | [A9（PyPTO2-普通版）] `Dispatch/SendTask/SetReadyQueue`；[A10（PyPTO2-普通版）] KernelModule/CheckArgs |
-| A（PyPTO2-普通版）动态/tile/共享IR | [A7（PyPTO2-普通版）]/[A8（PyPTO2-普通版）]/[A8b（PyPTO2-普通版）] dynamic/tile设置；[A11（PyPTO2-普通版）] `pypto_impl.ir` |
-| B（PyPTO2-Pro）编译/launch | [B1（PyPTO2-Pro）] `generate_single`；[B2（PyPTO2-Pro）] .so调用/Host launch；[B3（PyPTO2-Pro）] 方括号launch与默认block |
-| B（PyPTO2-Pro）共享/动态 | [B5（PyPTO2-Pro）]/[B5b（PyPTO2-Pro）]/[B5c（PyPTO2-Pro）] bootstrap/IR/loader；[B6（PyPTO2-Pro）] shape policy；[B12（PyPTO2-Pro）] 缓存测试 |
-| B（PyPTO2-Pro）tiling/核内索引 | [B4（PyPTO2-Pro）]/[B7（PyPTO2-Pro）]/[B8（PyPTO2-Pro）]/[B9（PyPTO2-Pro）] 打包/JIT/AOT；[B10（PyPTO2-Pro）]/[B11（PyPTO2-Pro）]/[B13（PyPTO2-Pro）] 索引/尾块/多核 |
+| A（PyPTO2-tensor版）前端 | [A1（PyPTO2-tensor版）] `jit(new_ir=True)`；[A2（PyPTO2-tensor版）] `compile_new/compile`；[A3（PyPTO2-tensor版）] PIL pipeline |
+| A（PyPTO2-tensor版）编译/执行 | [A4（PyPTO2-tensor版）]/[A4b（PyPTO2-tensor版）] finalize与compile queue；[A5（PyPTO2-tensor版）] CCE codegen；[A6（PyPTO2-tensor版）] DeviceLauncher |
+| A（PyPTO2-tensor版）任务 | [A9（PyPTO2-tensor版）] `Dispatch/SendTask/SetReadyQueue`；[A10（PyPTO2-tensor版）] KernelModule/CheckArgs |
+| A（PyPTO2-tensor版）动态/tile/共享IR | [A7（PyPTO2-tensor版）]/[A8（PyPTO2-tensor版）]/[A8b（PyPTO2-tensor版）] dynamic/tile设置；[A11（PyPTO2-tensor版）] `pypto_impl.ir` |
+| B（PyPTO2-block版）编译/launch | [B1（PyPTO2-block版）] `generate_single`；[B2（PyPTO2-block版）] .so调用/Host launch；[B3（PyPTO2-block版）] 方括号launch与默认block |
+| B（PyPTO2-block版）共享/动态 | [B5（PyPTO2-block版）]/[B5b（PyPTO2-block版）]/[B5c（PyPTO2-block版）] bootstrap/IR/loader；[B6（PyPTO2-block版）] shape policy；[B12（PyPTO2-block版）] 缓存测试 |
+| B（PyPTO2-block版）tiling/核内索引 | [B4（PyPTO2-block版）]/[B7（PyPTO2-block版）]/[B8（PyPTO2-block版）]/[B9（PyPTO2-block版）] 打包/JIT/AOT；[B10（PyPTO2-block版）]/[B11（PyPTO2-block版）]/[B13（PyPTO2-block版）] 索引/尾块/多核 |
 | C（PyPTO3（Simpler））后端 | [C1（PyPTO3（Simpler））] `_run_ptoas`、kernel wrapper；[C2（PyPTO3（Simpler））] PTO动态参数；[C3（PyPTO3（Simpler））] Orchestration submit |
 | C（PyPTO3（Simpler））runtime | [C4（PyPTO3（Simpler））]/[C4b（PyPTO3（Simpler））] SimplerWorker；[C5（PyPTO3（Simpler））] runtime目录；[C6（PyPTO3（Simpler））] spmd_submit；[C14（PyPTO3（Simpler））] logical ID |
 | C（PyPTO3（Simpler））动态/extern | [C7（PyPTO3（Simpler））]/[C8（PyPTO3（Simpler））]/[C9（PyPTO3（Simpler））]/[C10（PyPTO3（Simpler））] DynVar/cache/PA/TileType约束；[C13（PyPTO3（Simpler））] extern ABI |
@@ -4970,8 +4976,8 @@ GPU bundle的`origin_url`标识上游来源，不保证fork commit可在上游Gi
 
 | 对象 | Softmax | Attention / 动态 / 模型 |
 | --- | --- | --- |
-| A（PyPTO2-普通版） | [A12（PyPTO2-普通版）] 普通版完整例子 | [A13（PyPTO2-普通版）] 动态paged attention所在的多阶段程序 |
-| B（PyPTO2-Pro） | [B14（PyPTO2-Pro）] 双动态、multicore、TileGroup完整测试 | [B15（PyPTO2-Pro）] paged prefill；[B16（PyPTO2-Pro）] 动态TND actual_seq |
+| A（PyPTO2-tensor版） | [A12（PyPTO2-tensor版）] tensor版完整例子 | [A13（PyPTO2-tensor版）] 动态paged attention所在的多阶段程序 |
+| B（PyPTO2-block版） | [B14（PyPTO2-block版）] 双动态、multicore、TileGroup完整测试 | [B15（PyPTO2-block版）] paged prefill；[B16（PyPTO2-block版）] 动态TND actual_seq |
 | C（PyPTO3（Simpler）） | [C15（PyPTO3（Simpler））] pypto-lib示例 | [C16（PyPTO3（Simpler））] native decode；[C17（PyPTO3（Simpler））] 动态驱动；[C18（PyPTO3（Simpler））] 讲解；[C19（PyPTO3（Simpler））] AIV tiling task；[C20（PyPTO3（Simpler））] decode_fwd |
 | C（PyPTO3（Simpler））旧分task例子 | 第2章及[C9（PyPTO3（Simpler））] | [C11（PyPTO3（Simpler））]/[C12（PyPTO3（Simpler））] Simpler Host Python tiler + SPMD task |
 | D（CANNBot DSL） | [D10（CANNBot DSL）] Buffer版；[D11（CANNBot DSL）] NPU golden入口 | [D12（CANNBot DSL）] PA设计边界；[D13（CANNBot DSL）] 完整FlashAttention蓝本；[D7（CANNBot DSL）] 动态AOT |
@@ -4983,39 +4989,39 @@ GPU bundle的`origin_url`标识上游来源，不保证fork commit可在上游Gi
 
 链接行号对应上述HEAD；源码以后移动时优先按符号定位。相对路径便于本文随pto工作区一起阅读。
 
-[A1（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/frontend/parser/entry.py#L1188
-[A2（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/frontend/parser/entry.py#L451
-[A3（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/pil/compile_pipeline.py#L29
-[A4（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/interface/tensor/ir.cpp#L207
-[A4b（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/interface/tensor/ir_finalize.cpp#L39
-[A5（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/codegen/codegen.cpp#L21
-[A6（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/machine/runtime/launcher/device_launcher.cpp#L482
-[A7（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/frontend/__init__.py#L72
-[A8（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/_controller.py#L46
-[A8b（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/guide/programming_guide/tensor/development/tiling.md#L9
-[A9（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/machine/device/dynamic/aicore_manager.h#L994
-[A10（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/src/bindings/runtime.cpp#L430
-[A11（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/ir.py#L135
-[A12（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/examples/02_intermediate/operators/softmax/softmax.py#L76
-[A13（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/st/test_ctrl_cpu_perf.py#L73
-[B1（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/jit.py#L951
-[B2（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/jit.py#L601
-[B3（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/jit.py#L1595
-[B4（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/jit.py#L467
-[B5（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/_bootstrap.py#L14
-[B5b（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/ir/__init__.py#L36
-[B5c（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/_loader.py#L60
-[B6（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/shape_policy.py#L239
-[B7（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/guide/programming_guide/pro/development/tile_based_python_programming/TilingData.md#L22
-[B8（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/jit.py#L1395
-[B9（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/guide/programming_guide/pro/development/compilation_and_execution/offline_binary_compilation.md#L139
-[B10（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/interface/pypto_pro/backend/backend_cce_ops.cpp#L834
-[B11（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/guide/programming_guide/pro/development/tile_based_python_programming/tail_block_handling.md#L25
-[B12（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/ut/pypto_pro/runtime/test_shape_policy_codegen.py#L109
-[B13（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/guide/programming_guide/pro/development/tile_based_python_programming/multi_core_partitioning_and_Tiling.md#L74
-[B14（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/st/pypto_pro/frontend/tile_vector/test_softmax.py#L77
-[B15（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/st/pypto_pro/frontend/fa/test_flex_attention_prefill.py#L14
-[B16（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/st/pypto_pro/frontend/fa/test_fa_tnd_dn.py#L364
+[A1（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/frontend/parser/entry.py#L1188
+[A2（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/frontend/parser/entry.py#L451
+[A3（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/pil/compile_pipeline.py#L29
+[A4（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/interface/tensor/ir.cpp#L207
+[A4b（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/interface/tensor/ir_finalize.cpp#L39
+[A5（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/codegen/codegen.cpp#L21
+[A6（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/machine/runtime/launcher/device_launcher.cpp#L482
+[A7（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/frontend/__init__.py#L72
+[A8（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/_controller.py#L46
+[A8b（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/guide/programming_guide/tensor/development/tiling.md#L9
+[A9（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/machine/device/dynamic/aicore_manager.h#L994
+[A10（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/src/bindings/runtime.cpp#L430
+[A11（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/ir.py#L135
+[A12（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/examples/02_intermediate/operators/softmax/softmax.py#L76
+[A13（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/st/test_ctrl_cpu_perf.py#L73
+[B1（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/jit.py#L951
+[B2（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/jit.py#L601
+[B3（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/jit.py#L1595
+[B4（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/jit.py#L467
+[B5（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/_bootstrap.py#L14
+[B5b（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/ir/__init__.py#L36
+[B5c（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/_loader.py#L60
+[B6（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/shape_policy.py#L239
+[B7（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/guide/programming_guide/pro/development/tile_based_python_programming/TilingData.md#L22
+[B8（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/jit.py#L1395
+[B9（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/guide/programming_guide/pro/development/compilation_and_execution/offline_binary_compilation.md#L139
+[B10（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/interface/pypto_pro/backend/backend_cce_ops.cpp#L834
+[B11（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/guide/programming_guide/pro/development/tile_based_python_programming/tail_block_handling.md#L25
+[B12（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/ut/pypto_pro/runtime/test_shape_policy_codegen.py#L109
+[B13（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/guide/programming_guide/pro/development/tile_based_python_programming/multi_core_partitioning_and_Tiling.md#L74
+[B14（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/st/pypto_pro/frontend/tile_vector/test_softmax.py#L77
+[B15（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/st/pypto_pro/frontend/fa/test_flex_attention_prefill.py#L14
+[B16（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/st/pypto_pro/frontend/fa/test_fa_tnd_dn.py#L364
 [C1（PyPTO3（Simpler））]: https://github.com/hw-native-sys/pypto/blob/9f657f37ed20ce148b46fb7229c267a152a0644e/python/pypto/backend/pto_backend.py#L14
 [C2（PyPTO3（Simpler））]: https://github.com/hw-native-sys/pypto/blob/9f657f37ed20ce148b46fb7229c267a152a0644e/src/codegen/pto/pto_codegen.cpp#L1078
 [C3（PyPTO3（Simpler））]: https://github.com/hw-native-sys/pypto/blob/9f657f37ed20ce148b46fb7229c267a152a0644e/src/codegen/orchestration/orchestration_codegen.cpp#L198
@@ -5096,17 +5102,17 @@ GPU bundle的`origin_url`标识上游来源，不保证fork commit可在上游Gi
 [G10（AutoFuse + Inductor）]: https://gitcode.com/Ascend/torchair/blob/cf2acaee5fe6139617fa7014ea0d09933cf8b35c/experimental/_inductor_npu_ext/tests/smoke/inductor_npu_ext_test.py#L515
 [P4（PTOAS）]: https://github.com/hw-native-sys/PTOAS/blob/30a83c586cc9af801a9db0eb9137820b4cd8554c/test/samples/PyPTOIRParser/paged_attention_example_kernel_softmax_prepare.pto#L1
 
-[A14（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/interface/configs/tile_fwk_config_schema.json#L199
-[A15（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/interface/function/function.cpp#L2120
-[A16（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/passes/tile_graph_pass/graph_partition/supernode_graph_builder.cpp#L1092
-[A17（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/op/__init__.py#L13
-[A18（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/op/conv.py#L191
-[A19（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/op/matmul.py#L147
-[B17（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/language/__init__.py#L12
-[B18（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/language/_api.py#L1396
-[B19（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/language/parser/_buffer_parser.py#L10
-[B20（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/language/parser/_ast_parser.py#L89
-[B21（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/interface/pypto_pro/backend/backend_cce_vf_ops.cpp#L1569
+[A14（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/interface/configs/tile_fwk_config_schema.json#L199
+[A15（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/interface/function/function.cpp#L2120
+[A16（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/passes/tile_graph_pass/graph_partition/supernode_graph_builder.cpp#L1092
+[A17（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/op/__init__.py#L13
+[A18（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/op/conv.py#L191
+[A19（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto/op/matmul.py#L147
+[B17（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/language/__init__.py#L12
+[B18（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/language/_api.py#L1396
+[B19（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/language/parser/_buffer_parser.py#L10
+[B20（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/language/parser/_ast_parser.py#L89
+[B21（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/framework/src/interface/pypto_pro/backend/backend_cce_vf_ops.cpp#L1569
 [C21（PyPTO3（Simpler））]: https://github.com/hw-native-sys/pypto/blob/9f657f37ed20ce148b46fb7229c267a152a0644e/python/pypto/language/op/__init__.py#L12
 [C22（PyPTO3（Simpler））]: https://github.com/hw-native-sys/pypto/blob/9f657f37ed20ce148b46fb7229c267a152a0644e/src/backend/910B/backend_910b_ops.cpp#L29
 [C23（PyPTO3（Simpler））]: https://github.com/hw-native-sys/pypto-lib/blob/c6bc0bf50d6b1b58bde4698cdd4d8ff0f5d33b80/models/qwen3_14b/paged_attention_pypto.py#L260
@@ -5121,13 +5127,13 @@ GPU bundle的`origin_url`标识上游来源，不保证fork commit可在上游Gi
 [G11（AutoFuse + Inductor）]: https://gitcode.com/Ascend/torchair/blob/cf2acaee5fe6139617fa7014ea0d09933cf8b35c/experimental/_inductor_npu_ext/python/inductor_npu_ext/asc_ops.py#L49
 [G12（AutoFuse + Inductor）]: https://gitcode.com/Ascend/torchair/blob/cf2acaee5fe6139617fa7014ea0d09933cf8b35c/experimental/_inductor_npu_ext/python/inductor_npu_ext/npu.py#L3343
 
-[A20（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/examples/02_intermediate/controlflow/others/dynamic.py#L107
-[B22（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/platform.py#L157
-[B23（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/st/pypto_pro/frontend/fa/test_flex_attention_prefill.py#L1362
-[B24（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/st/pypto_pro/frontend/fa/test_flex_attention_prefill.py#L1593
-[B25（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/guide/programming_guide/pro/development/tile_based_python_programming/multi_core_partitioning_and_Tiling.md#L277
-[B26（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/jit.py#L1746
-[B27（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/ut/pypto_pro/runtime/test_shape_policy_jit.py#L31
+[A20（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/examples/02_intermediate/controlflow/others/dynamic.py#L107
+[B22（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/platform.py#L157
+[B23（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/st/pypto_pro/frontend/fa/test_flex_attention_prefill.py#L1362
+[B24（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/st/pypto_pro/frontend/fa/test_flex_attention_prefill.py#L1593
+[B25（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/guide/programming_guide/pro/development/tile_based_python_programming/multi_core_partitioning_and_Tiling.md#L277
+[B26（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/jit.py#L1746
+[B27（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/ut/pypto_pro/runtime/test_shape_policy_jit.py#L31
 [C24（PyPTO3（Simpler））]: https://github.com/hw-native-sys/simpler/blob/4e4d3a4ad1e54c1db3d50e72decc025a9075bfa0/tests/st/a2a3/tensormap_and_ringbuffer/spmd_paged_attention_highperf/test_spmd_paged_attention_highperf.py#L295
 [D20（CANNBot DSL）]: ../../cannbot_dsl/cannbot-dsl/test/cannbotdsl/test_aot_p1b_dyn_tail.py#L45
 [D21（CANNBot DSL）]: ../../cannbot_dsl/cannbot-dsl/test/cannbotdsl/test_aot_p1b_dyn_tail.py#L110
@@ -5136,10 +5142,10 @@ GPU bundle的`origin_url`标识上游来源，不保证fork commit可在上游Gi
 [F17（Triton-Ascend）]: https://github.com/triton-lang/triton-ascend/blob/c747daae7f67fb7acd1013bf9793505aec1dc9e2/python/triton/runtime/jit.py#L399
 [F18（Triton-Ascend）]: https://github.com/triton-lang/triton-ascend/blob/c747daae7f67fb7acd1013bf9793505aec1dc9e2/third_party/ascend/unittest/pytest_ut/test_triton_unified_attention.py#L258
 
-[A21（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/guide/programming_guide/tensor/debug/performance.md#L408
-[A22（PyPTO2-普通版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/api/tensor_api/config/pypto-set_pass_options.md#L43
-[B28（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/guide/programming_guide/pro/development/tile_based_python_programming/Reg_vector_computation.md#L1
-[B29（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/st/pypto_pro/frontend/vf_api/test_layernorm_tile_group_vf.py#L71
+[A21（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/guide/programming_guide/tensor/debug/performance.md#L408
+[A22（PyPTO2-tensor版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/api/tensor_api/config/pypto-set_pass_options.md#L43
+[B28（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/docs/zh/guide/programming_guide/pro/development/tile_based_python_programming/Reg_vector_computation.md#L1
+[B29（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/tests/st/pypto_pro/frontend/vf_api/test_layernorm_tile_group_vf.py#L71
 [C25（PyPTO3（Simpler））]: https://github.com/hw-native-sys/pypto/blob/9f657f37ed20ce148b46fb7229c267a152a0644e/src/ir/transforms/outline_incore_scopes_pass.cpp#L303
 [C26（PyPTO3（Simpler））]: https://github.com/hw-native-sys/pypto/blob/9f657f37ed20ce148b46fb7229c267a152a0644e/tests/ut/ir/transforms/test_outline_incore_scopes.py#L86
 [C27（PyPTO3（Simpler））]: https://github.com/hw-native-sys/pypto-lib/blob/c6bc0bf50d6b1b58bde4698cdd4d8ff0f5d33b80/docs/pypto-coding/pypto-coding-style.md#L684
@@ -5178,7 +5184,7 @@ GPU bundle的`origin_url`标识上游来源，不保证fork commit可在上游Gi
 [G15（AutoFuse + Inductor）]: https://gitcode.com/Ascend/torchair/blob/cf2acaee5fe6139617fa7014ea0d09933cf8b35c/experimental/_inductor_npu_ext/python/inductor_npu_ext/npu.py#L1081
 [G16（AutoFuse + Inductor）]: https://gitcode.com/Ascend/torchair/blob/cf2acaee5fe6139617fa7014ea0d09933cf8b35c/experimental/_inductor_npu_ext/python/inductor_npu_ext/npu.py#L3762
 [G17（AutoFuse + Inductor）]: https://gitcode.com/cann/graph-autofusion/blob/3b5e6a387e7dc2a0eef7d052a0f7a50c06947db2/autofuse/ascendc/api/axpy.h#L15
-[B30（PyPTO2-Pro）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/jit.py#L755
+[B30（PyPTO2-block版）]: https://gitcode.com/cann/pypto/blob/85c9484e236e35aaf4f6f04e3099c0a9442fd452/python/pypto_pro/runtime/jit.py#L755
 [C32（PyPTO3（Simpler））]: https://github.com/hw-native-sys/simpler/blob/4e4d3a4ad1e54c1db3d50e72decc025a9075bfa0/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp#L124
 [C33（PyPTO3（Simpler））]: https://github.com/hw-native-sys/simpler/blob/4e4d3a4ad1e54c1db3d50e72decc025a9075bfa0/src/a2a3/runtime/tensormap_and_ringbuffer/aicore/aicore_executor.cpp#L21
 [C34（PyPTO3（Simpler））]: https://github.com/hw-native-sys/pypto/blob/9f657f37ed20ce148b46fb7229c267a152a0644e/tests/st/runtime/cross_core/test_spmd.py#L109
@@ -5308,36 +5314,36 @@ GPU bundle的`origin_url`标识上游来源，不保证fork commit可在上游Gi
 <a id="nearest"></a>
 ## 14. 最终选择：每种方式最相似的另一种是谁
 
-这里按 **整体执行组织/责任分层 → 用户编程与tiling → 核内编译分工 → 前端代码血缘** 的顺序判断。megaKernel也按程序级与物理kernel级分开考虑。下表统一比较 A—I 九种方式的“最相似者”；这是有方向的选择，不强制成对，不是性能或优劣排名。原 A—G 子集里 D 选择 B 的理由继续保留，纳入 H 后 D 的首选按相同权重更新，见第 14.1 节。
+这里按 **整体执行组织/责任分层 → 用户编程与tiling → 核内编译分工 → 前端代码血缘** 的顺序判断。megaKernel也按程序级与物理kernel级分开考虑。下表比较 A—I 九种方式的“最相似者”；这是有方向的选择，不强制成对，不是性能或优劣排名。各维度的依据与适用范围见第 14.1 节。
 
 | 方式 | 最相似的另一种 | 首要理由 | 最重要的不相同 | 若换一个维度，谁会更近 |
 | --- | --- | --- | --- | --- |
-| A（PyPTO2-普通版） | **C（PyPTO3（Simpler））** | 都以Tensor/程序分解连接设备任务执行体系，可组织多阶段模型程序 | 自有IR、编译器和runtime实现不同；TileFwk不是Simpler | 按代码/基础IR共享，B（PyPTO2-Pro）更近 |
-| B（PyPTO2-Pro） | **D（CANNBot DSL）** | 显式核内资源、tile/循环、混合计算、Host直接launch，作者承担性能工程 | B（PyPTO2-Pro）自有IR/CCE；D（CANNBot DSL）更早进入MLIR且有Host staging/Channel | 按代码血缘选A（PyPTO2-普通版）；按task内SPMD核内风格，C（PyPTO3（Simpler））的对应子路径也很近 |
-| C（PyPTO3（Simpler）） | **A（PyPTO2-普通版）** | 外层程序/依赖/设备派发是整体架构识别度最高的部分 | C（PyPTO3（Simpler））的PTOAS、Simpler及显式TaskId/SPMD/extern接缝不同 | 只看pypto-lib的融合SPMD attention，B（PyPTO2-Pro）/D（CANNBot DSL）更近；看前端血缘则E（PyPTO on GPU）更近 |
-| D（CANNBot DSL） | **H（CATLASS DSL）** | 用户显式安排核内计算、缓冲/流水与launch；动态tile窗口不强制独立TilingFunc；H 还同时接近 D 的 NPU 显式资源与较早 MLIR 主链 | D（CANNBot DSL）有MLIR Host/Device链和Channel协议，B（PyPTO2-Pro）有独立Pro共享IR与TileGroup体系；对新增 H 则需区分 TLA/helper/HIVM 与 D 的 Host staging/CANNIR/AscendC | 只看MLIR贯穿的编译链，F（Triton-Ascend）更近；这是原 A—G 子集的参照，九路线下仍应同时比较 H，按原核内责任维度 B 也仍是重点 |
+| A（PyPTO2-tensor版） | **C（PyPTO3（Simpler））** | 都以Tensor/程序分解连接设备任务执行体系，可组织多阶段模型程序 | 自有IR、编译器和runtime实现不同；TileFwk不是Simpler | 按代码/基础IR共享，B（PyPTO2-block版）更近 |
+| B（PyPTO2-block版） | **D（CANNBot DSL）** | 显式核内资源、tile/循环、混合计算、Host直接launch，作者承担性能工程 | B（PyPTO2-block版）自有IR/CCE；D（CANNBot DSL）更早进入MLIR且有Host staging/Channel | 按代码血缘选A（PyPTO2-tensor版）；按task内SPMD核内风格，C（PyPTO3（Simpler））的对应子路径也很近 |
+| C（PyPTO3（Simpler）） | **A（PyPTO2-tensor版）** | 外层程序/依赖/设备派发是整体架构识别度最高的部分 | C（PyPTO3（Simpler））的PTOAS、Simpler及显式TaskId/SPMD/extern接缝不同 | 只看pypto-lib的融合SPMD attention，B（PyPTO2-block版）/D（CANNBot DSL）更近；看前端血缘则E（PyPTO on GPU）更近 |
+| D（CANNBot DSL） | **H（CATLASS DSL）** | 都由用户显式安排 NPU 核内计算、缓冲/流水与 launch，较早进入 MLIR；动态 tile 窗口不强制独立 TilingFunc | D 的 MLIR Host/Device staging、Channel、CANNIR/AscendC，与 H 的 TLA、内联设备 helper、HIVM 不同 | 按较长的 MLIR 编译链可对照 F（Triton-Ascend）；按 TileGroup/Channel 的核内作者责任可对照 B（PyPTO2-block版），区别见第 14.1 节 |
 | E（PyPTO on GPU） | **F（Triton-Ascend）** | 当前都偏向kernel/program级tile编程与专用后端lowering，runtime直接launch，非AICPU任务图主链 | GPU CTA/SM与NPU program/block映射不同；E（PyPTO on GPU）模式覆盖及动态入口更受限 | 按PyPTO前端血缘选C（PyPTO3（Simpler））；按客户Inductor入口则E（PyPTO on GPU）不如G（AutoFuse + Inductor）接近F（Triton-Ascend） |
 | F（Triton-Ascend） | **G（AutoFuse + Inductor）** | 当前都在PyTorch/Inductor的NPU kernel生成位置承担较完整的lowering、资源与launch分工 | F（Triton-Ascend）有独立Triton DSL/MLIR链，G（AutoFuse + Inductor）有ASCIR/自动Host tiling/AscendC生成 | 只看独立tile-kernel编程及专用MLIR后端，E（PyPTO on GPU）更近；看显式MLIR硬件链也可对比D（CANNBot DSL） |
 | G（AutoFuse + Inductor） | **F（Triton-Ascend）** | 客户可保留PyTorch表达，Inductor选择融合/模板/extern并生成NPU kernel | G（AutoFuse + Inductor）不是Triton frontend；ASCIR、ATT tiling及生成代码方式不同 | 只看生成AscendC及局部buffer语义，D（CANNBot DSL）的下层更近 |
 | H（CATLASS DSL） | **D（CANNBot DSL）** | NPU 显式 layout/资源/搬运/流水，较早进入 MLIR，Host 直接调用产物 | H 的 TLA/HIVM、局部 AutoSync 与 D 的 Channel/Host staging/CANNIR/AscendC 不同 | 按 Python layout/核内元编程看 I 更近；按部分下游编译基础设施看 F 更近 |
 | I（CuTe DSL） | **H（CATLASS DSL）** | Python 元编程、显式 layout/搬运/矩阵与 pipeline，直接编译/launch，作者承担局部资源责任 | GPU thread/value layout/atom/warp/TS 与 NPU 物理 tag/AIC/AIV/局部 AutoSync 不同 | 按 CUDA artifact/launch 看 E 更近；TS 与 A/C 仅按资源/任务粒度对照 |
 
-原 A—G 子集的归类仍可保留为：**A（PyPTO2-普通版）↔C（PyPTO3（Simpler）） 是程序/任务执行家族；B（PyPTO2-Pro）↔D（CANNBot DSL） 是显式核内工程家族；F（Triton-Ascend）↔G（AutoFuse + Inductor） 是 Inductor kernel 生成家族；E（PyPTO on GPU） 的当前整体形态最靠近 F（Triton-Ascend），但前端血缘靠近 C（PyPTO3（Simpler））。** 这份归类并不否定各家内部的其他模式，特别是 C（PyPTO3（Simpler）） 已有与 B（PyPTO2-Pro）/D（CANNBot DSL） 接近的SPMD核内实现。它用于定位哪些层可以共用、哪些层存在替代关系，而不是把混合架构强塞进互斥标签。
+按责任层归类，**A（PyPTO2-tensor版）与 C（PyPTO3（Simpler））属于程序/任务执行家族；B（PyPTO2-block版）、D（CANNBot DSL）与 H（CATLASS DSL）接近显式 NPU 核内工程家族；I（CuTe DSL）承担相近的 GPU layout/warp/流水责任；F（Triton-Ascend）与 G（AutoFuse + Inductor）接近 Inductor kernel 生成家族；E（PyPTO on GPU）的整体形态最靠近 F，前端血缘靠近 C。** 这些分组并不否定各家内部的其他模式，特别是 C 已有与 B/D 接近的 SPMD 核内实现。它们用于定位哪些层可以共用、哪些层存在替代关系，不是互斥的架构标签。
 
 
-### 14.1 九路线选择的依据与原有比较的适用范围
+### 14.1 相似性判断的依据与适用范围
 
-上表已统一列出九条路线：按本章优先级，H 首先选 D，I 首先选 H，D 在扩大候选集合后改选 H。原 A—G 子集的 D→B 判断保留在其理由和下表中：它准确描述显式核内资源/流水责任，新增 H 则同时补上较早 MLIR 主链这一相似维度。其余原有主要分组仍有解释力，该判断不要求双向匹配。
+按本章优先级，H 首先选 D，I 首先选 H，D 首先选 H。B/D 同样在显式核内资源与流水责任上相近，但 D 使用 MLIR Host/Device 链和 Channel，B 使用共享 PyPTO2 基础 IR 上的 block版操作与 TileGroup；D/H 则同时接近 NPU 显式资源和较早 MLIR 入口这两个维度。局部相似性与整体选择的权重不同，因此不要求双向匹配。
 
-| 对象 / 比较角度 | 纳入 H/I 后的选择 | 理由与边界 |
+| 对象 / 比较角度 | 相似对象 | 理由与边界 |
 | --- | --- | --- |
 | H 的整体执行与核内责任 | **D（CANNBot DSL）** | 同为 NPU 显式硬件/内存/流水 + 较早进入 MLIR + Host launch；H 的 TLA/HIVM 链、D 的 CANNIR/AscendC 与 Host staging 不同 |
 | I 的整体核内编程责任 | **H（CATLASS DSL）** | Python 元编程、显式 layout/搬运/矩阵与流水、直接 kernel artifact/launch 相近；I 的 GPU 线程/warp 与 TS、H 的 AIC/AIV/物理 tag 仍有显著差异 |
-| D 的新增最强候选 | **H**，原 B 仍是有价值的同硬件参照 | H 补充了显式资源与 MLIR 主链同时接近的对象；若优先比较 TileGroup/Channel 的作者责任，B/D 原讨论仍有效 |
+| D 的整体架构与核内责任 | **H**；B 也是同硬件参照 | D/H 同时接近显式资源与 MLIR 主链；若优先比较 TileGroup/Channel 的作者责任，B/D 也很相近 |
 | H/I 仅看 layout 和 Python 接口 | **互为重点比较对象** | 不能从名字相近推出 layout 代数同等覆盖、代码血缘或后端兼容 |
 | H 仅看下游编译基础设施 | **F 的 AscendNPU-IR 路径** | 输入抽象、已完成的物理分解、固定版本与 launch metadata 不同 |
 | I 的 TS 与 A/C 的任务系统 | **按粒度对照，不能合为同一整体家族** | 单 kernel 的 warp/资源协议，与跨计算入口的设备任务依赖/派发分别减少不同工程工作 |
 
-因此九路线的视图是在原有 **A↔C 程序/任务、B↔D 显式核内、F↔G Inductor、E 的 PyPTO/GPU 接缝** 之上，加入 **H 的 A5 layout/流水实现与 I 的 CuTe layout/warp/persistent 工具**。它们给原文的 megaKernel 理论提供更多可核对的实现对象，同时保留“程序级推进、单 kernel 合作、片上数据复用、最终性能”四个问题各自的边界。
+九路线覆盖 **A/C 的程序与任务组织、B/D/H 的显式 NPU 核内工程、F/G 的 Inductor kernel 生成、E 的 PyPTO/GPU 接口，以及 I 的 CuTe layout/warp/persistent 工具**。这些实现分别说明 megaKernel 的不同层次：“程序级推进、单 kernel 合作、片上数据复用、最终性能”需要各自的证据，不能相互替代。
 
-当前九路线的有向选择为 **A→C、B→D、C→A、D→H、E→F、F→G、G→F、H→D、I→H**。其中 D/H/I 的判断依据来自显式资源、Host/kernel 边界与实际编译链，而非名字、未测性能或相同 ISA；B/D 的原有专题仍解释另一组有用的同硬件参照。[H-dsl] [H-passes] [H-api-layout] [I-dsl] [I-layout] [I-task]
+九路线的有向选择为 **A→C、B→D、C→A、D→H、E→F、F→G、G→F、H→D、I→H**。D/H/I 的判断依据是显式资源、Host/kernel 边界与实际编译链；B/D 的同硬件核内责任比较见第 4.9 节。这些选择不依据名字、未测性能或相同 ISA。[H-dsl] [H-passes] [H-api-layout] [I-dsl] [I-layout] [I-task]
