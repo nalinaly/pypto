@@ -800,6 +800,33 @@ class CompiledProgram(_RuntimeFacade):
         orch_args = _coerced_to_orch_args(coerced, worker)
         return orch_args, coerced, return_style
 
+    def build_chip_args(
+        self, *args: "CallArg"
+    ) -> tuple[Any, list[torch.Tensor | DeviceTensor | ctypes._SimpleCData], bool]:
+        """Pack validated arguments for same-process ``simpler.task_interface.ChipWorker``.
+
+        Raw-pointer DeviceTensor values borrow caller-owned device storage. The
+        caller must keep that storage alive and synchronize producer/consumer
+        streams around the blocking chip dispatch. The returned ChipStorageTaskArgs
+        must never cross the address-free public Worker.run boundary.
+
+        Args:
+            *args: Positional tensors and scalars following the program signature.
+
+        Returns:
+            ``(chip_args, owners, return_style)`` with the same coercion and
+            output-allocation convention as :meth:`build_orch_args`.
+
+        Raises:
+            TypeError: Invalid arguments or a multi-orchestration parent.
+        """
+        if self._sub_chip_dirs:
+            raise TypeError("Multi-orch programs require compiled[<name>].build_chip_args(...).")
+        coerced, return_style = _coerce_args(args, *self._get_metadata(), caller_name="CompiledProgram")
+        from pypto.runtime.runner import _coerced_to_chip_args  # noqa: PLC0415
+
+        return _coerced_to_chip_args(coerced), coerced, return_style
+
     def build_call_config(
         self,
         config: Any = None,
@@ -1029,6 +1056,21 @@ class _SubChipCallable(_RuntimeFacade):
 
         orch_args = _coerced_to_orch_args(coerced, worker)
         return orch_args, coerced, return_style
+
+    def build_chip_args(
+        self, *args: "CallArg"
+    ) -> tuple[Any, list[torch.Tensor | DeviceTensor | ctypes._SimpleCData], bool]:
+        """Pack same-process chip arguments; see CompiledProgram.build_chip_args."""
+        coerced, return_style = _coerce_args(
+            args,
+            self._param_infos,
+            self._output_indices,
+            self._return_types,
+            caller_name=f"orchestration {self._name!r}",
+        )
+        from pypto.runtime.runner import _coerced_to_chip_args  # noqa: PLC0415
+
+        return _coerced_to_chip_args(coerced), coerced, return_style
 
     def build_call_config(
         self,

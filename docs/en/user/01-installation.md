@@ -2,6 +2,9 @@
 
 Install PyPTO from source, verify the install, and find your way around the examples.
 
+For the local A5 hardware workspace using the `nalinaly/pypto` fork, see
+[Local A5 environment](../dev/a5-local-environment.md).
+
 ## Concept
 
 PyPTO is a Python package with a compiled C++ core. Installing it builds that core, so

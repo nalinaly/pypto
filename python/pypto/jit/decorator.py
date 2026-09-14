@@ -2256,7 +2256,7 @@ class JITFunction:
         *,
         for_dispatch: bool = False,
     ) -> Any:
-        """Resolve the fixed A2/A3 L1 compile/dispatch configuration."""
+        """Resolve the onboard L1 compile/dispatch configuration."""
         from pypto.runtime.runner import RunConfig  # noqa: PLC0415
 
         tensors = [value for value in arguments if _is_tensor(value)]
@@ -2289,9 +2289,9 @@ class JITFunction:
             return RunConfig(platform="a2a3", device_id=device_id, runtime=self._execution_runtime)
         if not isinstance(run_config, RunConfig):
             raise TypeError("config must be pypto.runtime.RunConfig or None")
-        if run_config.platform != "a2a3":
+        if run_config.platform not in ("a2a3", "a5"):
             raise ValueError(
-                "@pl.jit(execution='l1') currently supports only A2/A3 onboard platform='a2a3'; "
+                "@pl.jit(execution='l1') requires onboard platform='a2a3' or 'a5'; "
                 f"got {run_config.platform!r}"
             )
         if run_config.runtime != self._execution_runtime:

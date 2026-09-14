@@ -802,6 +802,29 @@ def _coerced_to_orch_args(
     return orch_args
 
 
+def _coerced_to_chip_args(coerced: list[torch.Tensor | DeviceTensor | _SimpleCData]) -> Any:
+    """Pack process-local addresses for the direct ChipWorker compatibility API."""
+    from .task_interface import (  # noqa: PLC0415
+        ChipStorageTaskArgs,
+        device_tensor_to_chip_tensor,
+        make_chip_tensor_arg,
+        scalar_to_uint64,
+    )
+
+    chip_args = ChipStorageTaskArgs()
+    for arg in coerced:
+        if isinstance(arg, DeviceTensor):
+            chip_args.add_tensor(device_tensor_to_chip_tensor(arg))
+        elif isinstance(arg, torch.Tensor):
+            chip_args.add_tensor(make_chip_tensor_arg(arg))
+        elif not isinstance(arg, _SimpleCData):
+            raise TypeError(f"Unsupported direct-chip argument: {type(arg).__name__}")
+    for arg in coerced:
+        if isinstance(arg, _SimpleCData):
+            chip_args.add_scalar(scalar_to_uint64(arg))
+    return chip_args
+
+
 def _apply_ring_overrides(call_config: Any, run_config: "RunConfig") -> None:
     """Overlay a :class:`RunConfig`'s per-task ring sizing onto a ``CallConfig``.
 

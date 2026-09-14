@@ -15,8 +15,9 @@ from typing import Any
 import pypto.language as pl
 import pytest
 import torch
+from pypto.backend import BackendType
 from pypto.jit import decorator as decorator_mod
-from pypto.runtime import l1_jit
+from pypto.runtime import RunConfig, l1_jit
 
 
 @pl.jit(execution="l1")
@@ -80,6 +81,18 @@ def test_l1_lower_defaults_to_a2a3_without_public_init() -> None:
     lowered = _lowerable_l1_kernel.lower()
 
     assert lowered is not None
+
+
+@pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
+def test_l1_hbg_lower_accepts_a5_configuration(ascend_backend: BackendType) -> None:
+    """The public L1 decorator lowers the A5 target without creating a device owner."""
+    kernel = pl.jit(execution="l1", runtime="host_build_graph")(_lowerable_l1_kernel._func)
+    config = RunConfig(platform="a5", runtime="host_build_graph")
+    assert config.backend_type == ascend_backend
+    assert kernel.lower(config=config) is not None
+
+    with pytest.raises(ValueError, match="requires onboard platform"):
+        kernel.lower(config=RunConfig(platform="a5sim", runtime="host_build_graph"))
 
 
 def test_l1_runtime_scalar_values_share_one_jit_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
