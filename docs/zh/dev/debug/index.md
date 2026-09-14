@@ -5,6 +5,7 @@
 | 页面 | 内容 |
 | ---- | ---- |
 | [Torch 代码生成](00-torch_codegen.md) | 把 PyPTO IR lower 成可执行的 Python/PyTorch 脚本用于数值校验 |
+| [Kernel 模式 HBG 参数内存调查](kernel-mode-hbg-args-memory.md) | 区分 eager 在途参数、capture 节点持有内存与重复 replay，记录有界 CANN 复现及整网接入的设计影响 |
 
 ## 另请参阅
 

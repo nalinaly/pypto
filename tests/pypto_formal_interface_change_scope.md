@@ -22,7 +22,8 @@
 | 动态 shape | 沿用现有前端表达，不另造一套。ACLGraph 捕获后的 shape、地址和参数变化由使用者考虑，不自动重新捕获。 |
 | 编译产物 | 算子 IR、生成源码、AICore binary、orchestration SO、签名元数据及编译缓存归 PyPTO 管理。simpler 管理加载后的运行时资源。 |
 | workspace | 不公开按算子的 workspace 查询/allocate API，也不提供外部 allocator 回调。动态调度所需中间内存由 runtime 内部申请、回收和复用。 |
-| 异步与串行 | 调用异步提交；共享执行资源的设备侧串行由 simpler 保证。不能只依赖 Python 锁，也不能只锁住 Host 提交区间。 |
+| 异步与串行 | 正常调用异步提交；共享执行资源的设备侧串行由 simpler 保证。仅在第 2.4 节定义的可恢复大 args 分配失败路径允许内部同步回收及一次重试。不能只依赖 Python 锁。 |
+| 整网大 args 恢复 | 整网 decode 接入 vLLM/PyTorch 继续采用 kernel 模式；RTS 管理的 HBG 大 args 积压由 simpler 内部在失败后 timeline event 同步回收、成功后重试一次，不改框架执行层。此方案待实施及整网验证。 |
 | program pipeline | 保留现有两个槽位的 Host/Device 流水；这一步与 kernel 路径并列，不共用 `kernel_launch`。 |
 | 进程隔离 | 同一进程不支持 program/kernel runtime 共存；需要覆盖所有初始化入口，而不是只限制 `pl.jit`。 |
 | 支持范围 | A2/A3、A5 × HBG、TRB × eager、ACLGraph 全组合，不以单一 demo 跑通代替正式支持。 |
@@ -114,6 +115,64 @@ program 调用        → 两槽位准入 → program prepare / launch / 完成�
 
 参考及当前实现差异见第 7.1 节；这些是设计要求和源码观察，不是设备测试通过结论。
 
+### 2.4 整网 kernel 模式：HBG 大 args 回收与一次重试
+
+本节为 2026-09-14 用户确认的处理方向，**属于设计要求，尚未实施到正式 runtime**。
+整网每轮 decode 只进行一次 PyPTO `kernel_launch`，覆盖模型执行；只考虑单模型多 step 串行。
+不因 HBG 大参数在 eager 队列中积压，就要求退回 program 模式或修改 vLLM/PyTorch 执行层。
+
+首先区分两类 device 内存，**8192 和 2 GiB 不能套用到大 args**：
+
+| 对象 | 生命周期管理者 | 规格及本次恢复方案的作用 |
+| --- | --- | --- |
+| 已 prepare 的 callable 注册条目及驻留代码 | simpler 自管，不由 CANN RTS 随每次 task 完成自动回收 | 此前确定的 8192 个条目、device code 总容量上限 2 GiB、按需以 2 MiB 粒度申请仅约束这一类资源。timeline sync 不卸载 callable，也不解除这些上限。 |
+| HBG `build_graph` 结果序列化后经 launch args 下发的 device 副本 | CANN RTS，随 task 或 captured graph node 管理 | 同一 callable 的每次 eager 提交可能各持有一份大 args；本次失败回收处理的是先前 task 的这些副本，不占新的 callable 注册条目，不受上述 2 GiB 配额约束。 |
+
+两者都会占用物理 HBM，但管理者、生命周期及规格独立。simpler 通过 RTS 的完成/回收机制
+推动后者释放，不取得 args device 指针后自行 free，也不将其迁入 callable arena。
+可复用的执行 heap/slot 是另外一类资源；复用 heap 不会消除每次提交的大 args 副本。
+当前 Qwen3-14B B1/B16 HBG 图包为 83,400,640 bytes，本机每个待执行副本增加约 80 MiB HBM；
+同一个 callable 连续调用就能产生积压，无须先用完 8192 个 callable 条目。
+
+**已确认的恢复流程：在 simpler 的一次对外 launch 调用内部完成，最多尝试提交两次。**
+
+```text
+首次 kernel_launch
+  ├─ 成功 → 返回成功，保持异步
+  └─ 可恢复的大 args 分配失败
+       → 清理/取消并汇合本次已提交的 AICore 分支
+       → 在 caller stream 记录 ACL_EVENT_TIME_LINE event，并同步等待
+            ├─ 清理、record 或 sync 失败 → 返回失败
+            └─ sync 成功 → 用同一份调用参数再次 kernel_launch
+                              ├─ 成功 → 返回成功
+                              └─ 失败 → 必要清理后返回失败，不再重试
+```
+
+这里的可恢复失败指本轮讨论的、确认业务 AICPU 尚未提交的大 args 分配失败。
+不能只按一个通用非零返回值重放：业务已经提交、执行异常、参数非法或 callable 容量超限，
+不因同步而变成安全可重试错误。要保留失败阶段，避免重复更新 Out/InOut cache。
+第二次提交复用相同的 Tensor、Scalar 和 HBG 参数快照，不重新读取可能变化的调用者状态。
+
+- 回收 event 在 simpler 内部 lazy 初始化，使用 `ACL_EVENT_TIME_LINE`，保持自有资源生命周期；
+  回收时调用 `aclrtRecordEvent`、`aclrtSynchronizeEventWithTimeout`，不公开新的用户 API。
+- 普通 stream sync 或仅 `ACL_EVENT_SYNC` 不能替代这个回收等待。现有跨流 event 保持原职责，
+  不要求每次正常 decode 都同步或把所有 event 改成 timeline。
+- 恢复应位于 simpler 实际提交及错误处理层，不在 PyPTO Python 或框架外层捕获异常后补做。
+  首次可恢复失败不能先 poison context、终止 taskQueue；恢复成功对上层仍是一次成功调用。
+  整个恢复区间遵守 simpler 的串行约束；sync 或第二次 launch 失败才按最终失败处理。
+- 本阶段不新增在途 args 的固定字节配额、外部 workspace allocate API 或无限重试循环；
+  尤其不把 callable 的 2 GiB 上限重新解释为 args 积压阈值。
+- 这是 eager 失败慢路径的同步例外，不改变正常路径异步，也不沿用旧 demo 的“任何路径绝不同步”限制。
+  capture 中不能执行该 host 等待；graph node 持有的参数也不会因 replay sync 自动释放。
+  保留 ACLGraph 支持目标，但不能把 eager 的失败回收流程直接用于 capture 失败。
+
+该机制解决的是“旧的在途大 args 尚未回收，挤占下一次提交空间”，并不承诺无限模型规模：
+单次图包本身无法容纳、固定 heap 不足、权重/KV 等长期占用过大时，回收后仍应返回失败。
+因此整网 kernel 接入方向已确定，但“可以放心使用”的交付前提是完成实现及目标组合验证。
+本机 A3/CANN 探针已验证 timeline 同步后旧 args 全部释放、立即重试成功；
+未以该探针代替真实 PyPTO AICore 取消恢复、vLLM 整网、A5 或 ACLGraph 验证。
+源码依据、Qwen 图包尺寸及原始实验记录见[HBG 参数内存调查](../docs/zh/dev/debug/kernel-mode-hbg-args-memory.md)。
+
 ## 3. PyPTO 必改文件与目的
 
 ### 3.1 JIT、参数语义与模式选择
@@ -159,7 +218,7 @@ program 调用        → 两槽位准入 → program prepare / launch / 完成�
 | `python/pypto/runtime/_execution_mode.py` | PyPTO 侧统一 mode 校验和初始化入口防护；仅在进入实际 runtime 初始化时认领模式。simpler 仍是防止底层入口绕过限制的权威层。 |
 | `python/pypto/runtime/kernel/__init__.py` | 内部调度入口；不向普通用户导出 init、prepare、close、workspace 分配接口。 |
 | `python/pypto/runtime/kernel/context.py` | lazy 初始化、并发防重入、设备共享执行域、配置一致性、初始化失败回滚与内部资源释放。区分自有和借用资源。 |
-| `python/pypto/runtime/kernel/callable.py` | 编译对象到已加载 callable 的内部映射、一次性加载/prepare、单次异步提交及参数快照存活期。不向用户暴露第二个必须维护的 executor。 |
+| `python/pypto/runtime/kernel/callable.py` | 编译对象到已加载 callable 的内部映射、一次性加载/prepare、单次异步提交及参数快照存活期；保活覆盖 simpler 内部回收及重试，不在 Python 重复实现恢复循环。不向用户暴露第二个必须维护的 executor。 |
 | `python/pypto/runtime/kernel/abi.py` | 集中封装 simpler 正式接口及 descriptor/参数编码，检查 ABI 长度、类型、方向和返回错误。隔离 Python 业务对象与底层注册/launch 结构。 |
 
 生命周期借鉴 Triton/CuTe DSL 的“可调用对象持有加载状态，内部按需建立执行资源”方式：
@@ -246,7 +305,8 @@ program 调用        → 两槽位准入 → program prepare / launch / 完成�
 | 所有入口的 mode 互斥 | program 与 kernel 同进程不共存；包括绕过 PyPTO 直接进入 simpler 的初始化路径，避免 ACL 所有权旁路及误 reset。 |
 | 共享设备执行资源 | 由 simpler 保证异步调用和 ACLGraph replay 的执行顺序；Host Python 锁不能覆盖绕过 Host 的 replay。 |
 | 动态内存 | runtime 内部管理 heap、task window、临时 Tensor 及回收；没有外部 per-op allocate API。 |
-| callable 驻留规格 | 沿用此前要求：8192 个条目、总 device code 容量上限 2 GiB、按需以 2 MiB 粒度申请，不预留 512 MiB 大 arena。这个上限不是执行 heap 大小。 |
+| callable 驻留规格 | simpler 自管的 callable 注册/驻留代码：8192 个条目、总 device code 容量上限 2 GiB、按需以 2 MiB 粒度申请，不预留 512 MiB 大 arena。该规格既不是执行 heap 大小，也不是 RTS 管理的 HBG 大 args 总量/配额。 |
+| RTS 大 args 失败恢复 | 按第 2.4 节在 simpler 内部实现“首次提交失败 → timeline event 回收同步 → 成功后重试一次”；不按 callable 配额管理 args，不向框架转嫁回收逻辑。区分失败阶段，保留部分提交清理，最终失败才向上返回。 |
 | program 两槽位 | 复用已有准入、资源拓扑及完成回收协议，保留独立 launch 路径；异步准备不能越过容量限制。 |
 | 资源释放 | 仅关闭/释放自身创建的资源；借用设备和 stream 的归属不因初始化而改变。错误不能被吞掉后伪装成成功。 |
 
@@ -263,12 +323,17 @@ PyPTO 负责提交正确包、参数和单次 stream，并保留必要 Host 引�
 | `tests/ut/ir/test_compiled_program.py`、`test_compile_pipeline.py` | 内部编译阶段不启动设备、不执行算子；内部产物执行保留 mode；全部参数由外部传入，Out/InOut 和别名一致；产物元数据重建不丢失。 |
 | `tests/ut/runtime/test_run_config.py`、`test_execute_artifact.py`、`test_external_kernel_cache.py`、`test_binary_cache_context.py` | 配置来源一致；产物重载正确；不把已加载 device 状态当作可复用编译产物。 |
 | `tests/ut/runtime/test_worker_reuse.py`、`test_worker_memory.py`、`test_chip_worker_explicit_dispatch.py` | program 路径保留；所有入口的 mode 互斥；接入两槽位时无提前分配第三份执行资源。设备协议本身在 simpler 侧验证。 |
-| `tests/ut/runtime/test_kernel_context.py`、`test_kernel_callable.py`（拟新增） | 并发首次初始化、失败回滚、重复加载、内部资源所有权；prepare 不执行业务；每次参数快照独立；无公开 prepare/close 要求。 |
+| `tests/ut/runtime/test_kernel_context.py`、`test_kernel_callable.py`（拟新增） | 并发首次初始化、失败回滚、重复加载、内部资源所有权；prepare 不执行业务；参数快照保活覆盖 simpler 恢复区间；内部恢复成功不被 Python 二次重试，最终失败正确上抛；无公开 prepare/close 要求。 |
 | `tests/ut/runtime/test_dlpack.py`（拟新增） | legacy/versioned capsule、设备编码、dtype、非连续 stride、byte offset、空 Tensor、共享引用与单次 deleter；Out/InOut 不允许只读或隐式复制；新 Tensor/view 的元数据不被旧缓存覆盖。 |
 | `tests/ut/torch/test_interop.py`、`test_registration.py`（拟新增） | 自动 DLPack 接入及 torch_npu 兼容导出、当前设备/stream、Tensor 类型与布局、外部输出、mutation/alias；FakeTensor 不做真实导出，正常 eager 调用不强制注册 custom op。 |
 | `tests/ut/backend/test_kernel_config_signature.py`、`tests/ut/codegen/test_orchestration_codegen.py`、`test_orchestration_returned_param_map.py` | 完整 Tensor/Scalar 签名、方向、参数顺序与 wrapper/ABI 一致；有 codegen 联动时覆盖对应变化。 |
 | `tests/st/runtime/kernel/`（拟新增，迁移有效 L1 用例） | 全组合 eager/capture/replay、重复异步调用、多个 callable、stream 切换、运行时 Scalar、DLPack 零拷贝外部 Out/InOut、异步引用存活及 torch_npu taskQueue 开关两条路径；公开未覆盖的 dtype/布局，不用已知失败掩盖缺口。 |
 | `tests/st/runtime/framework_and_models/test_jit.py`、`test_compiled_program.py` 及相关 scheduling 用例 | program 的既有调用与两槽位路径回归；不能用 kernel 测试结果替代 program 路径结果。 |
+
+大 args 恢复协议在 simpler 侧验证：首次成功不做额外同步；OOM 后回收成功且第二次提交成功；
+清理/record/sync 失败；第二次提交失败且无第三次重试；非可恢复错误不重放；capture 不进入 host 等待。
+整网集成还需覆盖连续大 args 积压、部分提交后的 AICore 退出、Out/InOut 不重复更新及 taskQueue 错误传播；
+重复调用同一 callable 应仅增加 RTS 在途 args，不能误消耗 callable 条目或其 2 GiB 配额。
 
 支持矩阵如下；A2/A3 按同一个后端族列出，硬件验证仍需分别说明 A2、A3 的覆盖情况：
 
@@ -338,7 +403,7 @@ CuTe DSL 的 `python/CuTeDSL/cutlass/base_dsl/compiler.py`、
 1. 先定 mode 默认值、显式常量表达及内部 ABI 参数契约，锁定外部输入输出语义。
 2. 改 JIT/内部编译对象，落实 mode、Scalar、产物所有权及首次调用 lazy 编译，不公开显式编译 API。
 3. 接通用 DLPack Tensor 层、正式 kernel 内部目录及独立 PyTorch adapter，完成 lazy 生命周期和异步调用链。
-4. 接 program 共用上层契约，保留独立两槽位 launch；同步落实 simpler 的底层前提。
+4. 接 program 共用上层契约，保留独立两槽位 launch；同步落实 simpler 的底层前提及第 2.4 节大 args 回收重试。
 5. 按完整矩阵补齐实现和回归，再退场 demo，更新正式中英文文档与示例。
 
 实施前还需精确定义的只是细节，不重新打开已决定的方向：
