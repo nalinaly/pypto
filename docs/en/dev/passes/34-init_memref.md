@@ -178,6 +178,14 @@ Key observations:
 
 ## Slice views follow the parent's layout
 
+Before computing a slice's layout and byte offset, the pass folds origins proven
+to be integer constants through SSA assignments, including assignments inside
+loops. For example, `row = 64; tile.slice(pool, shape, [row, 0])` has the same
+MemRef as a literal origin. The slice arguments are updated too, so subsequent
+view rebuilding does not resurrect a symbolic offset. This does not propagate
+an initial value into a loop-carried variable or freeze runtime metadata; those
+origins remain symbolic. The analysis relies on this pass's SSAForm requirement.
+
 A `tile.slice` / `tensor.slice` result shares its parent's `base_` Ptr and adds a byte
 offset plus a narrowed view size. Where the pass can describe the parent's real storage
 layout exactly, both numbers are computed **in that layout** rather than in a fixed

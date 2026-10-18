@@ -29,6 +29,7 @@
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/arith/analyzer.h"
 #include "pypto/ir/cast_saturation.h"
 #include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
@@ -472,6 +473,36 @@ class InitMemRefMutator : public IRMutator {
                     FunctionType func_type)
       : declared_allocs_(declared_allocs), handler_(handler), func_type_(func_type) {}
 
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    auto result = IRMutator::VisitExpr_(op);
+    auto call = As<Call>(result);
+    if ((!IsOp(call, "tile.slice") && !IsOp(call, "tensor.slice")) || call->args_.size() < 3) {
+      return result;
+    }
+    auto offsets = As<MakeTuple>(call->args_[2]);
+    if (!offsets) return result;
+
+    // Fold only proven constant slice origins. Simplify deliberately keeps
+    // named scalars inside nested regions, but that spelling must not turn a
+    // static subview into a dynamic MemRef and disable legal arena packing.
+    // Rewrite the actual slice too: MemoryReuse recomputes view offsets from
+    // its arguments, and NZ geometry must see the same origin as InitMemRef.
+    auto elements = offsets->elements_;
+    bool changed = false;
+    for (auto& element : elements) {
+      if (As<ConstInt>(element)) continue;
+      auto folded = scalar_constants_.Simplify(element);
+      if (As<ConstInt>(folded)) {
+        element = folded;
+        changed = true;
+      }
+    }
+    if (!changed) return result;
+    auto new_call = MutableCopy(call);
+    new_call->args_[2] = std::make_shared<MakeTuple>(elements, offsets->span_);
+    return new_call;
+  }
+
   /// Whether `type` is bound to one of this function's declared allocations.
   [[nodiscard]] bool HasUserBinding(const TypePtr& type) const {
     if (declared_allocs_.empty()) return false;
@@ -880,6 +911,10 @@ class InitMemRefMutator : public IRMutator {
 
     // Default case: visit the variable normally
     auto new_var = GetNewVar(op->var_);
+    if (As<ScalarType>(new_var->GetType())) {
+      auto constant = scalar_constants_.Simplify(new_value);
+      if (As<ConstInt>(constant)) scalar_constants_.Bind(new_var, constant);
+    }
     return std::make_shared<AssignStmt>(new_var, new_value, op->span_);
   }
 
@@ -1019,6 +1054,12 @@ class InitMemRefMutator : public IRMutator {
   }
 
   std::map<VarPtr, VarPtr> var_map_;
+  // InitMemRef requires SSAForm: definitions dominate their uses, and branch
+  // results / loop IterArgs have distinct identities. Bind only proven integer
+  // constants, never an IterArg's initial value or a runtime bound. Thus nested
+  // constant bindings cannot freeze loop-varying or branch-selected metadata.
+  // One traversal and constant-size bindings keep this analysis O(N log N).
+  arith::Analyzer scalar_constants_;
   const DeclaredAllocMap& declared_allocs_;
   const backend::BackendHandler* handler_ = nullptr;
   FunctionType func_type_ = FunctionType::InCore;
