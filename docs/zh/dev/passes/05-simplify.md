@@ -68,6 +68,20 @@ program_simplified = simplify_pass(program)
 4. **标量 DCE + 死 yield 槽位裁剪**：mutator 完成后，`dce::EliminateDeadScalarAssignments` 在展平的函数体上运行，删除所有「全部使用都被折掉了」的标量 `AssignStmt`。该 DCE 是保守的：永远不会删除 Call 支撑的赋值，因为 IR 目前还没有纯度标注，`Call` 可能存在可观察的副作用。两次标量 DCE 之间由 `dce::EliminateDeadYieldSlots` 裁掉没有任何读者的 yield 槽位——`IfStmt` 中无人使用的 phi `return_vars_[i]`，以及 `ForStmt` / `WhileStmt` 中 `iter_args_[i]`（循环体内读）与 `return_vars_[i]`（循环后读）都未被使用的循环携带槽位——同时删除对应的 `YieldStmt` 槽位。跨两个 scope 复用同一个 Python 局部变量恰好会产生这种死携带：SSA 用前一个 scope 的值给第二个循环做初值，循环体每一轮都覆盖它，两端都没有人读。若保留下来，它会让前一个 scope 的值变成 live-out；对设备 scope 而言，这会迫使外提出的 kernel 返回一个 `Scalar`——参见 [08-outline_incore_scopes.md](09-outline_incore_scopes.md)。
 5. **循环状态修复**：如果 DCE 删除了任何语句，由 `loop_repair::MakeBody` 重新组装函数体，确保循环携带元信息（yield/return 映射）保持一致。
 
+### 循环状态中的纯传递闭环
+
+yield 槽位的存活性根据语义消费者判断，而非简单统计所有语法引用。
+纯别名和循环／if 的 yield 通道构成依赖边；操作、条件、描述符表达式、
+返回值和调度 metadata 构成根。工作列表对每个变量与依赖边只访问一次，
+因此没有实际消费者的传递闭环不再使无用 Tile 分配存活。随后同时删除
+不可达的纯别名与原始未初始化 `tile.create` 绑定。其它调用继续保守保留，
+不推断一般算子的纯度。
+
+循环结果还依赖初值，以保留零次迭代的语义。TaskId 通道、包含调用的
+初值／yield、`while` 条件、SPMD 核数、scope／call 属性与 Submit 的
+依赖／谓词均作为存活用途。通信域内部暂按保守方式处理。这样，关闭的
+constexpr 分支不会仅因循环传递而保留无用 UB 环。
+
 ### 控制流折叠
 
 两个折叠在 `SimplifyMutator` 遍历内部运行，因此与周围的表达式级处理共享分析器的约束栈：

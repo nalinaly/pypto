@@ -17,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -442,11 +443,13 @@ bool IsRemovableForDefaultDce(const StmtPtr& stmt) {
 class CallLikeFinder : public IRVisitor {
  public:
   bool found = false;
+  size_t count = 0;
 
  private:
   using IRVisitor::VisitExpr_;
   void VisitExpr_(const CallPtr& op) override {
     found = true;
+    ++count;
     // Keep walking — nested args may also contain Calls, but early-exit
     // would require throwing. The overhead is bounded by the expression
     // size which is small.
@@ -454,6 +457,7 @@ class CallLikeFinder : public IRVisitor {
   }
   void VisitExpr_(const SubmitPtr& op) override {
     found = true;
+    ++count;
     IRVisitor::VisitExpr_(op);
   }
 };
@@ -581,8 +585,7 @@ StmtPtr RebuildScopeWithBody(const std::shared_ptr<const ScopeStmt>& scope_stmt,
 /// `live_uses`: an IfStmt's `return_vars_[i]`, or a loop's carried slot (both
 /// `iter_args_[i]` and `return_vars_[i]` unused), plus the matching slot from
 /// the trailing YieldStmt that feeds it. Recurses into nested branches, scope
-/// bodies, and loop bodies. Sets `*changed` when any node was rewritten (used
-/// by the fixed-point loop in EliminateDeadYieldSlots).
+/// bodies, and loop bodies. Sets `*changed` when any node was rewritten.
 std::vector<StmtPtr> RewriteDeadYieldSlotsOnce(const std::vector<StmtPtr>& stmts,
                                                const std::unordered_set<const Var*>& live_uses,
                                                bool* changed);
@@ -599,6 +602,167 @@ bool IsTaskIdCarrier(const TypePtr& type) {
   if (auto array_type = As<ArrayType>(type)) return array_type->dtype_ == DataType::TASK_ID;
   return false;
 }
+
+/// Only forwarding bindings and a local, uninitialized tile allocation are
+/// removable here. Other calls/computations retain all their operand uses as
+/// roots; this is not a new general-purpose purity inference for operators.
+bool IsForwardingAssign(const AssignStmtPtr& assign) {
+  if (!assign || IsTaskIdCarrier(assign->var_->GetType())) return false;
+  if (AsVarLike(assign->value_)) return true;
+  // A primitive allocation is a plain Call, never an asynchronous Submit.
+  const auto call = As<Call>(assign->value_);
+  if (!call || !IsOp(call, "tile.create")) return false;
+  CallLikeFinder finder;
+  finder.VisitExpr(call);
+  // Preserve a nested call in a shape/attribute rather than deleting its effect.
+  return finder.count == 1;
+}
+
+/// Build a graph for aliases and structured yield channels. A syntactic use
+/// inside a forwarding cycle is not a root: the cycle survives only if a real
+/// operation, condition, descriptor, return or scheduling channel reaches it.
+/// Each expression/statement is visited a constant number of times; the
+/// worklist visits each variable and edge once (O(N + E), expected hash cost).
+class ForwardingUseGraph {
+ public:
+  std::unordered_set<const Var*> Analyze(const std::vector<StmtPtr>& stmts) {
+    MarkBinderTypeRefsLive(stmts, roots_);
+    CollectBody(stmts);
+    std::vector<const Var*> worklist(roots_.begin(), roots_.end());
+    auto live = roots_;
+    for (size_t next = 0; next < worklist.size(); ++next) {
+      auto found = dependencies_.find(worklist[next]);
+      if (found == dependencies_.end()) continue;
+      for (const Var* source : found->second) {
+        if (live.insert(source).second) worklist.push_back(source);
+      }
+    }
+    return live;
+  }
+
+ private:
+  void AddRoots(const ExprPtr& expr) {
+    if (!expr) return;
+    var_collectors::VarDefUseCollector collector;
+    collector.VisitExpr(expr);
+    roots_.insert(collector.var_uses.begin(), collector.var_uses.end());
+  }
+
+  void AddDependency(const Var* target, const ExprPtr& expr) {
+    if (!expr) return;
+    var_collectors::VarDefUseCollector collector;
+    collector.VisitExpr(expr);
+    auto& inputs = dependencies_[target];
+    inputs.insert(inputs.end(), collector.var_uses.begin(), collector.var_uses.end());
+  }
+
+  void AddAttrs(const std::vector<std::pair<std::string, std::any>>& attrs) {
+    for (const auto& [key, value] : attrs) {
+      ForEachAttrExpr(value, [this](const ExprPtr& expr) { AddRoots(expr); });
+    }
+  }
+
+  void AddYieldDependencies(const StmtPtr& body, const std::vector<VarPtr>& targets) {
+    auto flat = FlattenBody(body);
+    auto yielded = flat.empty() ? nullptr : As<YieldStmt>(flat.back());
+    if (!yielded || yielded->value_.size() != targets.size()) {
+      // Do not infer dead channels from an unrecognized/malformed yield shape.
+      for (const auto& target : targets) roots_.insert(target.get());
+      if (yielded) {
+        for (const auto& value : yielded->value_) AddRoots(value);
+      }
+      return;
+    }
+    for (size_t i = 0; i < targets.size(); ++i) {
+      AddDependency(targets[i].get(), yielded->value_[i]);
+      if (ExprContainsCallLike(yielded->value_[i])) roots_.insert(targets[i].get());
+    }
+  }
+
+  template <typename LoopT>
+  void CollectLoop(const std::shared_ptr<const LoopT>& loop) {
+    INTERNAL_CHECK_SPAN(loop->iter_args_.size() == loop->return_vars_.size(), loop->span_)
+        << "Internal error: mismatched loop carry and return slots";
+    std::vector<VarPtr> iter_targets;
+    iter_targets.reserve(loop->iter_args_.size());
+    for (size_t i = 0; i < loop->iter_args_.size(); ++i) {
+      const auto& argument = loop->iter_args_[i];
+      const auto& returned = loop->return_vars_[i];
+      iter_targets.push_back(argument);
+      AddDependency(argument.get(), argument->initValue_);
+      // A post-loop user also needs the initializer when the loop takes zero
+      // trips, even if the body overwrites the value without reading it.
+      dependencies_[returned.get()].push_back(argument.get());
+      if (IsTaskIdCarrier(argument->GetType()) || ExprContainsCallLike(argument->initValue_)) {
+        roots_.insert(argument.get());
+        roots_.insert(returned.get());
+      }
+    }
+    AddYieldDependencies(loop->body_, iter_targets);
+    CollectBody(FlattenBody(loop->body_));
+  }
+
+  void CollectBody(const std::vector<StmtPtr>& stmts) {
+    for (const auto& stmt : stmts) {
+      if (auto assign = As<AssignStmt>(stmt)) {
+        // Shape/view/slot expressions on a retained descriptor are uses even
+        // when they do not occur in the RHS expression. Keep these references
+        // conservatively also for removable bindings (as for loop binders).
+        for (const Var* ref : var_collectors::CollectTypeVars(assign->var_->GetType())) {
+          roots_.insert(ref);
+        }
+        if (IsForwardingAssign(assign)) {
+          AddDependency(assign->var_.get(), assign->value_);
+        } else {
+          // Includes Call and Submit args, deps, predicate and Expr-valued attrs
+          // through the shared IR visitor. Never treat a submit as a plain call.
+          AddRoots(assign->value_);
+        }
+      } else if (auto loop = As<ForStmt>(stmt)) {
+        AddRoots(loop->start_);
+        AddRoots(loop->stop_);
+        AddRoots(loop->step_);
+        AddAttrs(loop->attrs_);
+        CollectLoop(loop);
+      } else if (auto loop = As<WhileStmt>(stmt)) {
+        // The condition is a semantic use of an IterArg, not an implicit yield.
+        AddRoots(loop->condition_);
+        CollectLoop(loop);
+      } else if (auto branch = As<IfStmt>(stmt)) {
+        AddRoots(branch->condition_);
+        AddYieldDependencies(branch->then_body_, branch->return_vars_);
+        CollectBody(FlattenBody(branch->then_body_));
+        if (branch->else_body_.has_value()) {
+          AddYieldDependencies(*branch->else_body_, branch->return_vars_);
+          CollectBody(FlattenBody(*branch->else_body_));
+        } else {
+          for (const auto& returned : branch->return_vars_) roots_.insert(returned.get());
+        }
+      } else if (auto scope = As<ScopeStmt>(stmt)) {
+        if (As<CommDomainScopeStmt>(stmt)) {
+          // This utility does not rebuild communication-domain scopes. Keep
+          // their full body conservative rather than pruning an unknown
+          // execution-model channel.
+          var_collectors::VarDefUseCollector collector;
+          collector.VisitStmt(stmt);
+          roots_.insert(collector.var_uses.begin(), collector.var_uses.end());
+          continue;
+        }
+        AddAttrs(scope->attrs_);
+        if (auto spmd = As<SpmdScopeStmt>(stmt)) AddRoots(spmd->core_num_);
+        CollectBody(FlattenBody(scope->body_));
+      } else if (!As<YieldStmt>(stmt)) {
+        // Returns, evals and unhandled node kinds remain conservative roots.
+        var_collectors::VarDefUseCollector collector;
+        collector.VisitStmt(stmt);
+        roots_.insert(collector.var_uses.begin(), collector.var_uses.end());
+      }
+    }
+  }
+
+  std::unordered_map<const Var*, std::vector<const Var*>> dependencies_;
+  std::unordered_set<const Var*> roots_;
+};
 
 /// Prune dead carried slots from one loop node. `LoopT` is `ForStmt` or
 /// `WhileStmt`; both expose `iter_args_`, `body_` and `return_vars_`.
@@ -658,10 +822,12 @@ std::vector<StmtPtr> RewriteDeadYieldSlotsOnce(const std::vector<StmtPtr>& stmts
   std::vector<StmtPtr> result;
   result.reserve(stmts.size());
   for (const auto& stmt : stmts) {
-    if (auto if_stmt = std::dynamic_pointer_cast<const IfStmt>(stmt)) {
-      // Recurse into branches first so a dead inner phi observed in this same
-      // pass also gets cleared. The outer fixed-point still iterates until
-      // convergence; the inner recursion just shortens the iteration count.
+    if (auto assign = As<AssignStmt>(stmt);
+        assign && IsForwardingAssign(assign) && !live_uses.count(assign->var_.get())) {
+      *changed = true;
+    } else if (auto if_stmt = std::dynamic_pointer_cast<const IfStmt>(stmt)) {
+      // Reachability already resolves transitive aliases and nested phis.
+      // Recurse once to remove every unreachable forwarding channel together.
       auto then_stmts = FlattenBody(if_stmt->then_body_);
       auto new_then = RewriteDeadYieldSlotsOnce(then_stmts, live_uses, changed);
       std::optional<std::vector<StmtPtr>> else_stmts;
@@ -709,6 +875,12 @@ std::vector<StmtPtr> RewriteDeadYieldSlotsOnce(const std::vector<StmtPtr>& stmts
         *changed = true;
       }
 
+      if (new_then.empty() && (!new_else.has_value() || new_else->empty()) &&
+          new_return_vars.empty() && !ExprContainsCallLike(if_stmt->condition_)) {
+        *changed = true;
+        continue;
+      }
+
       auto new_if = MutableCopy(if_stmt);
       new_if->then_body_ = MakeBody(new_then, if_stmt->span_);
       new_if->else_body_ =
@@ -722,6 +894,10 @@ std::vector<StmtPtr> RewriteDeadYieldSlotsOnce(const std::vector<StmtPtr>& stmts
     } else if (auto while_stmt = std::dynamic_pointer_cast<const WhileStmt>(stmt)) {
       result.push_back(RewriteLoopCarrySlots(while_stmt, live_uses, changed));
     } else if (auto scope_stmt = std::dynamic_pointer_cast<const ScopeStmt>(stmt)) {
+      if (As<CommDomainScopeStmt>(stmt)) {
+        result.push_back(stmt);
+        continue;
+      }
       auto original = FlattenBody(scope_stmt->body_);
       auto rewritten = RewriteDeadYieldSlotsOnce(original, live_uses, changed);
       if (SameFlattenedBody(rewritten, original)) {
@@ -747,20 +923,12 @@ std::vector<StmtPtr> EliminateDeadScalarAssignments(const std::vector<StmtPtr>& 
 }
 
 std::vector<StmtPtr> EliminateDeadYieldSlots(const std::vector<StmtPtr>& stmts) {
-  std::vector<StmtPtr> cur = stmts;
-  while (true) {
-    // Collect every Var* that appears as a use anywhere in `cur`. The base
-    // visitor walks ScopeStmt attrs via VisitScopeAttrs and Submit::deps_
-    // through Call/Submit traversal, so all known reference channels are
-    // covered without extra plumbing.
-    var_collectors::VarDefUseCollector collector;
-    for (const auto& s : cur) collector.VisitStmt(s);
-
-    bool changed = false;
-    auto next = RewriteDeadYieldSlotsOnce(cur, collector.var_uses, &changed);
-    if (!changed) return cur;
-    cur = std::move(next);
-  }
+  ForwardingUseGraph graph;
+  auto live = graph.Analyze(stmts);
+  bool changed = false;
+  // Reachability already accounts for arbitrarily long forwarding chains and
+  // cycles, so one structural rewrite suffices; no repeated whole-IR scans.
+  return RewriteDeadYieldSlotsOnce(stmts, live, &changed);
 }
 
 }  // namespace dce

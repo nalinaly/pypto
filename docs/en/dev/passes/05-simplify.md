@@ -68,6 +68,22 @@ Implemented by `TransformSimplify` in `src/ir/transforms/simplify_pass.cpp` in f
 4. **Scalar DCE + dead yield-slot prune** — after the mutator finishes, `dce::EliminateDeadScalarAssignments` walks the flattened body and drops scalar `AssignStmt`s whose only uses were folded away. The DCE is conservative: it never removes call-backed assignments because the IR has no purity annotations yet and a `Call` may have observable side effects. Between the two scalar-DCE runs, `dce::EliminateDeadYieldSlots` drops the yielded slots nobody reads — an `IfStmt` phi whose `return_vars_[i]` has no user, and a `ForStmt` / `WhileStmt` carry whose `iter_args_[i]` (read inside the body) *and* `return_vars_[i]` (read after the loop) are both unused — together with the matching `YieldStmt` slot. Reusing one Python local across two scopes produces exactly that dead carry: SSA seeds the second loop with the first scope's value, every trip overwrites it, and nothing reads either end. Left in place it makes the earlier scope's value live-out, which for a device scope would force a `Scalar` into the outlined kernel's return set — see [08-outline_incore_scopes.md](09-outline_incore_scopes.md).
 5. **Loop-state repair** — if DCE removed any statements, `loop_repair::MakeBody` reassembles the function body so loop-carried metadata (yield/return mappings) stays consistent.
 
+### Forwarding cycles in loop state
+
+Yield-slot liveness follows semantic consumers rather than counting every
+syntactic use. Plain aliases and loop/if yield channels form dependency edges;
+operations, conditions, descriptor expressions, returns and scheduling metadata
+are roots. A worklist visits each variable and edge once, so an isolated
+forwarding cycle does not keep a dead Tile allocation alive. The rewrite also
+removes unreachable plain aliases and primitive, uninitialized `tile.create`
+bindings. Other calls remain conservative; no general operator purity is assumed.
+
+Loop results also depend on the initializer, preserving zero-trip behavior.
+TaskId carries, call-backed initializers/yields, `while` conditions, SPMD core
+counts, scope/call attributes and Submit dependencies/predicates remain live.
+Communication-domain bodies are left conservative. This prevents a disabled
+constexpr branch from retaining a useless UB ring solely through loop carries.
+
 ### Control-flow folding
 
 Two folds run inside the `SimplifyMutator` traversal so they share the analyzer's constraint stack with the surrounding expression-level work:
