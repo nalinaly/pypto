@@ -843,12 +843,47 @@ static std::string EmitLocalArrayValue(codegen::PTOCodegen& codegen, const ir::E
   return out;
 }
 
+// 只建立本地 GM 的单元素视图，不构造 CommContext、通信窗口或远端地址。
+static std::string MakeLocalSignalCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base,
+                                           bool notify) {
+  auto& cg = AsPto(codegen_base);
+  INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_) << "local signal expects three operands";
+  auto signal = AsVarLike(op->args_[0]);
+  INTERNAL_CHECK_SPAN(signal, op->span_) << "local signal must be a tensor variable";
+  auto type = As<TensorType>(signal->GetType());
+  auto offsets = As<ir::MakeTuple>(op->args_[1]);
+  INTERNAL_CHECK_SPAN(type && offsets, op->span_) << "local signal operand types were not verified";
+  auto local_view = cg.GetOrCreateTensorView(signal);
+  auto local_type = cg.GetTensorViewTypeString(type.get());
+  std::vector<std::string> one_dims(type->shape_.size(), "1");
+  std::vector<std::string> one_sizes(type->shape_.size(),
+                                   cg.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX));
+  auto partition_type = MakePartitionTensorViewType(one_dims, cg.GetTypeString(type->dtype_));
+  auto partition = EmitPartitionViewPTO(signal->name_hint_ + "_signal", local_view, local_type,
+                                       partition_type, GetIndexOffsetCodes(offsets->elements_, cg),
+                                       one_sizes, cg);
+  const auto value = cg.GetExprAsCode(op->args_[2]);
+  // 同步信号本身使用 PTO-ISA 已有的发布/轮询；不声称它自动刷新任意 payload。
+  const auto instruction = notify ? "pto.comm.tnotify" : "pto.comm.twait";
+  const auto attribute = notify ? "notifyOp = #pto<notify_op set>" : "cmp = #pto<wait_cmp ge>";
+  cg.Emit(std::string(instruction) + "(" + partition + ", " + value + " : " + partition_type +
+          ", i32) {" + attribute + "}");
+  return "";
+}
+
 void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& exclude_ops) {
   // Register ops with custom codegen logic
   auto reg = [&](const char* op_name, BackendCodegenFunc fn) {
     if (exclude_ops.count(op_name) > 0) return;
     backend.RegisterOp(op_name).f_codegen(std::move(fn));
   };
+
+  reg("system.signal_notify", [](const CallPtr& op, codegen::CodegenBase& cg) {
+    return MakeLocalSignalCodegenPTO(op, cg, true);
+  });
+  reg("system.signal_wait", [](const CallPtr& op, codegen::CodegenBase& cg) {
+    return MakeLocalSignalCodegenPTO(op, cg, false);
+  });
 
   // On-core arrays (ArrayType) -> PTOAS stack-local arrays. The IR's
   // SSA-functional update_element semantics are realized in place: PTOCodegen's

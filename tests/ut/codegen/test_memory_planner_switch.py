@@ -27,6 +27,8 @@ both passes run and codegen bakes ``addr`` for ``--pto-level=level3``.
 # DSL function bodies are parsed as AST, not executed — suppress pyright errors.
 # pyright: reportUndefinedVariable=false
 
+import re
+
 import pypto.language as pl
 import pytest
 from pypto import backend, ir
@@ -264,6 +266,116 @@ def test_ptoas_loop_carry_is_in_place_single_handle():
     # The accumulator alloc appears once, not once per SSA name (acc == acc_next).
     acc_allocs = [ln for ln in mlir.splitlines() if "pto.alloc_tile" in ln and out_handle in ln]
     assert len(acc_allocs) == 1, f"accumulator buffer must have exactly one alloc_tile:\n{mlir}"
+
+
+def test_ptoas_reshape_reads_phi_handle_after_branch():
+    """A post-if view cannot reuse a same-typed but branch-local old handle."""
+
+    @pl.program
+    class BranchView:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[32, 1], pl.FP32],
+            flag: pl.Scalar[pl.INT32],
+            out: pl.Out[pl.Tensor[[1, 16], pl.FP32]],
+        ) -> pl.Tensor[[1, 16], pl.FP32]:
+            base = pl.load(x, [0, 0], [32, 1])
+            if flag != 0:
+                row = pl.reshape(base, [1, 32])
+                updated = pl.add(row, 1.0)
+                column = pl.reshape(updated, [32, 1])
+                result = column
+            else:
+                result = base
+            after = pl.reshape(result, [1, 32])
+            head = pl.tile.extract(after, 0, 0, [1, 16], target_memory=pl.Mem.Vec)
+            output = pl.store(head, [0, 0], out)
+            return output
+
+    optimized, _ = _run_pipeline(passes.MemoryPlanner.PTOAS, BranchView)
+    mlir = _codegen(optimized, emit_tile_addr=False)
+    extract = next(line for line in mlir.splitlines() if "pto.textract ins(" in line)
+    source = extract.split("ins(", 1)[1].split(",", 1)[0]
+    view = next((line.strip() for line in mlir.splitlines() if line.strip().startswith(source + " =")), "")
+    assert "= pto.treshape " in view, mlir
+    phi = view.split("= pto.treshape ", 1)[1].split()[0]
+    assert any("pto.tmov" in line and "outs(" + phi + " :" in line for line in mlir.splitlines()), mlir
+
+
+def test_ptoas_conditional_gather_preserves_one_mat_buffer():
+    """Two in-place branch writes must not introduce an illegal Mat->Mat copy."""
+
+    @pl.program
+    class ConditionalGather:
+        @pl.function(type=pl.FunctionType.AIC)
+        def kernel(
+            self,
+            x: pl.Tensor[[64, 64], pl.FP16],
+            flag: pl.Scalar[pl.INT32],
+            out: pl.Out[pl.Tensor[[64, 16], pl.FP32]],
+        ) -> pl.Tensor[[64, 16], pl.FP32]:
+            base = pl.tile.create([32, 64], dtype=pl.FP16, target_memory=pl.Mem.Mat)
+            if flag != 0:
+                first = pl.tile.gather_row(base, x, [0, 0], [0, 0], [16, 64])
+            else:
+                first = pl.tile.gather_row(base, x, [0, 0], [16, 0], [16, 64])
+            if flag != 0:
+                second = pl.tile.gather_row(first, x, [16, 0], [32, 0], [16, 64])
+            else:
+                second = pl.tile.gather_row(first, x, [16, 0], [48, 0], [16, 64])
+            transposed = pl.tile.transpose_view(second)
+            rhs = pl.tile.load(x, [0, 0], [32, 16], target_memory=pl.Mem.Mat)
+            left = pl.tile.move(transposed, target_memory=pl.Mem.Left)
+            right = pl.tile.move(rhs, target_memory=pl.Mem.Right)
+            product = pl.tile.matmul(left, right)
+            output = pl.tile.store(product, [0, 0], out)
+            return output
+
+    optimized, _ = _run_pipeline(passes.MemoryPlanner.PTOAS, ConditionalGather)
+    mlir = _codegen(optimized, emit_tile_addr=False)
+    moves = [line for line in mlir.splitlines() if "pto.tmov" in line]
+    assert not any(line.count("loc=mat") == 2 for line in moves), mlir
+    bases = {
+        line.split("pto.subview ", 1)[1].split("[", 1)[0]
+        for line in mlir.splitlines()
+        if "pto.subview " in line
+    }
+    assert len(bases) == 1, mlir
+
+
+def test_ptoas_column_carry_move_uses_destination_view():
+    """A column carry can share storage with a row-major full initializer."""
+
+    @pl.program
+    class ColumnCarry:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            flag: pl.Scalar[pl.INT32],
+            out: pl.Out[pl.Tensor[[32, 1], pl.FP32]],
+        ) -> pl.Tensor[[32, 1], pl.FP32]:
+            row_base = pl.tile.full([1, 32], dtype=pl.FP32, value=0.0)
+            base = pl.tile.reshape(row_base, [32, 1])
+            for i, (carry,) in pl.range(2, init_values=(base,)):
+                if flag != 0:
+                    row = pl.reshape(carry, [1, 32])
+                    updated = pl.add(row, 1.0)
+                    column = pl.reshape(updated, [32, 1])
+                    value = column
+                else:
+                    value = carry
+                result = pl.yield_(value)
+            output = pl.store(result, [0, 0], out)
+            return output
+
+    optimized, _ = _run_pipeline(passes.MemoryPlanner.PTOAS, ColumnCarry)
+    mlir = _codegen(optimized, emit_tile_addr=False)
+    moves = [line for line in mlir.splitlines() if "pto.tmov" in line]
+    assert moves, mlir
+    for move in moves:
+        shapes = re.findall(r"rows=(\d+), cols=(\d+)", move)
+        assert len(shapes) == 2 and shapes[0] == shapes[1], move
 
 
 def test_pypto_loop_carry_uses_shared_addr():

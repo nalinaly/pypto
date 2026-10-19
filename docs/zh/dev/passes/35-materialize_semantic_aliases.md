@@ -46,6 +46,8 @@ program = passes.materialize_semantic_aliases()(program)
    的规范 MemRef 作为目标，推送到 yield 值及其 producer 链上（跟随原地
    `output-reuses-input` 算子与 view 输入）。`IfStmt` 的返回值被推送到两个分支的
    yield，然后应用收集到的类型改写。
+   遍历也进入 Scalar `WhileStmt` 的循环体，保证嵌套 `ForStmt` 沿用相同的
+   别名规则；这不会重定向 `WhileStmt` 自身的 carry，也不会把写入移到循环外。
 2. **规范化 peeled accumulator phi**：按后序访问嵌套 `IfStmt`，同时识别直接的
    in-place accumulator producer，以及由分支外 accumulator seed 驱动的分支内
    loop。当且仅当一个分支是 accumulator continuation 时，把另一个分支的局部
@@ -57,8 +59,12 @@ program = passes.materialize_semantic_aliases()(program)
    路径上，重定向后的 producer 会覆盖仍可观察的值。
 3. **规范化语义 identity chain**（`NormalizeIdentityCopyBuffersMutator`）：让 bare SSA
    copy 与 source 共享 allocation，并让每个注册的 in-place result 与其 reused input
-   共享 allocation。这样可在任何 memory planner 观察 lifetime 或 PTOAS 发射 tile
-   handle 之前消除 lowering 引入的类型漂移。
+   共享 allocation。同一正向遍历中的元数据视图（metadata view）跟随当前 input，
+   包括刚被重新锚定的 in-place result。子视图保留相对字节偏移和窗口大小，流水槽
+   身份跟随 input；真正搬运数据的 `tile.transpose` 仍占独立存储。尚未确定存储的
+   `if` phi 及其 view/in-place 别名链会继续延迟处理，直到 yield fixup 选定 phi
+   存储。这样可在任何 memory planner 观察 lifetime 或 PTOAS 发射 tile handle
+   之前消除 lowering 引入的类型漂移，不放宽生命周期或流水约束。
 
 当没有可重定向的内容时（`Compute` 返回空）本 pass 是 no-op，并跳过
 `Orchestration` 函数（无 TileType 变量）。

@@ -49,6 +49,7 @@ from typing import Any, cast
 from pypto._external_source import EXTERNAL_INCLUDE_DIRS_ATTR, encode_external_include_dirs
 from pypto._function_attrs import DUAL_AIV_DISPATCH_ATTR
 from pypto.language.typing.array import Array as _LangArray
+from pypto.language.typing.tile import Tile as _LangTile
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import TensorLayout
 
@@ -2098,6 +2099,11 @@ class Specializer:
                 continue
             if isinstance(ann_obj, _LangArray) and ann_obj.extent is not None and ann_obj.dtype is not None:
                 array_param_anns[arg.arg] = f"pl.Array[{ann_obj.extent}, {_array_dtype_str(ann_obj.dtype)}]"
+            elif is_inline and isinstance(ann_obj, _LangTile):
+                # Inline Tile parameters already have a complete type. Keep its
+                # shape, dtype and memory space instead of emitting a bare name;
+                # module/closure constants use the existing annotation folder.
+                array_param_anns[arg.arg] = ast.unparse(_fold_const_names(arg.annotation, ctx.py_globals))
 
         params = self._build_params(
             all_param_names,

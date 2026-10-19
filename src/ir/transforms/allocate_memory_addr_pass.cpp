@@ -13,6 +13,7 @@
 #include <any>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -320,7 +321,7 @@ class PinnedAllocCollector : public IRVisitor {
  * @brief Allocate memory addresses using the given allocation policy
  *
  * MemRefs sharing the same ``base_`` Ptr are co-located in a single bumped
- * slot sized by the largest member.size_ in the group.  This handles view
+ * slot sized by the largest static member end in the group. This handles view
  * MemRefs (e.g. produced by ``tile.slice``) — every view physically aliases
  * its parent allocation, so they should share one address slot rather than
  * each consuming size_ bytes of fresh L1.
@@ -373,14 +374,23 @@ std::vector<std::pair<const MemRef*, MemRefPtr>> AllocateMemoryAddresses(
     for (const Var* base_key : base_order) {
       const auto& group = base_groups.at(base_key);
 
-      // Slot size = max member.size_.  The root MemRef (byte_offset == 0) is
-      // sized to the full alloc; views are sub-regions and never exceed it.
+      // A grown reuse arena may contain windows extending past the original
+      // representative. Reserve their union, not just the largest tile size.
+      // Dynamic views remain covered by their root's complete static extent.
       uint64_t slot_size = 0;
       for (const auto& ref : group) {
         INTERNAL_CHECK_SPAN(ref->size_ > 0, ref->span_)
             << "AllocateMemoryAddr encountered zero-sized MemRef '" << ref->name_hint_
             << "'. InitMemRef should reject dynamic or invalid allocation shapes before address assignment.";
-        slot_size = std::max(slot_size, static_cast<uint64_t>(ref->size_));
+        uint64_t end = ref->size_;
+        if (auto offset = As<ConstInt>(ref->byte_offset_)) {
+          INTERNAL_CHECK_SPAN(offset->value_ >= 0 && static_cast<uint64_t>(offset->value_) <=
+                                                         std::numeric_limits<uint64_t>::max() - end,
+                              ref->span_)
+              << "Internal error: allocation window has an invalid static range";
+          end += static_cast<uint64_t>(offset->value_);
+        }
+        slot_size = std::max(slot_size, end);
       }
       // A declared allocation reserves what its alloc statement says, which for a
       // multi-slot declaration exceeds any single member. Everything else is sized

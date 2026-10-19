@@ -868,7 +868,8 @@ class PTOCodegen : public CodegenBase {
    * there is no baked `addr` to alias through. Returns "" when addresses are
    * baked, when `memref` is null, or when no handle is bound yet.
    */
-  [[nodiscard]] std::string TryGetSharedTileBufHandle(const ir::MemRefPtr& memref) const;
+  [[nodiscard]] std::string TryGetSharedTileBufHandle(const ir::MemRefPtr& memref,
+                                                      const std::string& required_type) const;
 
   /**
    * @brief Declare `ssa_name`'s `pto.alloc_tile` in the function head.
@@ -1016,8 +1017,9 @@ class PTOCodegen : public CodegenBase {
     /// a `[1, N]` row-major op result and its `[N, 1]` col-major reshape view,
     /// which occupy the same bytes. Their shared handle carries exactly one type
     /// (differently-typed reads become `pto.treshape` views of it), so it must
-    /// never be re-typed to suit another var. `TryGetSharedTileBufHandle` refuses
-    /// these identities.
+    /// never be re-typed to suit another var. `TryGetSharedTileBufHandle` accepts
+    /// these identities only when an already-emitted handle has the exact
+    /// requested tile_buf type.
     std::set<std::string> memref_identity_mixed_types;
     /// alloc_tile SSA handles already emitted — dedups the alloc when several
     /// vars share one handle (PTOAS in-place aliasing).

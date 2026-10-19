@@ -2128,6 +2128,76 @@ class TestDynamicLocalTensorMetadata:
         assert metas["flat"].shape == (128, t_dim)
         assert metas["flat"].dtype == DataType.BF16
 
+    def test_reshape_dim_arithmetic_reaches_dependency(self):
+        """Flatten and offset cache views retain runtime descriptor dimensions."""
+        pages = DynDim(name="PAGES", literal="PAGES", static_bound=3)
+        seed = {
+            "src": TensorMeta(shape=(pages, 4160), dtype=DataType.INT8),
+            "out": TensorMeta(shape=(1, 128), dtype=DataType.INT8),
+        }
+
+        def body(src, out):
+            rows = pl.tensor.dim(src, 0)
+            width = pl.tensor.dim(src, 1)
+            flat = pl.reshape(src, [rows * width])
+            shifted = flat[64 : 64 + ((rows * width - 64) // 128) * 128]
+            keys = pl.reshape(shifted, [(rows * width - 64) // 128, 128])
+            return _synth_dim_kernel(keys, out)
+
+        local = _extract_local_tensor_metas(body, seed_meta=seed)
+        assert local["flat"].dtype == DataType.INT8
+        assert isinstance(local["flat"].shape[0], DynDim)
+        assert local["flat"].shape[0].synthesized
+        assert local["keys"].shape[1] == 128
+        metas, _ = _resolve_dep_call_metadata(_synth_dim_kernel, body, seed, {}, {})
+        assert metas["t"] == local["keys"]
+
+    def test_reshape_dim_arithmetic_rejects_unknown_scalar(self):
+        """Mixing an unrelated runtime scalar into a shape stays uninferred."""
+        pages = DynDim(name="PAGES", literal="PAGES", static_bound=3)
+        seed = {
+            "src": TensorMeta(shape=(pages, 4160), dtype=DataType.INT8),
+            "cfg": TensorMeta(shape=(1,), dtype=DataType.INT32),
+        }
+
+        def body(src, cfg):
+            rows = pl.tensor.dim(src, 0)
+            width = pl.tensor.read(cfg, [0])
+            flat = pl.reshape(src, [rows * width])
+            return flat
+
+        assert "flat" not in _extract_local_tensor_metas(body, seed_meta=seed)
+
+    def test_reshape_dim_arithmetic_full_compile(self, tmp_path, monkeypatch):
+        """The derived dimensions remain descriptor-based through codegen."""
+        torch = pytest.importorskip("torch")
+        monkeypatch.setenv("PTOAS_ROOT", str(tmp_path / "missing_ptoas"))
+
+        @jit.incore
+        def copy_key(keys: pl.Tensor, out: pl.Out[pl.Tensor]) -> pl.Tensor:
+            tile = pl.load(keys, [0, 0], [1, 128])
+            pl.store(tile, [0, 0], out)
+            return out
+
+        @jit
+        def entry(
+            src: pl.Tensor[[_M_1524, 4160], pl.INT8],
+            out: pl.Out[pl.Tensor[[1, 128], pl.INT8]],
+        ):
+            rows = pl.tensor.dim(src, 0)
+            width = pl.tensor.dim(src, 1)
+            flat = pl.reshape(src, [rows * width])
+            shifted = flat[64 : 64 + ((rows * width - 64) // 128) * 128]
+            keys = pl.reshape(shifted, [(rows * width - 64) // 128, 128])
+            return copy_key(keys, out)
+
+        compiled = entry.compile(
+            torch.empty(3, 4160, dtype=torch.int8),
+            torch.empty(1, 128, dtype=torch.int8),
+            config=RunConfig(platform="a2a3", save_kernels_dir=str(tmp_path / "compiled")),
+        )
+        assert compiled.output_dir is not None
+
 
 # ---------------------------------------------------------------------------
 # Per-rank sliced dispatch (chip_orch(x[r], ...)) and pld.window metadata.

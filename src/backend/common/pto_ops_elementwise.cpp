@@ -1128,6 +1128,21 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
       if (!src_ssa.empty() && src_ssa == codegen.GetCurrentResultTarget()) {
         return std::string("");  // no-op: one handle, the op already wrote in place
       }
+      auto dst_var = codegen.GetCurrentResultVar();
+      const std::string logical_dst_type = codegen.GetCurrentResultTileBufTypeStringFromTileType();
+      const std::string actual_dst_type = codegen.GetSSATileBufType(codegen.GetCurrentResultTarget());
+      if (dst_var && !actual_dst_type.empty() && actual_dst_type != logical_dst_type) {
+        // A column carry may be backed by its row-major initializer's handle.
+        // Write through the carry's typed view; copying [N, 1] directly into
+        // that [1, N] handle is not a legal A2/A3 TMOV.
+        auto dst_tile = As<ir::TileType>(dst_var->GetType());
+        RequireStaticValidShapeForPtoas(dst_tile, "tile.move", "dst", op->span_);
+        const std::string dst = EnsureStaticViewTileSsa(dst_var, codegen, "move_dst_view");
+        EmitInsOutsWithViewTypes(codegen, "pto.tmov",
+                                 {{src_ssa, codegen.GetExprTypeAnnotation(op->args_[0])}}, dst, dst_tile);
+        codegen.SetCurrentResultBuf(dst);
+        return std::string("");
+      }
       codegen.Emit("pto.tmov " + GenerateInsOutsClause(op, codegen));
       return std::string("");
     }

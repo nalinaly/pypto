@@ -196,7 +196,40 @@ void PTOCodegen::VisitExpr_(const ir::FloorDivPtr& op) {
   VisitBinaryArithExpr(op, "arith.divsi", "arith.divf");
 }
 void PTOCodegen::VisitExpr_(const ir::FloorModPtr& op) {
-  VisitBinaryArithExpr(op, "arith.remsi", "arith.remf");
+  const auto dtype = ir::GetScalarDtype(op);
+  if (dtype != DataType::INDEX && !dtype.IsSignedInt()) {
+    // Preserve other dtype paths; this correction covers signed integer and
+    // index arithmetic, matching the scalar simplifier's floor semantics.
+    VisitBinaryArithExpr(op, "arith.remsi", "arith.remf");
+    return;
+  }
+
+  const std::string type = dtype == DataType::INDEX ? "index" : GetTypeString(dtype);
+  const std::string lhs = EmitArithOperand(op->left_, type);
+  const std::string rhs = EmitArithOperand(op->right_, type);
+  const std::string remainder = EmitArithBinaryOp("arith.remsi", lhs, rhs, type);
+
+  // FloorMod and the arithmetic simplifier use the divisor's sign. remsi
+  // instead follows the dividend; for example (1 - 48) % 24 must be 1, not
+  // -23. Correct the nonzero remainder when the signs differ. Constant
+  // divisors, as used by core ownership, need only one sign comparison.
+  const std::string zero = GetOrEmitConstant(static_cast<int64_t>(0), dtype);
+  std::string needs_correction;
+  if (auto divisor = As<ir::ConstInt>(op->right_); divisor && divisor->value_ != 0) {
+    needs_correction = EmitArithCmpi(divisor->value_ > 0 ? "slt" : "sgt", remainder, zero, type);
+  } else {
+    const std::string remainder_negative = EmitArithCmpi("slt", remainder, zero, type);
+    const std::string divisor_negative = EmitArithCmpi("slt", rhs, zero, type);
+    const std::string signs_differ =
+        EmitArithBinaryOp("arith.xori", remainder_negative, divisor_negative, "i1");
+    const std::string nonzero = EmitArithCmpi("ne", remainder, zero, type);
+    needs_correction = EmitArithBinaryOp("arith.andi", nonzero, signs_differ, "i1");
+  }
+  const std::string corrected = EmitArithBinaryOp("arith.addi", remainder, rhs, type);
+  const std::string result = NewTemp();
+  Emit(result + " = arith.select " + needs_correction + ", " + corrected + ", " + remainder +
+       " : " + type);
+  fs_.current_expr_value = result;
 }
 
 // ========================================================================

@@ -31,6 +31,32 @@ TypePtr DeduceUnknownType(const std::vector<ExprPtr>& args,
   return GetUnknownType();
 }
 
+// 临时本地信号接口：单写者 Set / 非消费式 Ge 等待，复用现有通信指令。
+// 限定 INT32，避免把旧 INT64 进度静默截断；业务数据发布仍由调用者显式完成。
+TypePtr DeduceLocalSignalType(const std::vector<ExprPtr>& args,
+                             const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  CHECK(args.size() == 3) << "local signal op requires (signal, offsets, value)";
+  CHECK(kwargs.empty()) << "local signal op takes no attributes";
+  for (const auto& arg : args) {
+    CHECK(arg) << "local signal operands must not be null";
+  }
+  auto tensor = As<TensorType>(args[0]->GetType());
+  CHECK(tensor && !IsA<DistributedTensorType>(args[0]->GetType()))
+      << "local signal requires an ordinary GM Tensor";
+  CHECK(tensor->dtype_ == DataType::INT32 && tensor->shape_.size() == 1)
+      << "local signal requires a one-dimensional INT32 Tensor";
+  auto offsets = As<MakeTuple>(args[1]);
+  CHECK(offsets && offsets->elements_.size() == 1) << "local signal requires one offset";
+  auto offset = As<ScalarType>(offsets->elements_[0]->GetType());
+  CHECK(offset && (offset->dtype_ == DataType::INDEX || offset->dtype_ == DataType::INT32 ||
+                   offset->dtype_ == DataType::INT64))
+      << "local signal offset must be INDEX, INT32 or INT64";
+  auto value = As<ScalarType>(args[2]->GetType());
+  CHECK(value && value->dtype_ == DataType::INT32)
+      << "local signal value/expected must be INT32; cast only after checking the protocol range";
+  return GetUnknownType();
+}
+
 }  // namespace
 
 // ============================================================================
@@ -90,6 +116,27 @@ REGISTER_OP("system.fence")
     .set_op_category("SyncOp")
     .no_argument()
     .f_deduce_type(DeduceUnknownType);
+
+REGISTER_OP("system.signal_notify")
+    .set_description("Temporary local GM signal Set; single writer per cache line; signal-only publication")
+    .set_op_category("SyncOp")
+    .add_argument("signal", "Ordinary one-dimensional INT32 GM signal Tensor")
+    .add_argument("offsets", "One scalar offset")
+    .add_argument("value", "INT32 progress value")
+    .set_no_duplicate()
+    .no_memory_spec()
+    .set_arg_effect(0, ArgEffect::Write)
+    .f_deduce_type(DeduceLocalSignalType);
+
+REGISTER_OP("system.signal_wait")
+    .set_description("Temporary local GM signal wait until >= expected; does not consume the signal")
+    .set_op_category("SyncOp")
+    .add_argument("signal", "Ordinary one-dimensional INT32 GM signal Tensor")
+    .add_argument("offsets", "One scalar offset")
+    .add_argument("expected", "INT32 progress threshold")
+    .no_memory_spec()
+    .no_arg_writes()
+    .f_deduce_type(DeduceLocalSignalType);
 
 // Register system.cacheinvalid (Cache Maintenance Operation).
 // Two forms selected by arg count:

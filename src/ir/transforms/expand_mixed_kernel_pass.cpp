@@ -2517,9 +2517,44 @@ class PeerFuncRewriter : public IRMutator {
   std::unordered_map<std::string, std::string> rename_map_;
 };
 
+using GroupTensorAliases = std::unordered_map<const Var*, VarPtr>;
+
+// A member's InOut result is a new SSA value for the same GM parameter. Resolve
+// those aliases before cloning onto the shared ABI; copying the caller-local
+// result into the member body would leave an unbound variable in that function.
+// Index the Group once for all member arguments, using the shared lineage rules
+// (including tuple returns and Submit), rather than rescanning it per argument.
+GroupTensorAliases CollectGroupTensorAliases(const FunctionPtr& group, const ProgramPtr& program,
+                                             const std::vector<WrapperCallInfo>& members) {
+  std::unordered_set<const Var*> seen;
+  for (const auto& param : group->params_) seen.insert(param.get());
+  std::vector<VarPtr> aliases;
+  for (const auto& member : members) {
+    for (const auto& arg : member.inner_call->args_) {
+      auto var = AsVarLike(arg);
+      if (var && AsTensorTypeLike(var->GetType()) && seen.insert(var.get()).second) {
+        aliases.push_back(var);
+      }
+    }
+  }
+  if (aliases.empty()) return {};
+  const auto indices = return_lineage::TraceToParamIndicesForOutlining(aliases, group->body_, group->params_,
+                                                                       program, /*trace_if_merges=*/false);
+  GroupTensorAliases result;
+  for (size_t i = 0; i < aliases.size(); ++i) {
+    CHECK_SPAN(indices[i].has_value(), aliases[i]->span_)
+        << "Mixed Group '" << group->name_ << "' member tensor argument '" << aliases[i]->name_hint_
+        << "' is not a whole-parameter writeback alias. Bind tensor views or new buffers before entering "
+           "the Group and pass them as explicit Group parameters.";
+    result.emplace(aliases[i].get(), group->params_[indices[i].value()]);
+  }
+  return result;
+}
+
 FunctionPtr BuildGroupAbiAdapter(const FunctionPtr& group, const WrapperCallInfo& member,
                                  const std::string& adapter_name,
-                                 const std::unordered_map<std::string, std::string>& peer_renames) {
+                                 const std::unordered_map<std::string, std::string>& peer_renames,
+                                 const GroupTensorAliases& tensor_aliases) {
   const auto& callee = member.inner_callee;
   const auto& call = member.inner_call;
   INTERNAL_CHECK(group != nullptr && callee != nullptr && call != nullptr)
@@ -2535,6 +2570,9 @@ FunctionPtr BuildGroupAbiAdapter(const FunctionPtr& group, const WrapperCallInfo
     auto fresh = std::make_shared<Var>(param->name_hint_, param->GetType(), param->span_);
     adapter_params.push_back(fresh);
     group_to_adapter.emplace(param.get(), fresh);
+  }
+  for (const auto& [alias, param] : tensor_aliases) {
+    group_to_adapter.emplace(alias, group_to_adapter.at(param.get()));
   }
 
   // Bind every original member parameter to the corresponding Group call-site
@@ -2559,10 +2597,13 @@ FunctionPtr BuildGroupAbiAdapter(const FunctionPtr& group, const WrapperCallInfo
 class GroupMemberCallRewriter : public IRMutator {
  public:
   GroupMemberCallRewriter(std::unordered_map<std::string, std::string> callee_renames,
-                          std::vector<VarPtr> canonical_args)
+                          std::vector<VarPtr> canonical_args, const GroupTensorAliases& tensor_aliases)
       : callee_renames_(std::move(callee_renames)), canonical_args_(std::move(canonical_args)) {
     for (size_t i = 0; i < canonical_args_.size(); ++i) {
       canonical_arg_indices_.emplace(canonical_args_[i].get(), static_cast<int32_t>(i));
+    }
+    for (const auto& [alias, param] : tensor_aliases) {
+      canonical_arg_indices_.emplace(alias, canonical_arg_indices_.at(param.get()));
     }
   }
 
@@ -2702,8 +2743,9 @@ NormalizedGroups NormalizeHandWrittenGroupAbis(const ProgramPtr& program,
     const std::unordered_map<std::string, std::string> peer_renames = {{aic.inner_callee->name_, aic_name},
                                                                        {aiv.inner_callee->name_, aiv_name}};
 
-    auto normalized_aic = BuildGroupAbiAdapter(group, aic, aic_name, peer_renames);
-    auto normalized_aiv = BuildGroupAbiAdapter(group, aiv, aiv_name, peer_renames);
+    const auto tensor_aliases = CollectGroupTensorAliases(group, program, {aic, aiv});
+    auto normalized_aic = BuildGroupAbiAdapter(group, aic, aic_name, peer_renames, tensor_aliases);
+    auto normalized_aiv = BuildGroupAbiAdapter(group, aiv, aiv_name, peer_renames, tensor_aliases);
     if (needs_dual_aiv_dispatch) normalized_aiv = WithDualAivDispatch(normalized_aiv);
     if (exclusive_pair) {
       replacements[aic_name] = normalized_aic;
@@ -2716,8 +2758,8 @@ NormalizedGroups NormalizeHandWrittenGroupAbis(const ProgramPtr& program,
     std::unordered_map<std::string, std::string> callee_renames = {{aic.inner_callee->name_, aic_name},
                                                                    {aiv.inner_callee->name_, aiv_name}};
     auto mutable_group = MutableCopy(group);
-    mutable_group->body_ =
-        GroupMemberCallRewriter(std::move(callee_renames), group->params_).VisitStmt(group->body_);
+    mutable_group->body_ = GroupMemberCallRewriter(std::move(callee_renames), group->params_, tensor_aliases)
+                               .VisitStmt(group->body_);
     replacements[group->name_] = mutable_group;
   }
 

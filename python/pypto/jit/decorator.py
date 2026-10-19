@@ -1444,8 +1444,10 @@ def _extract_local_tensor_metas(
     A ``pl.create_tensor`` / ``pld.window`` dim that no static rule resolves —
     a runtime extent such as ``pld.world_size()``, ``pl.tensor.read(cfg, [0])``,
     or arithmetic over a ``DynDim`` — becomes a synthesized ``DynDim`` (see
-    :func:`_synthesized_dyn_dim`) rather than voiding the whole meta. Everything
-    else not statically resolvable is still skipped silently, and the clear
+    :func:`_synthesized_dyn_dim`) rather than voiding the whole meta. Reshape
+    dimensions derived solely from tensor dimensions and integer arithmetic
+    use the same descriptor-bound symbols; their expressions remain in IR.
+    Other unresolved reshape dimensions are still skipped, and the clear
     ``ValueError`` in ``Specializer._build_params`` fires for that variable.
     When ``stop_at_dep`` is provided, extraction stops
     immediately before the first source-ordered call to that dependency. This
@@ -1506,8 +1508,8 @@ def _extract_local_tensor_metas(
             rhs = _resolve_shape_elt(elt.right)
             # Arithmetic over DynDim is not statically resolvable here; we
             # only fold int·int. Anything else (DynDim+int, DynDim*DynDim)
-            # is left unresolved — the parent-dim fallback in _slice_meta /
-            # the silent skip in _create_tensor_meta is the right behaviour.
+            # is left unresolved — the caller can use a parent bound or a
+            # synthesized descriptor dimension, depending on the operation.
             if isinstance(lhs, int) and isinstance(rhs, int):
                 return _fold_int_arith(elt.op, lhs, rhs)
             return None
@@ -1596,11 +1598,18 @@ def _extract_local_tensor_metas(
         )
         if shape_node is None:
             return None
-        # Strict on purpose (no ``target``): a reshape's dims are constrained by
-        # the source's element count, which a freshly invented symbol cannot
-        # express. ``pl.slice`` below is strict for the mirror reason — it
-        # already has a better answer, the parent dim's static bound.
         shape = _resolve_shape(shape_node)
+        if (
+            shape is None
+            and isinstance(shape_node, ast.List)
+            and all(_is_dimension_arithmetic(elt) for elt in shape_node.elts)
+        ):
+            # Rank/dtype discovery need not fold a descriptor-derived extent.
+            # Keep its arithmetic in the reshape IR, and let dependency
+            # parameters bind the resulting dimension from the view's actual
+            # descriptor. This does not assert an element-count equality or
+            # replace a runtime dimension by the placeholder's static bound.
+            shape = _resolve_shape(shape_node, target)
         if shape is None:
             return None
         # A reshape re-groups the dims a layout describes, so the source layout
@@ -1610,6 +1619,18 @@ def _extract_local_tensor_metas(
         if src_meta.layout not in (None, _ir.TensorLayout.ND):
             return None
         return TensorMeta(shape=shape, dtype=src_meta.dtype)
+
+    def _is_dimension_arithmetic(elt: ast.expr) -> bool:
+        """Accept dimension-derived arithmetic, not arbitrary runtime values."""
+        if _resolve_shape_elt(elt) is not None:
+            return True
+        if isinstance(elt, ast.BinOp) and isinstance(elt.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv)):
+            if isinstance(elt.op, ast.FloorDiv) and _resolve_shape_elt(elt.right) == 0:
+                return False
+            return _is_dimension_arithmetic(elt.left) and _is_dimension_arithmetic(elt.right)
+        if isinstance(elt, ast.UnaryOp) and isinstance(elt.op, (ast.UAdd, ast.USub)):
+            return _is_dimension_arithmetic(elt.operand)
+        return False
 
     def _slice_meta(call: ast.Call, target: str | None = None) -> TensorMeta | None:
         # pl.slice(tensor, shape, offset, ...) — shape is positional index 1 or kw `shape=`.
