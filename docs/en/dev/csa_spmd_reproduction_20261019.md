@@ -48,3 +48,21 @@ Related upstream records include PyPTO #3014, #3015, #3016, #3017, #3020,
 #3026, #3027, #3028 and #3037. Publishing this reproduction branch neither
 closes those issues nor creates an upstream pull request.
 
+## Integration of upstream fixes (2026-10-21)
+
+The shared CSA toolchain retains the kernel integration branch's runtime ABI.
+When adopting the general shared-destination fix from upstream, remove the
+older move-specific reshape emitter: destination selection now happens once
+in `PrepareTileDestination`. Preserve upstream's dynamic representation of
+the all-zero replay sentinel; it is not a general relaxation for partial-zero
+valid shapes.
+
+Constant scalar fill loops remain scalar when converting only some of a GM
+parameter's writes to DMA would create a mixed-store function. This fallback
+uses the same alias-aware access analysis as the final coherence diagnostic.
+It does not disable rejection of mixed DMA/scalar stores in the source.
+
+Complete Buffer IR lowering is absent from this kernel branch. The imported
+recompile/Buffer-stage test is capability-skipped until `lower_tile_to_buffer`
+exists; Group output and shared-storage tests run independently of that feature.
+

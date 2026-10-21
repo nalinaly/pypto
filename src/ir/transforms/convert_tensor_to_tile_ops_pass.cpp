@@ -2420,16 +2420,20 @@ YieldAliasInfo AnalyzeStmtAliases(const StmtPtr& stmt, AliasOriginMap& origin_ma
   return {};
 }
 
-/// Upgrade In params to Out/InOut based on tile.store/tensor.write usage analysis.
-void UpgradeWrittenTensorParamDirections(const std::vector<StmtPtr>& stmts, const std::vector<VarPtr>& params,
-                                         std::vector<ParamDirection>& param_directions) {
-  std::vector<bool> has_read(params.size(), false);
-  std::vector<bool> has_write(params.size(), false);
-  std::vector<std::optional<Span>> dma_store_spans(params.size());
-  std::vector<std::optional<Span>> scalar_store_spans(params.size());
-  AliasOriginMap origin_map;
+struct TensorParamAccess {
+  std::vector<bool> has_read;
+  std::vector<bool> has_write;
+  std::vector<std::optional<Span>> dma_store_spans;
+  std::vector<std::optional<Span>> scalar_store_spans;
+};
 
-  for (size_t i = 0; i < params.size() && i < param_directions.size(); ++i) {
+TensorParamAccess AnalyzeTensorParamAccess(const std::vector<StmtPtr>& stmts,
+                                          const std::vector<VarPtr>& params) {
+  TensorParamAccess access{std::vector<bool>(params.size(), false), std::vector<bool>(params.size(), false),
+                          std::vector<std::optional<Span>>(params.size()),
+                          std::vector<std::optional<Span>>(params.size())};
+  AliasOriginMap origin_map;
+  for (size_t i = 0; i < params.size(); ++i) {
     // AsTensorTypeLike also seeds DistributedTensorType window params, so a
     // pld.tile.remote_store into such a param is attributed as a write below.
     if (!AsTensorTypeLike(params[i]->GetType())) {
@@ -2438,12 +2442,36 @@ void UpgradeWrittenTensorParamDirections(const std::vector<StmtPtr>& stmts, cons
     origin_map[params[i].get()] = ParamOrigins{i};
   }
 
-  auto analysis_map = origin_map;
-  AnalyzeStmtSequenceAliases(stmts, analysis_map, has_read, has_write, dma_store_spans, scalar_store_spans);
+  AnalyzeStmtSequenceAliases(stmts, origin_map, access.has_read, access.has_write, access.dma_store_spans,
+                             access.scalar_store_spans);
+  return access;
+}
+
+StmtPtr CanonicalizeConstantScalarFills(const StmtPtr& body, const std::vector<VarPtr>& params) {
+  ConstantScalarFillLoopCanonicalizer canonicalizer;
+  auto rewritten = canonicalizer.VisitStmt(body);
+  if (rewritten == body) return body;
+  const auto access = AnalyzeTensorParamAccess(FlattenToStmts(rewritten), params);
+  for (size_t i = 0; i < params.size(); ++i) {
+    if (access.dma_store_spans[i] && access.scalar_store_spans[i]) {
+      // A partial rewrite must not introduce a DMA/D-cache mixture into a
+      // previously all-scalar metadata producer. Conservatively keep this
+      // function's original loops; the normal post-conversion check below
+      // still rejects any mixture already authored in the input program.
+      return body;
+    }
+  }
+  return rewritten;
+}
+
+/// Upgrade In params to Out/InOut based on tile.store/tensor.write usage analysis.
+void UpgradeWrittenTensorParamDirections(const std::vector<StmtPtr>& stmts, const std::vector<VarPtr>& params,
+                                         std::vector<ParamDirection>& param_directions) {
+  const auto access = AnalyzeTensorParamAccess(stmts, params);
 
   for (size_t i = 0; i < params.size() && i < param_directions.size(); ++i) {
-    if (dma_store_spans[i].has_value() && scalar_store_spans[i].has_value()) {
-      CHECK_SPAN(false, scalar_store_spans[i].value_or(Span::unknown()))
+    if (access.dma_store_spans[i].has_value() && access.scalar_store_spans[i].has_value()) {
+      CHECK_SPAN(false, access.scalar_store_spans[i].value_or(Span::unknown()))
           << "GM tensor '" << params[i]->name_hint_
           << "' mixes MTE3 and scalar stores in one InCore function. tile.store/tensor.assemble "
              "uses the MTE3 path while tensor.write uses the scalar D-cache path; PyPTO cannot "
@@ -2451,10 +2479,10 @@ void UpgradeWrittenTensorParamDirections(const std::vector<StmtPtr>& stmts, cons
              "one UB tile (use tile.write, then one tile.store), or use tensor.write for every GM "
              "element written to this tensor.";
     }
-    if (param_directions[i] != ParamDirection::In || !has_write[i]) {
+    if (param_directions[i] != ParamDirection::In || !access.has_write[i]) {
       continue;
     }
-    param_directions[i] = has_read[i] ? ParamDirection::InOut : ParamDirection::Out;
+    param_directions[i] = access.has_read[i] ? ParamDirection::InOut : ParamDirection::Out;
   }
 }
 
@@ -2689,8 +2717,7 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
   const auto& span = func->span_;
 
   auto staged_body = CanonicalizeFullTensorScalarUpdates(func->body_, func->params_);
-  ConstantScalarFillLoopCanonicalizer scalar_fill_canonicalizer;
-  auto canonical_body = scalar_fill_canonicalizer.VisitStmt(staged_body);
+  auto canonical_body = CanonicalizeConstantScalarFills(staged_body, func->params_);
 
   // Save every logical return before lowering can change its storage identity.
   // In particular, tensor.create is otherwise promoted to tile.create, which

@@ -4348,6 +4348,30 @@ class TestGmLocalTensorConversion:
         assert len(_find_calls_to(kernel, "tile.reshape")) == 2
         assert _find_first_call_to(kernel, "tensor.write") is None
 
+    def test_partial_scalar_fill_rewrite_keeps_metadata_on_one_store_channel(self):
+        """A constant fill must not turn legal scalar metadata writes into mixed stores."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def metadata(
+                self,
+                dst: pl.InOut[pl.Tensor[[64], pl.INT32]],
+                value: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[64], pl.INT32]:
+                pl.tensor.write(dst, [0], value)
+                for i in pl.range(32):
+                    pl.tensor.write(dst, [i + 32], pl.const(0, pl.INT32))
+                alias = pl.tensor.view(dst, [64])
+                pl.tensor.write(alias, [33], value)
+                return dst
+
+        after = passes.convert_tensor_to_tile_ops()(Before)
+        kernel = _require_function(after, "metadata")
+        assert len(_find_calls_to(kernel, "tensor.write")) == 3
+        assert _find_first_call_to(kernel, "tile.store") is None
+        assert _find_first_call_to(kernel, "tile.full") is None
+
     def test_unaligned_constant_scalar_fill_loop_still_rejected(self):
         """A constant fill smaller than one MTE3 row stays on the scalar path."""
 

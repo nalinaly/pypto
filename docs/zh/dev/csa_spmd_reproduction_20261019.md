@@ -41,3 +41,18 @@
 问题记录包括 PyPTO #3014、#3015、#3016、#3017、#3020、#3026、#3027、
 #3028、#3037。复现分支的发布不会自动关闭这些上游 issue，也不创建上游 PR。
 
+## 官方修复接入（2026-10-21）
+
+公共 CSA 工具链继续保留 kernel 调试分支的运行时 ABI。
+接入上游通用共享目的视图修复后，删除旧的 move 专用 reshape 生成逻辑，
+由 `PrepareTileDestination` 统一选择一次目标。保留全零 replay sentinel
+的动态有效范围表达；此规则不推广到部分维度为零的 valid shape。
+
+如果只将某个 GM 参数的部分 Scalar 写循环改成 DMA 会造成混写，
+则保留该函数原有的 Scalar 循环。判断复用最终一致性检查所使用的别名分析，
+不关闭对源程序已有 DMA/Scalar 混写的拒绝。
+
+kernel 调试分支尚无完整 Buffer IR lowering。导入的重编译/Buffer 阶段测试
+在 `lower_tile_to_buffer` 能力缺失时明确跳过；Group 输出与共享存储测试
+独立执行，不把该能力缺口计为回归通过。
+

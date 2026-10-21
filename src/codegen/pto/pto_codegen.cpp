@@ -2831,6 +2831,14 @@ std::string PTOCodegen::GetViewTileBufTypeStringFromTileType(
   // carrier coordinates PTOAS expects on that tile_buf.
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile_type);
   const auto& valid = view.valid_shape;
+  // Preserve upstream's all-zero lane-1 replay sentinel as dynamic: pto-isa
+  // has no GetValidRow/GetValidCol overload for a statically zero extent.
+  // Do not generalize this to a lone zero, whose runtime extent has no
+  // initialization contract (gh#2879).
+  const bool zero_sentinel = !valid.empty() && std::all_of(valid.begin(), valid.end(), [](const auto& dim) {
+    auto value = As<ir::ConstInt>(dim);
+    return value && value->value_ == 0;
+  });
   const bool packed_fp4_vec = tile_type->dtype_ == DataType::FP4 && *memory_space == ir::MemorySpace::Vec;
   const size_t packed_dim = view.blayout == ir::TileLayout::col_major ? 0 : 1;
   auto physical_valid = [&](int64_t value, size_t dim) {
@@ -2842,7 +2850,7 @@ std::string PTOCodegen::GetViewTileBufTypeStringFromTileType(
     }
     return value;
   };
-  if (valid.size() == 1) {
+  if (!zero_sentinel && valid.size() == 1) {
     // Match ComputeAllocTileFields / ExtractTileTypeInfo: a 1-D valid_shape
     // maps to rows=1, cols=shape[0]. Without this a 1-D reshape view keeps the
     // dynamic zero-valid extent and its consumers become silent no-ops.
@@ -2852,7 +2860,7 @@ std::string PTOCodegen::GetViewTileBufTypeStringFromTileType(
       c.v_row_dynamic = false;
       c.v_col_dynamic = false;
     }
-  } else if (valid.size() >= 2) {
+  } else if (!zero_sentinel && valid.size() >= 2) {
     auto v_row = As<ir::ConstInt>(valid[0]);
     auto v_col = As<ir::ConstInt>(valid[1]);
     if (v_row && v_col) {
