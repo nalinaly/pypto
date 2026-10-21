@@ -411,22 +411,9 @@ std::string EnsureTileViewSsa(const ir::ExprPtr& expr,
                               const std::shared_ptr<const ir::TileType>& view_tile_type,
                               codegen::PTOCodegen& codegen, const std::string& temp_prefix) {
   INTERNAL_CHECK(view_tile_type) << "Internal error: EnsureTileViewSsa requires a TileType view";
-  const std::string view_type = codegen.GetViewTileBufTypeStringFromTileType(view_tile_type);
-  std::string current_ssa = codegen.GetExprAsCode(expr);
-  const std::string current_type = codegen.GetExprTypeAnnotation(expr);
-  if (!current_type.empty() && current_type == view_type) {
-    return current_ssa;
-  }
-  std::string view_ssa = codegen.NewNamedTemp(temp_prefix);
-  codegen.RegisterTileBufType(view_ssa, view_type);
-  codegen.RegisterTileViewName(view_ssa);
-  std::ostringstream oss;
-  oss << view_ssa << " = pto.treshape " << current_ssa;
-  if (!current_type.empty()) {
-    oss << " : " << current_type << " -> " << view_type;
-  }
-  codegen.Emit(oss.str());
-  return view_ssa;
+  const std::string source = codegen.GetExprAsCode(expr);
+  const std::string source_type = codegen.GetExprTypeAnnotation(expr);
+  return codegen.EnsureTileView(source, source_type, view_tile_type, temp_prefix);
 }
 
 std::string EnsureStaticViewTileSsa(const ir::ExprPtr& expr, codegen::PTOCodegen& codegen,
