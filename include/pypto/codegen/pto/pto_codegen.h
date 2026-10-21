@@ -673,9 +673,9 @@ class PTOCodegen : public CodegenBase {
   std::string EmitCommRemoteOffsetInline(const std::string& ctx_ssa, const std::string& peer_ssa,
                                          const DataType& dtype);
 
-  /// Increase/decrease the current indentation level (used by op codegen helpers that emit scf.for blocks)
-  void IncreaseIndent() { indent_level_++; }
-  void DecreaseIndent() { indent_level_--; }
+  /// Enter/leave an emitted MLIR region, tracking indentation and allocation dominance.
+  void IncreaseIndent();
+  void DecreaseIndent();
 
   /**
    * @brief Return the GM slot buffer SSA region for one frontend pipe.
@@ -861,15 +861,20 @@ class PTOCodegen : public CodegenBase {
                                          bool use_physical_valid_shape = false);
 
   /**
-   * @brief The tile_buf handle already bound to the buffer `memref` denotes.
+   * @brief The tile_buf handle already bound to the buffer `tile_type` denotes.
    *
    * Only meaningful under the PTOAS memory planner (`emit_tile_addr_ == false`),
    * where variables denoting the same buffer must share one handle because
    * there is no baked `addr` to alias through. Returns "" when addresses are
-   * baked, when `memref` is null, or when no handle is bound yet.
+   * baked, when `tile_type` has no MemRef, or when no handle is bound yet. Mixed
+   * view types can reuse a declared tile handle only when its declaration
+   * dominates the current region, both branch yields already share it in the
+   * result's known memory space, and its actual SSA type matches `expected_type`.
    */
-  [[nodiscard]] std::string TryGetSharedTileBufHandle(const ir::MemRefPtr& memref,
-                                                      const std::string& required_type) const;
+  [[nodiscard]] std::string TryGetSharedTileBufHandle(const std::shared_ptr<const ir::TileType>& tile_type,
+                                                      const std::string& expected_type,
+                                                      const ir::VarPtr& then_value,
+                                                      const ir::VarPtr& else_value) const;
 
   /**
    * @brief Declare `ssa_name`'s `pto.alloc_tile` in the function head.
@@ -1017,13 +1022,22 @@ class PTOCodegen : public CodegenBase {
     /// a `[1, N]` row-major op result and its `[N, 1]` col-major reshape view,
     /// which occupy the same bytes. Their shared handle carries exactly one type
     /// (differently-typed reads become `pto.treshape` views of it), so it must
-    /// never be re-typed to suit another var. `TryGetSharedTileBufHandle` accepts
-    /// these identities only when an already-emitted handle has the exact
-    /// requested tile_buf type.
+    /// never be re-typed to suit another var. `TryGetSharedTileBufHandle` only
+    /// accepts these identities for a dominating tile handle shared by both
+    /// branch yields in the result's known memory space, whose declared type
+    /// matches the requested type.
     std::set<std::string> memref_identity_mixed_types;
     /// alloc_tile SSA handles already emitted — dedups the alloc when several
     /// vars share one handle (PTOAS in-place aliasing).
     std::set<std::string> emitted_tile_alloc_names;
+    /// Declaration region for each emitted/staged alloc. Region 0 is the
+    /// function body/head; every SCF region gets a unique ID, including sibling
+    /// branches at the same nesting depth. Only active ancestor regions dominate
+    /// the current emission point. Keep this separate from function-wide dedup.
+    std::map<std::string, size_t> tile_alloc_scope;
+    std::vector<size_t> tile_alloc_scope_stack{0};
+    std::set<size_t> active_tile_alloc_scopes{0};
+    size_t next_tile_alloc_scope = 0;
 
     ir::FunctionPtr current_function;
     ir::VarPtr current_result_var;
@@ -1102,6 +1116,10 @@ class PTOCodegen : public CodegenBase {
       memref_identity_type.clear();
       memref_identity_mixed_types.clear();
       emitted_tile_alloc_names.clear();
+      tile_alloc_scope.clear();
+      tile_alloc_scope_stack = {0};
+      active_tile_alloc_scopes = {0};
+      next_tile_alloc_scope = 0;
       multi_buffer_regions.clear();
       multi_buffer_region_order.clear();
 

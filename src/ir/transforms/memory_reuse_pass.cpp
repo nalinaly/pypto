@@ -96,6 +96,12 @@ bool SamePhysicalWindow(const MemRefPtr& lhs, const MemRefPtr& rhs) {
   return !lhs_has_slot || structural_equal(*lhs->slot_index_, *rhs->slot_index_);
 }
 
+// Equal unresolved annotations cannot prove that two tiles occupy the same
+// hardware memory space, even when their MemRef windows match.
+bool SameKnownTileMemorySpace(const TileTypePtr& lhs, const TileTypePtr& rhs) {
+  return lhs && rhs && lhs->GetMemorySpace().has_value() && lhs->GetMemorySpace() == rhs->GetMemorySpace();
+}
+
 // ============================================================================
 // Top-down target retargeting
 //
@@ -4303,7 +4309,8 @@ class YieldFixupMutator : public StorageBoundaryMutator {
     return VisitStmt(body);
   }
 
-  /// `fixup_if_stmts=false` reconciles only ForStmt carries. Used under
+  /// `fixup_if_stmts=false` reconciles ForStmt carries and preserves already
+  /// shared tile windows across if results, without inserting branch copies. Used under
   /// memory_planner=PtoAS, where PTO codegen already re-points a branch-local
   /// producer at the phi handle (#1956/#1985) and copies in anything it declines
   /// to re-point — a copy-free path that an IR-level `tile.move` would displace
@@ -4313,25 +4320,70 @@ class YieldFixupMutator : public StorageBoundaryMutator {
       : fixup_if_stmts_(fixup_if_stmts), canonical_branch_storage_(canonical_branch_storage) {}
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
-    auto result = As<AssignStmt>(IRMutator::VisitStmt_(op));
-    INTERNAL_CHECK_SPAN(result != nullptr, op->span_) << "Assignment mutation must preserve AssignStmt";
-    auto source = AsVarLike(result->value_);
-    auto source_tile = source ? GetTileTypeWithMemRef(source->GetType()) : nullptr;
-    auto target_tile = GetTileTypeWithMemRef(result->var_->GetType());
-    if (!source_tile || !target_tile ||
-        SamePhysicalWindow(GetDefinedMemRef(source_tile), GetDefinedMemRef(target_tile))) {
+    if (fixup_if_stmts_) {
+      auto result = As<AssignStmt>(IRMutator::VisitStmt_(op));
+      INTERNAL_CHECK_SPAN(result != nullptr, op->span_) << "Assignment mutation must preserve AssignStmt";
+      auto source = AsVarLike(result->value_);
+      auto source_tile = source ? GetTileTypeWithMemRef(source->GetType()) : nullptr;
+      auto target_tile = GetTileTypeWithMemRef(result->var_->GetType());
+      if (!source_tile || !target_tile ||
+          SamePhysicalWindow(GetDefinedMemRef(source_tile), GetDefinedMemRef(target_tile))) {
+        return result;
+      }
+      // An inner branch may have just changed its phi's storage. Propagate that
+      // decision through identity aliases before an enclosing boundary chooses
+      // its destination, rather than manufacturing copies into stale phi buffers
+      // and repairing the alias only after all boundaries have been processed.
+      auto type = CloneTypeWithMemRefAndRemapExprs(
+          result->var_->GetType(), GetDefinedMemRef(source_tile),
+          [this](const ExprPtr& expr) { return VisitExpr(expr); }, source_tile->GetMemorySpace());
+      auto target = std::make_shared<Var>(result->var_->name_hint_, type, result->var_->span_);
+      var_remap_[op->var_.get()] = target;
+      return std::make_shared<AssignStmt>(target, source, result->span_);
+    }
+    auto result = IRMutator::VisitStmt_(op);
+
+    // Follow semantic aliases of a repaired phi. Registered views re-derive
+    // their relative window; writeback results keep their input's whole window.
+    // A new SSA input alone does not refresh either result's stored MemRef.
+    VarPtr input = AsVarLike(op->value_);
+    bool is_aliasing_view = false;
+    if (auto call = As<Call>(op->value_); call && call->op_) {
+      is_aliasing_view = op_predicates::IsBufferAliasingViewOp(call->op_->name_);
+      auto index = op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size());
+      if (!index && !call->args_.empty() && is_aliasing_view) {
+        index = 0;
+      }
+      if (index) input = AsVarLike(call->args_[*index]);
+    }
+    if (!input) return result;
+    auto new_input = AsVarLike(VisitExpr(input));
+    if (!new_input || repaired_tile_aliases_.count(new_input.get()) == 0) return result;
+    auto output_tile = GetTileTypeWithMemRef(op->var_->GetType());
+    auto input_tile = GetTileTypeWithMemRef(input->GetType());
+    auto new_input_tile = GetTileTypeWithMemRef(new_input->GetType());
+    if (!SameKnownTileMemorySpace(input_tile, output_tile) ||
+        !SameKnownTileMemorySpace(input_tile, new_input_tile) ||
+        SamePhysicalWindow(GetDefinedMemRef(input_tile), GetDefinedMemRef(new_input_tile))) {
       return result;
     }
-    // An inner branch may have just changed its phi's storage. Propagate that
-    // decision through identity aliases before an enclosing boundary chooses
-    // its destination, rather than manufacturing copies into stale phi buffers
-    // and repairing the alias only after all boundaries have been processed.
-    auto type = CloneTypeWithMemRefAndRemapExprs(
-        result->var_->GetType(), GetDefinedMemRef(source_tile),
-        [this](const ExprPtr& expr) { return VisitExpr(expr); }, source_tile->GetMemorySpace());
-    auto target = std::make_shared<Var>(result->var_->name_hint_, type, result->var_->span_);
-    var_remap_[op->var_.get()] = target;
-    return std::make_shared<AssignStmt>(target, source, result->span_);
+    auto assignment = As<AssignStmt>(result);
+    auto target = GetDefinedMemRef(new_input_tile);
+    if (is_aliasing_view) {
+      // The view's old absolute offset belongs to the abandoned phi allocation.
+      // Recompute only its relative offset from the rewritten call, retaining its
+      // own extent and inheriting the repaired source's allocation/slot identity.
+      auto view_call = As<Call>(assignment->value_);
+      auto relative_offset = ComputeViewByteOffset(view_call, new_input_tile);
+      target = MakeAliasingMemRef(target, relative_offset, GetDefinedMemRef(output_tile)->size_, op->span_);
+    } else if (!SamePhysicalWindow(GetDefinedMemRef(output_tile), GetDefinedMemRef(input_tile))) {
+      return result;
+    }
+    auto new_type = CloneTypeWithMemRef(assignment->var_->GetType(), target);
+    auto new_var = std::make_shared<Var>(op->var_->name_hint_, new_type, op->var_->span_);
+    var_remap_[op->var_.get()] = new_var;
+    repaired_tile_aliases_.insert(new_var.get());
+    return std::make_shared<AssignStmt>(new_var, assignment->value_, assignment->span_);
   }
 
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
@@ -4478,14 +4530,15 @@ class YieldFixupMutator : public StorageBoundaryMutator {
 
       auto then_tile = then_var ? GetTileTypeWithMemRef(then_var->GetType()) : nullptr;
       auto else_tile = else_var ? GetTileTypeWithMemRef(else_var->GetType()) : nullptr;
+      auto rv_tile = As<TileType>(new_return_vars[i]->GetType());
       if (!then_tile && !else_tile) continue;
 
-      // PTOAS owns divergent branch storage, but an in-place operation in both
-      // arms already writes one physical window. Preserve that semantic alias
-      // on the phi instead of making codegen invent a second destination and
-      // copy into it (Mat->Mat is not even a legal instruction).
+      // PTOAS owns reconciliation of distinct branch buffers. Only propagate
+      // an existing alias here: both arms must denote the exact same byte window,
+      // including its extent and pipeline slot, in the result's known memory
+      // space. Keep the result's view metadata; no producer is retargeted.
       if (!fixup_if_stmts_ &&
-          (!then_tile || !else_tile ||
+          (!SameKnownTileMemorySpace(then_tile, else_tile) || !SameKnownTileMemorySpace(then_tile, rv_tile) ||
            !SamePhysicalWindow(GetDefinedMemRef(then_tile), GetDefinedMemRef(else_tile)))) {
         continue;
       }
@@ -4496,7 +4549,7 @@ class YieldFixupMutator : public StorageBoundaryMutator {
       auto target_memory = target_tile->GetMemorySpace();
 
       // Check else branch: if MemRef differs from target, insert tile.move
-      if (then_tile && else_tile) {
+      if (fixup_if_stmts_ && then_tile && else_tile) {
         auto else_memref = GetDefinedMemRef(else_tile);
         // Addresses, not allocations: an arm sitting on a sibling slot of the same
         // allocation still has to be copied into the phi's slot.
@@ -4516,16 +4569,19 @@ class YieldFixupMutator : public StorageBoundaryMutator {
       }
 
       // Patch return_var to share target MemRef
-      auto rv_tile = As<TileType>(new_return_vars[i]->GetType());
       if (rv_tile && rv_tile->memref_.has_value()) {
         auto rv_memref = GetDefinedMemRef(rv_tile);
         // Metadata only, so realign anything not provably already the target.
-        if (CompareBaseAddress(rv_memref, target_memref) != AddressRelation::kSame) {
+        const bool shares_target =
+            fixup_if_stmts_ ? CompareBaseAddress(rv_memref, target_memref) == AddressRelation::kSame
+                            : SamePhysicalWindow(rv_memref, target_memref);
+        if (!shares_target) {
           auto new_rv_type = CloneTypeWithMemRefAndRemapExprs(
               rv_tile, target_memref, [this](const ExprPtr& e) { return VisitExpr(e); }, target_memory);
           new_return_vars[i] =
               std::make_shared<Var>(new_return_vars[i]->name_hint_, new_rv_type, new_return_vars[i]->span_);
           var_remap_[if_stmt->return_vars_[i].get()] = new_return_vars[i];
+          if (!fixup_if_stmts_) repaired_tile_aliases_.insert(new_return_vars[i].get());
           body_changed = true;
         }
       }
@@ -4560,6 +4616,7 @@ class YieldFixupMutator : public StorageBoundaryMutator {
  private:
   bool fixup_if_stmts_ = true;
   bool canonical_branch_storage_ = false;
+  std::set<const Var*> repaired_tile_aliases_;
   StorageNameSupply names_;
 
   // The enabled pipeline establishes each phi's target before planning. Never
@@ -5535,8 +5592,9 @@ FunctionPtr TransformMaterializeSemanticAliases(const FunctionPtr& func) {
   // legacy PyPTO planner it stays where it is: Step 4 must run *after* reuse
   // decisions, which can themselves create fresh mismatches.
   //
-  // PTOAS needs only the ForStmt YieldFixup half: addr-less codegen already
-  // re-points a branch-local producer at the if-phi handle. DSA-RP instead
+  // PTOAS reconciles ForStmt carries and preserves existing same-window Mat
+  // if aliases. Addr-less codegen still handles distinct branch buffers by
+  // re-pointing a branch-local producer at the if-phi handle. DSA-RP instead
   // materializes both IfStmt and ForStmt fixups and repairs bare-Var identity
   // copies before lifetime analysis and placement.
   if (ctx != nullptr && ctx->GetEnableBufferIR()) {
