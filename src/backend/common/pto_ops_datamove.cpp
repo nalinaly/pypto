@@ -1031,6 +1031,17 @@ static void EmitTreshapeView(codegen::PTOCodegen& codegen, const ir::ExprPtr& sr
   codegen.Emit(oss.str());
 }
 
+// A fixed-address result declaration carries the view over inherited storage.
+// Without addresses, only the actual source handle can stand in for it: an old
+// MemRef representative may be stale after an if-phi rebind (upstream #3019).
+static bool CanReuseViewTarget(codegen::PTOCodegen& codegen, const std::string& source,
+                              const std::string& target, const std::string& result_type,
+                              bool result_has_memref) {
+  const auto existing_type = codegen.GetSSATileBufType(target);
+  return result_has_memref && !existing_type.empty() && existing_type == result_type &&
+         (codegen.EmitTileAddr() || source == target);
+}
+
 struct StaticValidTileView {
   std::string ssa;
   std::string type;
@@ -1470,9 +1481,8 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     // Without baked addresses, matching types alone do not establish aliasing:
     // an if-phi can bind the source to a different handle than its old MemRef
     // representative. Read the actual source unless it is already that handle.
-    auto existing_type = codegen.GetSSATileBufType(result_target);
-    if (result_has_memref && !existing_type.empty() && existing_type == result_type &&
-        (codegen.EmitTileAddr() || codegen.GetExprAsCode(op->args_[0]) == result_target)) {
+    if (CanReuseViewTarget(codegen, codegen.GetExprAsCode(op->args_[0]), result_target, result_type,
+                           result_has_memref)) {
       return std::string("");
     }
 
@@ -1544,9 +1554,8 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     }
     // The result's own alloc_tile already declares the transposed type: it IS
     // the view, so emit nothing. Mirrors tile.reshape's no-op check.
-    auto existing_type = codegen.GetSSATileBufType(result_target);
-    if (result_has_memref && !existing_type.empty() && existing_type == result_type &&
-        (codegen.EmitTileAddr() || codegen.GetExprAsCode(op->args_[0]) == result_target)) {
+    if (CanReuseViewTarget(codegen, codegen.GetExprAsCode(op->args_[0]), result_target, result_type,
+                           result_has_memref)) {
       return std::string("");
     }
 
