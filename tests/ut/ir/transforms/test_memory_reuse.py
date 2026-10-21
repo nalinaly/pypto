@@ -26,6 +26,8 @@ from pypto.backend import BackendType
 from pypto.ir.op import tile
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
+from .storage_test_utils import without_call_memrefs
+
 # Tile-producing reads from GM. Built through the getter so a renamed operator fails at import
 # rather than silently dropping out of the membership test below.
 _LOAD_LIKE_OPS = frozenset({ir.get_op("tile.load").name, ir.get_op("tile.read").name})

@@ -20,6 +20,9 @@ from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.backend.pto_backend import _run_ptoas
 from pypto.pypto_core import codegen
 
+# The kernel integration branch predates main's packed-FP4 dtype.
+_PACKED_FP4 = getattr(pl, "FP4E2M1X2", None)
+
 
 def _generate(
     program: ir.Program,
@@ -263,9 +266,10 @@ def _packed_fp4_destination_program(root_dtype, result_dtype) -> ir.Program:
 
 @pytest.mark.parametrize(
     ("root_dtype", "result_dtype"),
-    [(pl.UINT8, pl.FP4E2M1X2), (pl.FP4E2M1X2, pl.UINT8)],
+    [(pl.UINT8, _PACKED_FP4), (_PACKED_FP4, pl.UINT8)],
     ids=["byte-to-packed", "packed-to-byte"],
 )
+@pytest.mark.skipif(_PACKED_FP4 is None, reason="packed-FP4 dtype is not on the kernel debug branch")
 def test_shared_destination_rejects_packed_fp4_treshape(root_dtype, result_dtype):
     # Equal carrier sizes do not make packed-FP4 treshape legal in PTOAS.
     program = _packed_fp4_destination_program(root_dtype, result_dtype)
@@ -273,8 +277,9 @@ def test_shared_destination_rejects_packed_fp4_treshape(root_dtype, result_dtype
         _generate(program, backend_type=BackendType.Ascend950)
 
 
+@pytest.mark.skipif(_PACKED_FP4 is None, reason="packed-FP4 dtype is not on the kernel debug branch")
 def test_matching_packed_fp4_destination_does_not_create_a_view():
-    program = _packed_fp4_destination_program(pl.FP4E2M1X2, pl.FP4E2M1X2)
+    program = _packed_fp4_destination_program(_PACKED_FP4, _PACKED_FP4)
     mlir = _generate(program, backend_type=BackendType.Ascend950)
     assert "pto.treshape" not in mlir, mlir
     assert mlir.count("= pto.alloc_tile") == 1, mlir
@@ -286,9 +291,10 @@ def test_matching_packed_fp4_destination_does_not_create_a_view():
 
 @pytest.mark.parametrize(
     ("root_dtype", "result_dtype"),
-    [(pl.UINT8, pl.FP4E2M1X2), (pl.FP4E2M1X2, pl.UINT8)],
+    [(pl.UINT8, _PACKED_FP4), (_PACKED_FP4, pl.UINT8)],
     ids=["byte-to-packed", "packed-to-byte"],
 )
+@pytest.mark.skipif(_PACKED_FP4 is None, reason="packed-FP4 dtype is not on the kernel debug branch")
 def test_addressed_packed_fp4_destination_keeps_its_own_allocation(root_dtype, result_dtype):
     # PYPTO and DSA_RP provide an address, so each dtype gets an alloc at that
     # same address instead of a treshape of the other dtype's descriptor.

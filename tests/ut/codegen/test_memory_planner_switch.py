@@ -241,7 +241,7 @@ def _calls_with_loop_depth(program):
 
 
 def _run_pipeline(
-    memory_planner: passes.MemoryPlanner, program: ir.Program = ElementwiseAdd
+    memory_planner: passes.MemoryPlanner, program: ir.Program = ElementwiseAdd, *, enable_buffer_ir=False
 ) -> tuple[ir.Program, list[str]]:
     """Run the Default pipeline under a PassContext with the given planner.
 
@@ -249,7 +249,7 @@ def _run_pipeline(
     """
     backend.reset_for_testing()
     backend.set_backend_type(BackendType.Ascend910B)
-    with passes.PassContext([], memory_planner=memory_planner):
+    with passes.PassContext([], memory_planner=memory_planner, enable_buffer_ir=enable_buffer_ir):
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         optimized = pm.run_passes(program)
     return optimized, list(pm.pass_names)

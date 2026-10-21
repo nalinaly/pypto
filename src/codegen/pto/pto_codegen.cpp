@@ -2381,8 +2381,8 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
           elide_move =
               source == result_buf || (source_type && origin(source) == origin(result_buf) &&
                                        ShareOneMemRefWindow(source_type, result_tile_type) &&
-                                       ir::structural_equal(ir::CloneTypeWithoutMemRef(source_type),
-                                                            ir::CloneTypeWithoutMemRef(result_tile_type)));
+                                       ir::structural_equal(ir::CloneTypeWithMemRef(source_type, std::nullopt),
+                                                            ir::CloneTypeWithMemRef(result_tile_type, std::nullopt)));
           if (elide_move) storage = source;
         }
         const auto destination = PrepareTileDestination(op->var_, storage, call->op_->name_);

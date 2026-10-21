@@ -4322,24 +4322,34 @@ class YieldFixupMutator : public StorageBoundaryMutator {
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     if (fixup_if_stmts_) {
       auto result = As<AssignStmt>(IRMutator::VisitStmt_(op));
-      INTERNAL_CHECK_SPAN(result != nullptr, op->span_) << "Assignment mutation must preserve AssignStmt";
+      INTERNAL_CHECK_SPAN(result, op->span_) << "Assignment mutation must preserve AssignStmt";
       auto source = AsVarLike(result->value_);
+      bool is_view = false;
+      auto call = As<Call>(result->value_);
+      if (call && call->op_) {
+        auto index = op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size());
+        is_view = !index && op_predicates::IsBufferAliasingViewOp(call->op_->name_);
+        if (index || (is_view && !call->args_.empty())) {
+          source = AsVarLike(call->args_[index ? *index : 0]);
+        }
+      }
       auto source_tile = source ? GetTileTypeWithMemRef(source->GetType()) : nullptr;
       auto target_tile = GetTileTypeWithMemRef(result->var_->GetType());
-      if (!source_tile || !target_tile ||
-          SamePhysicalWindow(GetDefinedMemRef(source_tile), GetDefinedMemRef(target_tile))) {
-        return result;
+      if (!SameKnownTileMemorySpace(source_tile, target_tile)) return result;
+      auto target_memory = GetDefinedMemRef(source_tile);
+      if (is_view) {
+        target_memory = MakeAliasingMemRef(target_memory, ComputeViewByteOffset(call, source_tile),
+                                           GetDefinedMemRef(target_tile)->size_, op->span_);
       }
-      // An inner branch may have just changed its phi's storage. Propagate that
-      // decision through identity aliases before an enclosing boundary chooses
-      // its destination, rather than manufacturing copies into stale phi buffers
-      // and repairing the alias only after all boundaries have been processed.
+      if (SamePhysicalWindow(target_memory, GetDefinedMemRef(target_tile))) return result;
+      // A repaired inner phi must update views/writebacks before a following
+      // boundary reconciles its arms, just as it updates bare SSA aliases.
       auto type = CloneTypeWithMemRefAndRemapExprs(
-          result->var_->GetType(), GetDefinedMemRef(source_tile),
+          result->var_->GetType(), target_memory,
           [this](const ExprPtr& expr) { return VisitExpr(expr); }, source_tile->GetMemorySpace());
       auto target = std::make_shared<Var>(result->var_->name_hint_, type, result->var_->span_);
       var_remap_[op->var_.get()] = target;
-      return std::make_shared<AssignStmt>(target, source, result->span_);
+      return std::make_shared<AssignStmt>(target, result->value_, result->span_);
     }
     auto result = IRMutator::VisitStmt_(op);
 

@@ -38,6 +38,7 @@
 #include "pypto/ir/span.h"
 #include "pypto/ir/transforms/base/functor.h"
 #include "pypto/ir/type.h"
+#include "src/ir/arith/simplify_utils.h"
 
 namespace pypto {
 namespace ir {
@@ -73,7 +74,7 @@ ExprPtr CanonicalSimplifier::Impl::VisitExpr(const ExprPtr& expr) {
       stype && stype->dtype_.IsFloat()) {
     return expr;
   }
-  return ExprFunctor<ExprPtr>::VisitExpr(expr);
+  return PreserveIntegerResultType(expr, ExprFunctor<ExprPtr>::VisitExpr(expr));
 }
 
 CompareResult CanonicalSimplifier::Impl::TryCompare(const ExprPtr& /*x*/, int64_t /*val*/) {
@@ -785,6 +786,9 @@ ExprPtr CanonicalSimplifier::Impl::VisitExpr_(const BitNotPtr& op) {
 
 ExprPtr CanonicalSimplifier::Impl::VisitExpr_(const CastPtr& op) {
   ExprPtr a = VisitExpr(op->operand_);
+  // Fold before the identity check: ``cast(<literal>, dtype)`` folds even when
+  // the operand itself did not simplify.
+  if (auto folded = TryConstFoldCast(a, GetScalarDtype(op))) return folded;
   if (a.get() == op->operand_.get()) return op;
   return MakeCast(a, GetScalarDtype(op));
 }

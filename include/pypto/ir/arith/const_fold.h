@@ -459,6 +459,41 @@ inline ExprPtr TryConstFoldUnary(ObjectKind kind, const ExprPtr& operand) {
 }
 
 // ---------------------------------------------------------------------------
+// TryConstFoldCast — fold a cast of a constant into a typed constant
+// ---------------------------------------------------------------------------
+
+/// Try to fold ``cast(<integer constant>, dtype)`` into a constant of ``dtype``.
+///
+/// Only an integer constant going to an integer (or INDEX) destination folds,
+/// and only when the value is exactly representable **on both sides**:
+///
+/// - in ``dtype``, so a narrowing cast whose value does not fit keeps its Cast
+///   node — the truncation is the target's runtime behaviour, and baking a
+///   wrapped value into the IR would hide it;
+/// - in the operand's OWN dtype, because ``ConstInt`` does not validate its
+///   value against its dtype and an annotated literal can mint an out-of-range
+///   one (``small: pl.Scalar[pl.INT8] = 255``). Copying ``value_`` across would
+///   then change the program: codegen lowers such a constant as
+///   ``arith.constant 255 : i8`` + ``arith.extsi ... : i8 to i32``, and
+///   sign-extending the ``0xff`` bit pattern yields **-1**, not 255.
+///
+/// Float conversions are left alone: they carry rounding and saturation
+/// semantics this fold does not model.
+///
+/// Without this fold, an annotated scalar whose RHS folds to a constant
+/// (``y: pl.Scalar[pl.INT64] = i // 8`` with ``i`` in ``[0, 8)``) keeps the
+/// parser's dtype cast around a literal — ``cast(0, INT64)`` instead of
+/// ``const(0, INT64)`` — all the way into codegen.
+inline ExprPtr TryConstFoldCast(const ExprPtr& operand, const DataType& dtype) {
+  auto pi = As<ConstInt>(operand);
+  if (!pi) return nullptr;
+  if (!dtype.IsInt() && dtype != DataType::INDEX) return nullptr;
+  if (!detail::ConstIntFitsDtype(pi->value_, pi->dtype())) return nullptr;
+  if (!detail::ConstIntFitsDtype(pi->value_, dtype)) return nullptr;
+  return MakeConstInt(pi->value_, dtype);
+}
+
+// ---------------------------------------------------------------------------
 // TryConstFold — unified entry point: inspect expression, dispatch to above
 // ---------------------------------------------------------------------------
 
@@ -467,6 +502,9 @@ inline ExprPtr TryConstFoldUnary(ObjectKind kind, const ExprPtr& operand) {
 inline ExprPtr TryConstFold(const ExprPtr& expr) {
   if (auto bin = As<BinaryExpr>(expr)) {
     return TryConstFoldBinary(expr->GetKind(), bin->left_, bin->right_, GetScalarDtype(expr));
+  }
+  if (auto cast = As<Cast>(expr)) {
+    return TryConstFoldCast(cast->operand_, GetScalarDtype(cast));
   }
   if (auto un = As<UnaryExpr>(expr)) {
     return TryConstFoldUnary(expr->GetKind(), un->operand_);

@@ -1288,7 +1288,12 @@ def test_tensor_conversion_preserves_already_lowered_buffer_functions(function_t
         ir_stage=ir.FunctionIRStage.Buffer,
     )
     before = ir.Program([kernel], "already_lowered_buffer", span)
-    after = passes.convert_tensor_to_tile_ops()(before)
+    # This debug branch has Buffer IR but no printed pl.buffer parser yet.
+    # Check the actual IR identity and all pass properties without that unrelated
+    # text roundtrip. Other Group regression cases keep roundtrip enabled.
+    checks = [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]
+    with passes.PassContext(checks):
+        after = passes.convert_tensor_to_tile_ops()(before)
     ir.assert_structural_equal(after, before)
     preserved = _function(after, "kernel")
     assert preserved.same_as(kernel)

@@ -64,6 +64,8 @@ def _with_memref(type_: ir.Type, memref: ir.MemRef, memory_space: ir.MemorySpace
     if isinstance(type_, ir.TileType):
         return ir.TileType(type_.shape, type_.dtype, memref, type_.tile_view, memory_space)
     if isinstance(type_, ir.DistributedTensorType):
+        if type_.window_buffer is None:
+            return ir.DistributedTensorType(type_.shape, type_.dtype, memref, type_.tensor_view)
         return ir.DistributedTensorType(
             type_.shape, type_.dtype, memref, type_.tensor_view, type_.window_buffer
         )
@@ -181,6 +183,12 @@ def _writeback_call(
         destination = tensor("destination", [16, 32])
         args = [destination, ir.ConstInt(8, DataType.INDEX, span), ir.ConstInt(32, DataType.INDEX, span)]
 
+    if kind == "gather":
+        kwargs["transpose"] = False
+    if kind == "gemv":
+        kwargs["acc_phase"] = int(ir.AccPhase.Unspecified)
+    if kind == "scatter_update":
+        kwargs["dim"] = -2
     call = ir.create_op_call(op_name, args, kwargs, span)
     destination_type = destination.type
     assert isinstance(destination_type, ir.ShapedType) and destination_type.memref is not None
@@ -349,9 +357,8 @@ def test_tensor_loop_bindings_follow_reanchored_initializer(
     # including when the loop executes zero times.
     view = ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[8, 32])
     if isinstance(old_type, ir.DistributedTensorType):
-        current_type = ir.DistributedTensorType(
-            old_type.shape, old_type.dtype, old_type.memref, view, old_type.window_buffer
-        )
+        assert old_type.window_buffer is None
+        current_type = ir.DistributedTensorType(old_type.shape, old_type.dtype, old_type.memref, view)
     else:
         current_type = ir.TensorType(old_type.shape, old_type.dtype, old_type.memref, view)
     destination = ir.Var(old_destination.name_hint, current_type, old_destination.span)

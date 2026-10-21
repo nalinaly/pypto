@@ -1875,7 +1875,10 @@ class ASTParser:
                         for ann_dim, inf_dim in zip(resolved.shape, value_expr.type.shape)
                     ):
                         override_type = ir.TensorType(
-                            resolved.shape, resolved.dtype, value_expr.type.memref, value_expr.type.tensor_view
+                            resolved.shape,
+                            resolved.dtype,
+                            value_expr.type.memref,
+                            value_expr.type.tensor_view,
                         )
                 elif (
                     isinstance(resolved, ir.ScalarType)

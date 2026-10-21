@@ -130,6 +130,7 @@ _MARKER_TYPE_GETTERS: dict[str, Callable[[], ir.Type]] = {
     "AsyncSession": ir.AsyncSessionType.get,
     "CommCtxType": ir.CommCtxType.get,
     "CommCtx": ir.CommCtxType.get,
+    "Ptr": ir.PtrType,
 }
 
 
@@ -1048,11 +1049,11 @@ class TypeResolver:
         return ir.TupleType(self._resolve_tuple_element_types(call_node.args[0].elts))
 
     def _resolve_tuple_element_types(self, elts: Sequence[ast.expr]) -> list[ir.Type]:
-        """Resolve a sequence of AST type nodes into IR types, rejecting nested tuples."""
+        """Resolve tuple values while rejecting built-in tuple return-list annotations."""
         types: list[ir.Type] = []
         for elt in elts:
             resolved = self.resolve_type(elt)
-            if isinstance(resolved, (list, ir.TupleType)):
+            if isinstance(resolved, list):
                 raise ParserTypeError(
                     "Nested tuple types are not supported",
                     span=self._get_span(elt),
