@@ -565,9 +565,9 @@ def test_codegen_emits_the_divided_offset():
     clamp = defining_line(offsets[2])
     assert "arith.maxsi" in clamp, clamp
     divide = defining_line(clamp.split("arith.maxsi ", 1)[1].split(",", 1)[0])
-    assert "arith.divsi" in divide and "%c16_index" in divide, divide
+    assert "arith.floordivsi" in divide and "%c16_index" in divide, divide
 
-    dividend = divide.split("arith.divsi ", 1)[1].split(",", 1)[0]
+    dividend = divide.split("arith.floordivsi ", 1)[1].split(",", 1)[0]
     offset_def = defining_line(dividend)
     assert "arith.muli" in offset_def and "%c256_index" in offset_def, offset_def
 
@@ -936,11 +936,11 @@ def test_rejects_a_reshape_that_is_not_a_whole_tensor_flatten():
 
 
 def test_rejects_a_remainder_of_an_unproven_dividend():
-    """A remainder is only non-negative when its dividend is.
+    """The conservative proof still requires a non-negative dividend.
 
-    ``FloorMod`` lowers to ``arith.remsi``, which truncates toward zero, so
-    ``(blk - 1) % 2`` is -1 on the first block. A difference proves no sign, so
-    the whole offset stays unproven rather than being trusted for its divisor.
+    ``FloorMod`` codegen corrects negative remainders, so ``(blk - 1) % 2``
+    is 1 on the first block. This pass does not use that stronger fact: a
+    difference proves no sign, so the whole offset remains unproven.
     """
 
     @pl.jit

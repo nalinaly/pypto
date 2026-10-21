@@ -193,30 +193,44 @@ void PTOCodegen::VisitExpr_(const ir::AddPtr& op) { VisitBinaryArithExpr(op, "ar
 void PTOCodegen::VisitExpr_(const ir::SubPtr& op) { VisitBinaryArithExpr(op, "arith.subi", "arith.subf"); }
 void PTOCodegen::VisitExpr_(const ir::MulPtr& op) { VisitBinaryArithExpr(op, "arith.muli", "arith.mulf"); }
 void PTOCodegen::VisitExpr_(const ir::FloorDivPtr& op) {
-  VisitBinaryArithExpr(op, "arith.divsi", "arith.divf");
+  // Match FloorMod's floor semantics so q * divisor + remainder reconstructs
+  // the dividend even when either operand is negative. PTOAS expands the native
+  // floor operation into truncating division plus a conditional correction.
+  const auto dtype = ir::GetScalarDtype(op);
+  const bool signed_integer = dtype == DataType::INDEX || dtype.IsSignedInt();
+  VisitBinaryArithExpr(op, signed_integer ? "arith.floordivsi" : "arith.divsi", "arith.divf");
 }
 void PTOCodegen::VisitExpr_(const ir::FloorModPtr& op) {
   const auto dtype = ir::GetScalarDtype(op);
   if (dtype != DataType::INDEX && !dtype.IsSignedInt()) {
-    // Preserve other dtype paths; this correction covers signed integer and
-    // index arithmetic, matching the scalar simplifier's floor semantics.
     VisitBinaryArithExpr(op, "arith.remsi", "arith.remf");
     return;
   }
 
-  const std::string type = dtype == DataType::INDEX ? "index" : GetTypeString(dtype);
+  const std::string type = GetTypeString(dtype);
   const std::string lhs = EmitArithOperand(op->left_, type);
   const std::string rhs = EmitArithOperand(op->right_, type);
   const std::string remainder = EmitArithBinaryOp("arith.remsi", lhs, rhs, type);
+  const std::string zero = GetOrEmitConstant(int64_t{0}, dtype);
 
-  // FloorMod and the arithmetic simplifier use the divisor's sign. remsi
-  // instead follows the dividend; for example (1 - 48) % 24 must be 1, not
-  // -23. Correct the nonzero remainder when the signs differ. Constant
-  // divisors, as used by core ownership, need only one sign comparison.
-  const std::string zero = GetOrEmitConstant(static_cast<int64_t>(0), dtype);
+  // FloorMod follows the divisor's sign, whereas remsi follows the dividend's.
+  // Correct only nonzero remainders with the opposite sign. A constant divisor
+  // needs just one comparison; for example, -97 % 24 must be 23, not -1.
+  const auto divisor = As<ir::ConstInt>(op->right_);
+  int64_t divisor_value = divisor ? divisor->value_ : 0;
+  // Interpret signless MLIR literals at their emitted signed width, including
+  // EmitArithOperand's i32 narrowing (for example, 253 : i8 represents -3).
+  if (dtype == DataType::INT8) {
+    divisor_value = static_cast<uint8_t>(divisor_value);
+    if (divisor_value >= 128) divisor_value -= 256;
+  } else if (dtype == DataType::INT16) {
+    divisor_value = static_cast<int16_t>(divisor_value);
+  } else if (dtype == DataType::INT32) {
+    divisor_value = static_cast<int32_t>(divisor_value);
+  }
   std::string needs_correction;
-  if (auto divisor = As<ir::ConstInt>(op->right_); divisor && divisor->value_ != 0) {
-    needs_correction = EmitArithCmpi(divisor->value_ > 0 ? "slt" : "sgt", remainder, zero, type);
+  if (divisor && divisor_value != 0) {
+    needs_correction = EmitArithCmpi(divisor_value > 0 ? "slt" : "sgt", remainder, zero, type);
   } else {
     const std::string remainder_negative = EmitArithCmpi("slt", remainder, zero, type);
     const std::string divisor_negative = EmitArithCmpi("slt", rhs, zero, type);
@@ -227,8 +241,7 @@ void PTOCodegen::VisitExpr_(const ir::FloorModPtr& op) {
   }
   const std::string corrected = EmitArithBinaryOp("arith.addi", remainder, rhs, type);
   const std::string result = NewTemp();
-  Emit(result + " = arith.select " + needs_correction + ", " + corrected + ", " + remainder +
-       " : " + type);
+  Emit(result + " = arith.select " + needs_correction + ", " + corrected + ", " + remainder + " : " + type);
   fs_.current_expr_value = result;
 }
 

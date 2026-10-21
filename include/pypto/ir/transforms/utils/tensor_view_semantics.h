@@ -458,9 +458,9 @@ inline bool IsProvableNonNegative(const ExprPtr& expr, const NzOffsetFacts& fact
   // non-negative. This is what a split-K block index reaches for --
   // ``(block % OK) * K_SLICE`` names the K half.
   //
-  // Keep view-legality proofs restricted to non-negative source indices.
-  // Scalar codegen now corrects remsi to floor remainder for negative inputs;
-  // that fix does not broaden this conservative source-index proof.
+  // Keep the proof conservative: signed integer and INDEX FloorMod codegen
+  // corrects arith.remsi to floor semantics, but this predicate still requires
+  // a non-negative dividend instead of relying on that stronger result bound.
   if (auto mod = As<FloorMod>(expr)) {
     auto divisor = As<ConstInt>(mod->right_);
     return divisor && divisor->value_ > 0 && IsProvableNonNegative(mod->left_, facts, budget);

@@ -122,12 +122,26 @@ ptoas 带生命周期复用地规划，那部分本 pass 无法建模。
 %pipe_t_mb = pto.alloc_multi_tile valid_row = %c64_index valid_col = %c64_index
            : !pto.multi_tile_buf<!pto.tile_buf<loc=vec, dtype=f32, rows=64, cols=64, ...>, count=2>
 scf.for %i = %c0_index to %c4_index step %c1_index {
-  %0 = arith.remsi %i, %c2_index : index
-  %t = pto.multi_tile_get %pipe_t_mb[%0] : !pto.multi_tile_buf<..., count=2> -> !pto.tile_buf<...>
+  %rem = arith.remsi %i, %c2_index : index
+  %negative = arith.cmpi slt, %rem, %c0_index : index
+  %corrected = arith.addi %rem, %c2_index : index
+  %slot = arith.select %negative, %corrected, %rem : index
+  %t = pto.multi_tile_get %pipe_t_mb[%slot] : !pto.multi_tile_buf<..., count=2> -> !pto.tile_buf<...>
   pto.tload ins(...) outs(%t : ...)
   ...
 }
 ```
+
+有符号 `INDEX` 余数先修正为向下取模（floor modulo）语义，再用来选择槽位。
+操作数仍是逻辑下标，不乘以字节大小，因此 ptoas 仍能推导动态槽位选取和逐槽位 event id。
+
+一般而言，有符号整数和 `INDEX` 的 `FloorMod` 保持 Python `%` 的语义：非零余数与除数同号。
+正常量除数只需上面的负余数检查，负常量除数则检查余数是否为正。动态除数需要同时检查
+余数非零、余数与除数异号，再加上除数。例如 `-97 % 24` 得到 `23`。除数为零和
+有符号最小值对 `-1` 取模仍不属于有效输入。有符号整数和 `INDEX` 的 `FloorDiv` 使用
+`arith.floordivsi` 生成匹配的向下取整商，保持 `a == (a // b) * b + a % b`。
+浮点、无符号数的降级保持原有行为。向下整除与取模的常量折叠将超出类型范围的字面量保留到运行时求值，
+避免用原始存储整数的计算结果替换其实际输出的位模式。
 
 循环按原步长前进且只有一份循环体，region 不带 `addr`——由 ptoas `PlanMemory` 放置，这正是它能把第 *i* 次迭代的 load 与第 *i-1* 次的计算重叠起来的原因。
 
