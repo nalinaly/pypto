@@ -456,6 +456,8 @@ UINT32 + INT32 → INT32 (signed precedence)
 | `system.bar_v` | 向量屏障（下降为 `pto.barrier <PIPE_V>`） | 无 |
 | `system.bar_m` | 矩阵屏障（下降为 `pto.barrier <PIPE_M>`） | 无 |
 | `system.fence` | 全局内存屏障（下降为 `pto.fence.barrier_all #pto.fence_scope<gm>`） | 无 |
+| `system.signal_notify` | 临时普通 GM INT32 信号 Set，下降为 TNOTIFY(Set)；参数为 signal、offsets、value | 无 |
+| `system.signal_wait` | 临时普通 GM INT32 非消费式等待，直到信号 >= expected，下降为 TWAIT(Ge) | 无 |
 | `system.cacheinvalid` | 使 tensor 子区域基地址所在的那一条 cache line 失效。参数：`tensor`、`shapes`（N 维）、`offsets`（N 维）。任意区域大小（包括单个元素）都下降为 `pto.partition_view` + `pto.cmo.cacheinvalid %payload_view single_cache_line : !pto.partition_tensor_view<...>`；`shapes` 不会让它遍历区域内的所有 cache line。无参数形式使全部 GM cache 失效。 | 无 |
 | `system.syncall` | 跨核全员屏障（`pto::SYNCALL`）。属性 `mode` 取 `"hard"`（FFTS，无 operand）或 `"soft"`（GM 轮询，带 operand） | `core_type`（`"aiv_only"` \| `"aic_only"` \| `"mix"`）、`mode`（`"hard"` \| `"soft"`） |
 | `system.sync_src` | 设置同步标志 | `set_pipe`, `wait_pipe`, `event_id` |
@@ -476,6 +478,25 @@ UINT32 + INT32 → INT32 (signed precedence)
 `system.available_cluster_count` / `system.available_aiv_count` 是 SPMD **启动形状查询**：把它作为 `pl.spmd(...)` 的 `core_num` 传入，启动宽度即按本次运行落到的设备自适应。Orchestration codegen 分别下沉为 `rt_available_cluster_count()` / `rt_available_aiv_count()`。混合（AIC+AIV）或纯 cube kernel 用 cluster 数（每个 core-group 一个 block），纯 vector kernel 用 AIV 数。这是唯一能跨设备保持满占用的启动宽度，而 hard `system.syncall` 正需要满占用；`HardSyncallOccupancy` verifier 对这类宽度不再做数量比较，并会拒绝用错核类型的查询。请把调用内联传入（`pl.spmd(pl.system.available_cluster_count())`），不要先绑定到变量名——变量名会以「定义在调用方的变量」形式落到外提出的 `Spmd` 包装函数上，IR printer 无法重新解析。源码：`src/ir/op/sync_ops/launch.cpp`。
 
 `system.task_invalid` 返回类型为 [`ScalarType(DataType::TASK_ID)`](02-types.md#scalartype)。当 Python 字面量 `None` 出现在 TaskId 位置（`deps=[None]` 条目或 TaskId 循环 iter_arg 种子）时，它就是 `None` 在 `with pl.manual_scope():` 区域内的下沉目标。不存在 `system.task_id_of` op —— producer task id 由 `pl.submit(...)` parser construct 返回的二元组第二个元素获得，而非来自 builtin。源码：`src/ir/op/sync_ops/task.cpp`。
+
+### 临时普通 GM 点对点信号
+
+`pl.system.signal_notify(signal, [offset], value)` 与
+`pl.system.signal_wait(signal, [offset], expected)` 是
+[issue #3020](https://github.com/hw-native-sys/pypto/issues/3020) 的本地原型，
+不是上游正式 API。它们使用一维普通 GM INT32 Tensor，复用
+TNOTIFY(Set) / TWAIT(Ge)。offset 可以动态变化，value / expected 必须是 INT32；
+无需 DistributedTensor、通信窗口或全体 barrier。wait 不清除信号，允许多个消费者。
+
+每条信号缓存行必须只有一个写者，不能与 payload 或其他写者共享。
+首次启动前初始化；代际必须单调递增且不得溢出 INT32。并发调用独占信号空间。
+所有必要生产者必须已驻留或能够继续执行。当前只用于 MIX group 内显式 AIC/AIV
+核体，不定义自动 MIX 展开的 lane 放置语义。
+
+这两个操作只发布和观察信号。调用者仍需单独完成生产者数据流水、payload 发布，
+以及消费者读数据前的缓存维护与内存顺序。当前 A3 TWAIT 使用 volatile 读取配合
+DCCI，不能声称使用了绕过 DCache 的 ld_dev；volatile 本身不保证缓存一致性，
+信号 wait 也不能代替完整的业务数据屏障。
 
 ## CrossCoreOp：AIC↔AIV 跨核通信
 

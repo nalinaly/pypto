@@ -161,6 +161,10 @@ view = pl.TensorView(stride=[1024, 1], layout=pl.TensorLayout.ND, valid_shape=[1
 
 ### 动态 shape
 
+将 `x[row:row + 8, :]` 这样起点可变、大小固定的视图传给 inline helper 时，
+JIT 元数据推导保留八行的范围。起点可以是运行时标量，不应因此采用父 Tensor
+的完整行数。
+
 `pl.dynamic(name)` 用来标注**编译时未知、且每次启动都可能不同**的轴 —— 随请求变化的 batch、解码过程中不断增长的序列长度。该维的尺寸成为运行期的值，因此一份编译产物服务这个轴的所有取值：动态维在 JIT 缓存 key 里折叠为 `None`，尺寸变化不会触发重编译。
 
 <!-- doctest: run -->

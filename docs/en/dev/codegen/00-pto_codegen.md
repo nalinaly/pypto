@@ -41,6 +41,22 @@ constants block is finalized, so a constant that appears only inside a shape or
 stride expression — e.g. the `2` in a composite parameter dim `M * 2` — is still
 declared in the constants block before its use.
 
+### Signed scalar floor remainder
+
+For signed integer and `INDEX` operands, `FloorMod(a, b)` preserves floor
+remainder semantics: a nonzero result has the divisor's sign. Codegen emits
+`arith.remsi`, then adds `b` when the remainder is nonzero and its sign differs
+from `b`, selecting the corrected value. For a constant divisor, its known
+sign reduces the required comparison. For example, `-97 % 24` produces `23`,
+not the truncating remainder `-1`.
+
+This is semantic lowering of one IR operation, not an arithmetic simplification.
+It matters after the arithmetic analyzer simplifies `(x % n + n) % n` to
+`x % n`: emitting only `arith.remsi` would change the meaning for negative `x`.
+The divisor must be nonzero and operands must avoid the signed division
+overflow case. This rule does not change floating-point remainder or
+`FloorDiv` lowering.
+
 ## Architecture
 
 ### Explicit Buffer input
@@ -172,6 +188,23 @@ print(pto_code)
 | `tile.or_(lhs, rhs)` / `tile.ors(lhs, scalar)` | `pto.tor` / `pto.tors`; scalar is same-width signless `iN` |
 | `tile.xor(lhs, rhs, tmp)` / `tile.xors(lhs, scalar, tmp)` | `pto.txor` / `pto.txors`; scalar is same-width signless `iN` |
 | `tile.fillpad_expand(src, shape)` | `pto.tfillpad_expand ins(%src) outs(%dst)` (the `shape` tuple is type-deduction only; the larger `dst` and its pad come from the result type) |
+
+**Reshape and transpose views after control flow.** With physical addresses
+baked into tile handles, an existing handle of the requested type can express
+the view directly. Under the PTOAS memory planner, a matching type alone does
+not establish aliasing: an if-phi may have a different handle from its old
+MemRef representative. Codegen omits the view only if the actual source is
+already the result handle; otherwise it emits `pto.treshape` from the current
+source, preserving both buffer identity and SSA dominance across branches.
+
+**Shared phi handles and tile moves.** An in-place conditional gather retains
+its already-declared tile handle even when later transpose/reshape views give
+the same storage additional types. Reuse requires the existing handle's exact
+type; a handle is never retyped. For a loop-carry move whose backing handle is a
+row but whose logical destination is a column, codegen emits a destination
+`pto.treshape` view with the static valid shape before `pto.tmov`. This preserves
+storage identity and matches the source/destination shapes without adding an
+allocation or an unsupported Mat-to-Mat copy.
 
 **`tile.slice` / `tile.assemble` lowering details.**  Both ops are lowered
 through `pto.subview`, which is a pure view alias of the source tile (no

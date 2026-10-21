@@ -1944,18 +1944,27 @@ std::string PTOCodegen::AllocNewTileBuf(const std::string& tile_buf_type_string,
   return name;
 }
 
-std::string PTOCodegen::TryGetSharedTileBufHandle(const ir::MemRefPtr& memref) const {
+std::string PTOCodegen::TryGetSharedTileBufHandle(const ir::MemRefPtr& memref,
+                                                  const std::string& required_type) const {
   if (emit_tile_addr_ || !memref) {
     return "";
   }
   const std::string ident = MemRefIdentityKey(memref);
+  auto it = fs_.memref_identity_to_mlir.find(ident);
+  if (it == fs_.memref_identity_to_mlir.end()) return "";
   // A mixed-type identity's handle already carries another var's type; re-typing
   // it would make one SSA value have two types and ptoas would reject the module.
   if (fs_.memref_identity_mixed_types.count(ident) != 0) {
-    return "";
+    // A later transpose/reshape view does not invalidate an already-declared
+    // handle of exactly the requested type. Reuse it without retyping it; this
+    // is essential for a conditional in-place Mat gather followed by a view.
+    auto type = fs_.ssa_to_tile_buf_type.find(it->second);
+    if (fs_.emitted_tile_alloc_names.count(it->second) == 0 || type == fs_.ssa_to_tile_buf_type.end() ||
+        type->second != required_type) {
+      return "";
+    }
   }
-  auto it = fs_.memref_identity_to_mlir.find(ident);
-  return it != fs_.memref_identity_to_mlir.end() ? it->second : std::string{};
+  return it->second;
 }
 
 bool PTOCodegen::DeclareTileBufAtHead(const std::string& ssa_name, const AllocTileFields& fields) {

@@ -96,6 +96,32 @@ def _build_program(cmp_mode: str | int = "eq", offset=0, src_dtype=pl.FP32, coun
 class TestTileGatherCompareTypes:
     """Type-contract tests: dtype allowed / disallowed, dst INT32, kvalue matches src."""
 
+    @pytest.mark.parametrize("rows", [1, 2, 7, 8, 9, 16])
+    @pytest.mark.parametrize("count_dtype", [pl.INT32, pl.UINT32])
+    def test_count_physical_alignment_preserves_valid_rows(self, rows, count_dtype):
+        """#3079：小行数计数仍有合法 UB 容量，只暴露实际有效行数。"""
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(self, src: pl.Tensor[[rows, 64], pl.FP32],
+                     out: pl.Out[pl.Tensor[[1, rows], count_dtype]]):
+                values = pl.load(src, [0, 0], [rows, 64])
+                tmp = pl.tile.create([1, 4096], pl.UINT8)
+                ids, counts = pl.tile.gather_compare(
+                    values, pl.cast(0.5, pl.FP32), tmp, cmp_mode="gt",
+                    out_cols=64, count_dtype=count_dtype,
+                )
+                pl.store(counts, [0, 0], out)
+                return out
+
+        _, count_type = _tuple_elements(_find_call(Program, "tile.gather_compare"))
+        assert _static_shape(count_type) == [1, ((rows + 7) // 8) * 8]
+        # 全容量有效时 parser 可以省略等价的 TileView；非对齐行数必须
+        # 保留较短 valid_shape，不能把 padding 计数作为业务输出。
+        valid_shape = (count_type.tile_view.valid_shape
+                       if count_type.tile_view is not None else count_type.shape)
+        assert [dim.value for dim in valid_shape] == [1, rows]
+
     @pytest.mark.parametrize("src_dtype", _VALID_SRC_DTYPES)
     def test_valid_src_dtype(self, src_dtype):
         call = _find_call(_build_program(src_dtype=src_dtype), "tile.gather_compare")

@@ -34,6 +34,14 @@ members to that Group signature and rewrites both inner `Call` or `Submit` nodes
 to forward the complete list. Unused parameters remain valid wrapper arguments;
 each cloned body still references only the values from its original call.
 
+An `InOut` result may be rebound and passed to the next member, as in
+`sink = cube(sink); sink = vec(sink)`. The result is an SSA alias of the same
+whole GM parameter. Before cloning, the pass traces member arguments through
+writebacks, including tuple results and `Submit`, and binds these aliases to the
+corresponding fresh adapter parameters. `pl.no_dep` overrides follow the same
+mapping. Tensor views and newly allocated buffers are not whole-parameter
+aliases; bind them outside the Group and pass them as explicit Group parameters.
+
 When both member kernels are exclusive to the Group, their names are preserved.
 If either kernel has another call site, the pass creates a Group-private adapter
 pair and rewrites `import_peer_buffer(peer_func=...)` to the adapter peer names,

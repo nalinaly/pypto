@@ -234,6 +234,10 @@ and FP4 are intentionally not part of this interface.
 
 ### Dynamic shapes
 
+When passing a moving, fixed-size view such as `x[row:row + 8, :]` to an inline
+helper, JIT metadata inference preserves the eight-row extent. The origin may be a
+runtime scalar; it is not a reason to use the full parent tensor's row count.
+
 `pl.dynamic(name)` marks an axis whose extent is **not known when the kernel is compiled
 and may differ from one launch to the next** — a batch that varies with the request, a
 sequence length that grows as decoding proceeds. The extent becomes a run-time value, so

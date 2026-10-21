@@ -358,6 +358,104 @@ def test_hand_written_group_members_share_canonical_abi():
         assert [arg.name_hint for arg in call.args] == expected_names
 
 
+def test_hand_written_group_rebinds_shared_inout_results():
+    """A preceding member's writeback must bind to a parameter in the next member."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_side(
+            self,
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return sink
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vec_side(
+            self,
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
+            return sink, out
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed(
+            self,
+            out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
+            sink = self.cube_side(sink)
+            sink, out = self.vec_side(sink, out)
+            return sink, out
+
+    after = _run_pipeline(Program)
+    cube = after.get_function("cube_side")
+    vec = after.get_function("vec_side")
+    group = after.get_function("mixed")
+    assert cube is not None and vec is not None and group is not None
+    for member, indices in ((cube, [1]), (vec, [1, 0])):
+        returns = [stmt for stmt in ir.flatten_to_stmts(member.body) if isinstance(stmt, ir.ReturnStmt)]
+        assert len(returns) == 1
+        expected = ir.ReturnStmt([member.params[i] for i in indices], returns[0].span)
+        ir.assert_structural_equal(returns[0], expected)
+        assert "FREE_VAR" not in member.as_python()
+    calls = [
+        stmt.value
+        for stmt in ir.flatten_to_stmts(group.body)
+        if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call)
+    ]
+    assert len(calls) == 2
+    assert all(list(call.args) == list(group.params) for call in calls)
+
+
+def test_hand_written_group_submit_rebinds_tuple_writeback_no_dep():
+    """Tuple/Submit lineage preserves both buffer identity and the no_dep position."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_side(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
+            return second, first
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vec_side(
+            self,
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return sink
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            (second, first), _cube_tid = pl.submit(self.cube_side, first, second)
+            second, _vec_tid = pl.submit(self.vec_side, pl.no_dep(second))
+            return second
+
+    after = _run_pipeline(Program)
+    vec = after.get_function("vec_side")
+    group = after.get_function("mixed")
+    assert vec is not None and group is not None
+    returns = [stmt for stmt in ir.flatten_to_stmts(vec.body) if isinstance(stmt, ir.ReturnStmt)]
+    assert len(returns) == 1
+    ir.assert_structural_equal(returns[0], ir.ReturnStmt([vec.params[1]], returns[0].span))
+    submits = [
+        stmt.value
+        for stmt in ir.flatten_to_stmts(group.body)
+        if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Submit)
+    ]
+    vec_submit = next(submit for submit in submits if submit.op.name == "vec_side")
+    assert list(vec_submit.args) == list(group.params)
+    assert vec_submit.attrs["arg_direction_overrides"] == [1]
+    assert "FREE_VAR" not in vec.as_python()
+
+
 def test_hand_written_no_split_pipe_group_infers_dual_aiv_dispatch():
     """910B explicit pipe members get the same lane-1 handshake replay as auto-expanded mixed kernels."""
 

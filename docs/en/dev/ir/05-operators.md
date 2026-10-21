@@ -496,6 +496,8 @@ flat gather, valid-region semantics, tile layouts, and mask patterns.
 | `system.bar_v` | Vector barrier (lowers to `pto.barrier <PIPE_V>`) | None |
 | `system.bar_m` | Matrix barrier (lowers to `pto.barrier <PIPE_M>`) | None |
 | `system.fence` | Memory barrier over global memory (lowers to `pto.fence.barrier_all #pto.fence_scope<gm>`) | None |
+| `system.signal_notify` | Temporary local GM INT32 signal Set; lowers to TNOTIFY(Set). Args: signal, offsets, value | None |
+| `system.signal_wait` | Temporary non-consuming local GM INT32 wait until >= expected; lowers to TWAIT(Ge). Args: signal, offsets, expected | None |
 | `system.cacheinvalid` | Invalidate the cache line containing a tensor sub-region's base address. Args: `tensor`, `shapes` (N-D), `offsets` (N-D). Every region size — a single element included — lowers to `pto.partition_view` + `pto.cmo.cacheinvalid %payload_view single_cache_line : !pto.partition_tensor_view<...>`; `shapes` does not make it walk every cache line. The no-argument form invalidates all GM. | None |
 | `system.syncall` | Cross-core all-participant barrier (`pto::SYNCALL`). Attr `mode` `"hard"` (FFTS, no operands) or `"soft"` (GM-polling, operands) | `core_type` (`"aiv_only"` \| `"aic_only"` \| `"mix"`), `mode` (`"hard"` \| `"soft"`) |
 | `system.sync_src` | Set sync flag | `set_pipe`, `wait_pipe`, `event_id` |
@@ -516,6 +518,29 @@ The `core_type` and `mode` attributes stay strings **in the IR**, but the Python
 `system.available_cluster_count` / `system.available_aiv_count` are the SPMD **launch-shape queries**: pass one as `pl.spmd(...)`'s `core_num` so the launch sizes itself on the device the run lands on. Orchestration codegen lowers them to `rt_available_cluster_count()` / `rt_available_aiv_count()`. Use the cluster count for a mixed (AIC+AIV) or cube-only kernel — one block per core-group — and the AIV count for a vector-only kernel. This is the only launch width that stays at full occupancy across devices, which the hard `system.syncall` requires; the `HardSyncallOccupancy` verifier accepts these widths without a count comparison and rejects the query for the *other* core type. Pass the call inline (`pl.spmd(pl.system.available_cluster_count())`) rather than binding it to a name first — a name reaches the outlined `Spmd` wrapper as a variable defined in the caller, which the IR printer cannot re-parse. Source: `src/ir/op/sync_ops/launch.cpp`.
 
 `system.task_invalid` returns [`ScalarType(DataType::TASK_ID)`](02-types.md#scalartype). It is the lowering target of the Python literal `None` when `None` appears in a TaskId position (a `deps=[None]` entry or a TaskId loop iter_arg seed) inside `with pl.manual_scope():` regions. There is no `system.task_id_of` op — producer task ids are obtained from the second tuple element returned by the `pl.submit(...)` parser construct, not from a builtin. Source: `src/ir/op/sync_ops/task.cpp`.
+
+### Temporary ordinary-GM point-to-point signals
+
+`pl.system.signal_notify(signal, [offset], value)` and
+`pl.system.signal_wait(signal, [offset], expected)` are a local prototype for
+[issue #3020](https://github.com/hw-native-sys/pypto/issues/3020), not an upstream API.
+They use a one-dimensional ordinary GM `INT32` Tensor and existing
+`TNOTIFY(Set)` / `TWAIT(Ge)`. The offset may be dynamic; value and expected must
+be INT32. They do not require a DistributedTensor, communication window, or
+collective barrier. Wait is non-consuming and supports multiple readers.
+
+Each signal cache line must have a single writer and must not share storage
+with payload or another writer. Initialize it before launch; use monotonically
+increasing epochs without INT32 overflow. Concurrent invocations need separate
+storage. All required producer kernels must be resident or otherwise able to
+make progress. This prototype is for explicitly typed AIC/AIV bodies within a
+MIX group; automatic MIX lane placement is not specified.
+
+These operations publish and observe the signal only. Callers must separately
+complete producer data pipelines, release payload writes, and maintain consumer
+caches and ordering before reading payload. The current A3 TWAIT uses volatile
+loads with DCCI, not a promise of cache-bypassing `ld_dev` loads. Do not treat
+volatile alone as cache coherence, or a signal wait as a full payload barrier.
 
 ## CrossCoreOp: AIC↔AIV Communication
 

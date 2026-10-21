@@ -56,9 +56,9 @@ program_optimized = reuse_pass(program)
 2. **干涉检查**：识别生命周期重叠的变量
 3. **MemRef 共享**（全局「最大优先 + first-fit」装箱，`IdentifyReuseOpportunities`）：在每个内存空间内，按 **大小从大到小** 装箱；后续每个区间加入第一个其全部成员都能与之共享的缓冲区（生命周期不重叠 + hazard / no-alias 安全，见 `can_share`）。缓冲区的分配大小由其首个（最大）成员固定，因此之后纳入更小的成员是「免费」的 —— 且 *后定义的较大区间* 现在可以承载 *先定义的较小区间*。（此前的定义序贪心带有单向的大小门槛 `source.size >= target.size`，因此两个生命周期不相交、但较小者先定义的 tile 永远无法合并。）每个成员被重定位到的「代表」是该缓冲区的最大成员；由于 InitMemRef 会把所有 `tile.alloc` 提升到函数体头部，代表的 alloc 支配整个函数，因此代表即使定义在其部分成员之后也是安全的。由于装箱器不再按程序序处理，每个成对门槛（hazard、no-alias）都会在两个方向上检查。
 
-   **容量溢出时的子区间回退（仅 PYPTO）。** 本 pass 先计算上述旧式整块装箱；只要其精确 allocator footprint 不超过 backend 容量，就逐字节保留原布局。只有确认溢出后，才重试把较小 root 放到现有最大成员 arena 的对齐子区间。例如，一块已经失活的 64 KiB root 预留 `[0, 65536)` 后，两个随后且同时存活的 32 KiB root 可以分别占 `[0, 32768)` 与 `[32768, 65536)`。64 KiB root 的生命周期必须与两个小 root 都不重叠；两个小 root 互相干涉，所以它们的字节区间必须分离。重试为候选选择不被「不能与它共享字节」的成员阻塞的最低对齐空洞。arena 永不扩容，所以两个 32 KiB arena 不会拼成新的 64 KiB arena；64 KiB 代表必须原本就存在。若子区间装箱后仍放不下，原有的流水线深度削减与 legacy 回退照常执行。
+   **容量溢出时的子区间回退（仅 PYPTO）。** 本 pass 先计算上述旧式整块装箱；只要其精确 allocator footprint 不超过 backend 容量，就逐字节保留原布局。只有确认溢出后，才重试把较小 root 放到现有最大成员 arena 的对齐子区间。例如，一块已经失活的 64 KiB root 预留 `[0, 65536)` 后，两个随后且同时存活的 32 KiB root 可以分别占 `[0, 32768)` 与 `[32768, 65536)`。64 KiB root 的生命周期必须与两个小 root 都不重叠；两个小 root 互相干涉，所以它们的字节区间必须分离。重试为候选选择不被「不能与它共享字节」的成员阻塞的最低对齐空洞。固定容量的子区间重试仍超限时，增加一次允许扩展复用区的重试：仅扩展编译器拥有、根偏移为零的复用区，且不超过可用片上容量。例如先使用 48＋12 KiB、后使用 32＋32 KiB 的两个阶段可以共用 64 KiB。只有总分配量降低时才采用新布局，所有生命周期、hazard 和流水分离约束仍然生效；真正同时存活的 64＋12 KiB 仍报超限。原有流水线深度削减与 legacy 回退作为最后的选择。
 
-   子区间复用移动的是完整 root allocation；它不会利用 alias/view 未访问的内部空洞。候选 root 与 arena root 的 allocation offset 因此仍须是静态非负值。只有直接内部 `tile.slice` 才支持动态 offset，因为 PTO 能使用已经重定位的 source tile 与 slice 操作数重建其运行时地址。如果某个 memory space 中存在其他动态 offset 成员，例如动态 slice 之后的 reshape、reinterpret 或 transpose view，则整个 space 都禁用子区间回退，避免压缩无关 root 后把原本的 legacy overflow 变成错误代码。常量成员 offset 继续检查非负且不越过 root；受支持的动态 slice 原样保留相对表达式 `arena_offset + placement + (member_offset - root_offset)`。动态 root offset 仍不具备资格，声明式/pinned allocation 也保持封闭。生命周期干涉、pipeline 分离、目标 hazard 与算子 no-alias 规则仍由 `can_share` 判断；任何规则只要禁止字节重叠，两个 root 地址区间就必须分离。`AllocateMemoryAddr` 使用 arena root 的完整 allocation capacity 计算物理槽大小；所有常量子区间在 placement 阶段已经验证不会越过该容量。纯动态 `tile.slice` 的 MemRef 随后沿用旧行为记录 bare-base 地址，实际窗口由 PTO 使用 source tile 和 slice 操作数生成 `pto.subview`。后续 reshape fold 比较 base、offset 与 tile signature，PTO DPS alias 还会比较 extent。因此不会只因 base pointer 相同就把同一 arena 的兄弟 root 子区间误认为同一个 tile。
+   子区间复用移动的是完整 root allocation；它不会利用 alias/view 未访问的内部空洞。候选 root 与 arena root 的 allocation offset 因此仍须是静态非负值。只有直接内部 `tile.slice` 才支持动态 offset，因为 PTO 能使用已经重定位的 source tile 与 slice 操作数重建其运行时地址。如果某个 memory space 中存在其他动态 offset 成员，例如动态 slice 之后的 reshape、reinterpret 或 transpose view，则整个 space 都禁用子区间回退，避免压缩无关 root 后把原本的 legacy overflow 变成错误代码。常量成员 offset 继续检查非负且不越过 root；受支持的动态 slice 原样保留相对表达式 `arena_offset + placement + (member_offset - root_offset)`。动态 root offset 仍不具备资格，声明式/pinned allocation 也保持封闭。生命周期干涉、pipeline 分离、目标 hazard 与算子 no-alias 规则仍由 `can_share` 判断；任何规则只要禁止字节重叠，两个 root 地址区间就必须分离。物理 allocation 记录扩展容量，各 Tile 保留自己的窗口大小。`AllocateMemoryAddr` 按成员最大 `offset + size` 保留完整区间，避免另一 allocation 与扩展区重叠；所有常量子区间在 placement 阶段均验证不会越过该容量。纯动态 `tile.slice` 的 MemRef 随后沿用旧行为记录 bare-base 地址，实际窗口由 PTO 使用 source tile 和 slice 操作数生成 `pto.subview`。后续 reshape fold 比较 base、offset 与 tile signature，PTO DPS alias 还会比较 extent。因此不会只因 base pointer 相同就把同一 arena 的兄弟 root 子区间误认为同一个 tile。
 4. **循环携带变量重对齐**（`AlignLoopCarriesToInitMutator`）：共享（步骤 3）只会重写由 `AssignStmt` 定义的变量（producer/init），而循环携带的 `iter_arg`/`return_var` 节点被排除在生命周期/共享映射之外、仍保留原始 MemRef。本步骤**自外向内**遍历 `ForStmt`，将每个循环的 `iter_arg`/`return_var` 重对齐到其（已复用的）`initValue` 的 MemRef，并在递归前写入 `var_remap_`，使嵌套循环能观察到已修正的外层 `iter_arg` 作为其 init。若缺少本步骤，被复用的**嵌套流水化 `matmul_acc`** 累加器会分裂到两个 Acc 缓冲区，导致步骤 7 插入非法的 `acc→acc tile.move`，被 Ascend 910B 的 ptoas 拒绝（[#1352](https://github.com/hw-native-sys/pypto/issues/1352)）
 5. **累加器 if-phi 合并**（`TopDownRetargeter::CoalesceAccumulatorIfPhis`）：`LowerPipelineLoops` 会把 stage-2 的 K 循环剥离成 `if`-phi，其活跃分支是就地累加的 `matmul_acc`（位于累加器缓冲区），而失效的 `if k==0` 分支是位于*不同* Acc 缓冲区上的全新 `matmul` seed。若不处理，步骤 7 会尝试用 `acc→acc tile.move` 协调二者 —— 产生第二个同时存活的 L0C 缓冲区（溢出），且 ptoas 也会拒绝（不存在合法的 Acc→Acc `tmov`）。本步骤通过 `reuses_input` 的 producer 识别就地累加分支，并把*另一*分支的 seed 重定向到累加器缓冲区，使两个分支共享同一缓冲区、不再产生 move（符合 `mad_acc` 共享 `%dst` 的语义）。仅作用于 `Acc`；重定向是**强制的**（被拒绝的重定向会触发 `INTERNAL_CHECK`，绝不退化为 move —— 因为不存在合法的 Acc→Acc move）。它会跳过*全局* dead-at-assign 活跃性检查（否则会因 if 之后合法的 phi 消费者而误判拒绝），但仅在验证分支互斥真正所需的两个前提之后：(a) seed 的 producer 是词法上位于该分支**内部**的 `Call`（经由分支透传的 if 前值会无条件执行，从而破坏 sibling 就地分支所读取的累加器），以及 (b) **限定分支范围** 的 `IsTargetDeadAtAssign`（在所属 `if` 处停止）确认分支内 seed 之后没有对累加器缓冲区的尾部读取。任一前提不满足时，该 phi 保持未合并，步骤 7 会明确失败，而不会生成不受支持的 Acc→Acc IR
 
@@ -114,6 +114,29 @@ program_optimized = reuse_pass(program)
 **Alloc 清理**：
 
 MemRef 共享完成后，部分 MemRef 对象变为无引用状态（其变量现在指向不同的共享 MemRef）。该 Pass 遍历周围的 `SeqStmts`，移除所有左值 MemRef 指针不在仍使用集合中的 `tile.alloc` `AssignStmt`。
+
+## 控制流生命周期与别名
+
+if 结果的后续使用会延长各分支局部源的生命周期。同一返回位置的源属于同一
+phi family，因此互斥分支可以共享存储。原地 gather 循环的分支局部 allocation
+别名也属于该 family；分支外定义保持独立，仍可阻止不安全复用。
+
+仅在容量超限时，装箱器额外按 else 在前、then 在后的顺序分析一次并重试。
+任一顺序下生命周期不相交即可证明不干涉，不改变实际执行顺序。例如，仅在
+else 分支读取的旧值可以与 then 分支的新值共享。if 后读取、同分支后续读取、
+循环再次读取、流水分离以及硬件 hazard 约束继续保留。原本能放下的布局不变。
+这里只增加有界的一次遍历与装箱，不枚举分支排列。
+
+Yield fixup 在内层 phi 更新后立即同步纯别名的类型，再处理外层 phi。所有
+planner 都保留两分支已经共用的同一物理窗口；这不会在 PTOAS 模式下引入
+机会性复用或不同窗口之间的额外拷贝。
+
+循环 carry 重定向时，内层 phi 改变位置后，纯 SSA identity 仍可能带着旧
+MemRef。循环初始化值独立确定了目标，因此 TopDownRetargeter 可以沿纯别名
+追到 producer，无须先要求别名的旧窗口一致；producer 的生命周期、no-alias
+和 view-offset 检查仍然保留。这个例外只用于循环 carry 传播：累加器 if-phi
+合并从别名本身推导目标，仍必须检查 identity 的窗口一致。嵌套 phi 回归检查
+不再引入冗余 carry 搬运；不一致累加器别名的反例仍须被明确拒绝。
 
 ## 声明式分配
 

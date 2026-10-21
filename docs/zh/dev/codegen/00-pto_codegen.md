@@ -39,6 +39,18 @@ PTO 代码生成 (CodeGen) (`PTOCodegen`) 从 PyPTO 中间表示 (IR) 生成 PTO
 张量视图与分配前缀会**先**渲染到缓冲区、再定稿常量块, 因此只出现在某个 shape 或
 stride 表达式里的常量 (例如复合参数维度 `M * 2` 中的 `2`) 也会在使用前被声明到常量块。
 
+### 有符号标量的 floor 余数
+
+对于有符号整数和 `INDEX` 操作数，`FloorMod(a, b)` 保留向下取整除法的余数
+语义：非零结果与除数同号。代码生成先发射 `arith.remsi`，在余数非零且与
+`b` 异号时加上 `b`，再选择修正值。除数为常量时，其已知符号可以减少必要的
+比较。例如 `-97 % 24` 得到 `23`，而不是截断除法的余数 `-1`。
+
+这是单个 IR 操作的语义下沉，不是算术优化。算术分析器将
+`(x % n + n) % n` 简化为 `x % n` 后，仅发射 `arith.remsi` 会改变负数 `x`
+的含义。除数必须非零，操作数必须避开有符号除法溢出的情况。此规则不改变
+浮点余数或 `FloorDiv` 的下沉方式。
+
 ## 架构
 
 ### 显式 Buffer 输入
@@ -166,6 +178,19 @@ print(pto_code)
 | `tile.or_(lhs, rhs)` / `tile.ors(lhs, scalar)` | `pto.tor` / `pto.tors`；scalar 使用同位宽 signless `iN` |
 | `tile.xor(lhs, rhs, tmp)` / `tile.xors(lhs, scalar, tmp)` | `pto.txor` / `pto.txors`；scalar 使用同位宽 signless `iN` |
 | `tile.fillpad_expand(src, shape)` | `pto.tfillpad_expand ins(%src) outs(%dst)`（`shape` 元组仅用于类型推导；更大的 `dst` 及其 pad 来自结果类型） |
+
+**控制流之后的 reshape 与 transpose view。** 固定物理地址模式下，相同类型的
+已有 handle 可以直接表达 view。使用 PTOAS 规划内存时，仅类型相同不足以证明
+别名关系：if-phi 的当前 handle 可能不同于旧 MemRef 代表。只有实际源就是结果
+handle 时才省略 view，否则从当前源发出 `pto.treshape`，保持缓冲身份以及跨分支
+SSA 定义对使用点的支配关系。
+
+**共享 phi handle 与 tile 搬运。** 条件原地 gather 保留已声明的 tile handle，
+即使后续 transpose/reshape 为同一存储增加了其他视图类型。复用要求已有
+handle 的类型完全匹配，不修改已有 handle 的类型。循环携带值的底层 handle
+为行、逻辑目标为列时，先按静态 valid shape 生成目标 `pto.treshape` 视图，
+再执行 `pto.tmov`，保持同一存储以及源/目标形状匹配，不增加 allocation，
+也不引入不支持的 Mat→Mat 拷贝。
 
 **`tile.slice` / `tile.assemble` 下沉细节。** 两个 op 都通过 `pto.subview`
 下沉，它是源 tile 的纯视图别名（不搬数据，也不会额外发 `pto.alloc_tile`）。

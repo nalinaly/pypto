@@ -855,5 +855,77 @@ class TestLaunchShapeQueryParsing:
             assert call.type.dtype == DataType.INT32
 
 
+def test_local_signal_round_trip():
+    """临时接口保留普通 GM Tensor、动态索引和 INT32 阈值。"""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.AIV)
+        def kernel(
+            self,
+            signal: pl.InOut[pl.Tensor[[256], pl.INT32]],
+            offset: pl.Scalar[pl.INDEX],
+            tag: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[256], pl.INT32]:
+            pl.system.signal_notify(signal, [offset], tag)
+            pl.system.signal_wait(signal, [offset], tag)
+            return signal
+
+    printed = Before.as_python()
+    assert "pl.system.signal_notify(" in printed
+    assert "pl.system.signal_wait(" in printed
+    ir.assert_structural_equal(Before, pl.parse_program(printed))
+
+
+@pytest.mark.parametrize("dtype", [DataType.INT64, DataType.FP32])
+def test_local_signal_rejects_unsupported_storage(dtype):
+    """不允许把旧 INT64 进度或浮点 Tensor 静默当成 INT32 信号。"""
+    span = ir.Span.unknown()
+    signal = ir.Var("signal", ir.TensorType([64], dtype), span)
+    with pytest.raises(ValueError, match="one-dimensional INT32"):
+        system_ops.signal_notify(signal, [0], 1)
+
+
+def test_local_signal_rejects_overflowing_literal():
+    span = ir.Span.unknown()
+    signal = ir.Var("signal", ir.TensorType([64], DataType.INT32), span)
+    with pytest.raises(ValueError, match="outside INT32"):
+        system_ops.signal_wait(signal, [0], 1 << 31)
+
+
+def test_local_signal_backoff_round_trip():
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.AIV)
+        def kernel(
+            self,
+            signal: pl.InOut[pl.Tensor[[256], pl.INT32]],
+            offset: pl.Scalar[pl.INDEX],
+            tag: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[256], pl.INT32]:
+            pl.system.signal_wait(signal, [offset], tag, backoff_ticks=150)
+            return signal
+
+    printed = Before.as_python()
+    assert "backoff_ticks=150" in printed
+    ir.assert_structural_equal(Before, pl.parse_program(printed))
+
+
+@pytest.mark.parametrize("ticks", [-1, 1 << 31, True, 1.5])
+def test_local_signal_rejects_invalid_backoff(ticks):
+    span = ir.Span.unknown()
+    signal = ir.Var("signal", ir.TensorType([64], DataType.INT32), span)
+    with pytest.raises(ValueError, match="backoff_ticks must be"):
+        system_ops.signal_wait(signal, [0], 1, backoff_ticks=ticks)
+
+
+def test_local_signal_zero_backoff_preserves_legacy_call():
+    span = ir.Span.unknown()
+    signal = ir.Var("signal", ir.TensorType([64], DataType.INT32), span)
+    before = system_ops.signal_wait(signal, [0], 1, span=span)
+    after = system_ops.signal_wait(signal, [0], 1, backoff_ticks=0, span=span)
+    ir.assert_structural_equal(before, after)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

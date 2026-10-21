@@ -183,10 +183,15 @@ pipeline judges whatever the program then does with it (loading the whole tensor
 say, gets you `InitMemRef requires static shape` — the same error the equivalent
 `@pl.program` earns).
 
+For `pl.reshape`, a target dimension may also be an integer expression over named
+tensor-dimension aliases, such as `rows * width` after `rows = pl.tensor.dim(x, 0)` and
+`width = pl.tensor.dim(x, 1)`. The view keeps that expression in IR; consumers bind its
+dynamic dimension from the actual descriptor. This metadata propagation does not prove
+that an arbitrary reshape preserves the element count.
+
 What does not resolve is a returned tensor whose shape the specializer cannot *reach* at
-all: a `pl.reshape` whose target shape is not static (a reshape is constrained by its
-source's element count, so no dynamic dimension can stand in for it), or a result rebound
-through an operation the specializer does not model. That surfaces as
+all: a `pl.reshape` sized from an unrelated runtime scalar (for example a value read from
+another tensor), or a result rebound through an operation the specializer does not model. That surfaces as
 `missing inferred tensor metadata for parameter '<name>'` at the *next* call that consumes
 it — the error names the consumer, but the fix belongs at the producer: give the producing
 statement a statically inferable shape, or pass the buffer in as a `pl.Out[...]` parameter.

@@ -49,6 +49,8 @@ __all__ = [
     "sync_dst",
     "sync_set",
     "sync_wait",
+    "signal_notify",
+    "signal_wait",
     "set_ffts",
     "bar_v",
     "bar_m",
@@ -135,6 +137,44 @@ def sync_wait(
     event_expr = event_id.unwrap() if isinstance(event_id, Scalar) else event_id
     kernel = _kernel_or_none(core_type, "sync_wait")
     return _ir_ops.sync_wait(event_expr, pipe=pipe, core_type=kernel, span=span)
+
+
+def signal_notify(
+    signal: Tensor,
+    offsets: Sequence[IntLike],
+    value: IntLike,
+    *,
+    span: Span | None = None,
+) -> Call:
+    """临时本地 GM 单写者通知，复用 TNOTIFY(Set)，只发布信号。
+
+    signal 必须为一维 INT32；每条信号 cacheline 独占且只有一个写者。
+    调用者负责 payload 完成、缓存发布和代际/溢出；通知不自动完成这些工作。
+    此接口用于显式 AIC/AIV 核体，不能推断自动 MIX 中应由哪条 lane 发布。
+    """
+    index_exprs = [item.unwrap() if isinstance(item, Scalar) else item for item in offsets]
+    value_expr = value.unwrap() if isinstance(value, Scalar) else value
+    return _ir_ops.signal_notify(signal.unwrap(), index_exprs, value_expr, span=span)
+
+
+def signal_wait(
+    signal: Tensor,
+    offsets: Sequence[IntLike],
+    expected: IntLike,
+    *,
+    backoff_ticks: int = 0,
+    span: Span | None = None,
+) -> Call:
+    """临时本地 GM 等待，复用 TWAIT(Ge)，不消费信号或建立全体 barrier。
+
+    signal 必须为一维 INT32；expected 为 INT32，消费者不得写信号所在 cacheline。
+    返回后仍须按业务数据的访问路径完成消费者缓存维护与内存顺序。
+    """
+    index_exprs = [item.unwrap() if isinstance(item, Scalar) else item for item in offsets]
+    expected_expr = expected.unwrap() if isinstance(expected, Scalar) else expected
+    return _ir_ops.signal_wait(
+        signal.unwrap(), index_exprs, expected_expr, backoff_ticks=backoff_ticks, span=span
+    )
 
 
 def set_ffts(workspace: Tensor, *, span: Span | None = None) -> Call:

@@ -165,6 +165,12 @@ def main(
 
 ## 切片视图遵循父张量的布局
 
+计算 slice 的布局与字节偏移之前，会沿 SSA 赋值折叠可证明为整数常量的起点，
+也包括循环体内的常量赋值。例如 `row = 64; tile.slice(pool, shape, [row, 0])`
+与直接传入常量起点具有相同的 MemRef。slice 参数同步改写，避免后续重建视图时
+重新产生符号偏移。该分析依赖本 pass 的 SSAForm 前置条件；不会把循环携带变量
+的初值当作每轮值，也不会固化真实的运行时 metadata。
+
 `tile.slice` / `tensor.slice` 的结果与父张量共享 `base_` Ptr，并附加一个字节偏移
 （byte offset）和收窄后的视图尺寸。只要该 pass 能够精确描述父张量的真实存储布局，
 这两个数值就在**该布局下**计算，而不是固定按行主序稠密（row-major dense）模型计算：

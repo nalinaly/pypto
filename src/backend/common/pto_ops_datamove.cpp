@@ -1467,8 +1467,12 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     }
     // The no-op check compares against the pre-declared alloc_tile, whose type is
     // always the dynamic-valid form — so it must use `result_type`, not `view_type`.
+    // Without baked addresses, matching types alone do not establish aliasing:
+    // an if-phi can bind the source to a different handle than its old MemRef
+    // representative. Read the actual source unless it is already that handle.
     auto existing_type = codegen.GetSSATileBufType(result_target);
-    if (result_has_memref && !existing_type.empty() && existing_type == result_type) {
+    if (result_has_memref && !existing_type.empty() && existing_type == result_type &&
+        (codegen.EmitTileAddr() || codegen.GetExprAsCode(op->args_[0]) == result_target)) {
       return std::string("");
     }
 
@@ -1541,7 +1545,8 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     // The result's own alloc_tile already declares the transposed type: it IS
     // the view, so emit nothing. Mirrors tile.reshape's no-op check.
     auto existing_type = codegen.GetSSATileBufType(result_target);
-    if (result_has_memref && !existing_type.empty() && existing_type == result_type) {
+    if (result_has_memref && !existing_type.empty() && existing_type == result_type &&
+        (codegen.EmitTileAddr() || codegen.GetExprAsCode(op->args_[0]) == result_target)) {
       return std::string("");
     }
 

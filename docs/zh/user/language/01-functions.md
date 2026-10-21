@@ -149,9 +149,14 @@ def entry(x: pl.Tensor[[1, 8], pl.FP32], out: pl.Out[pl.Tensor[[1, 8], pl.FP32]]
 tile 加载，就会得到 `InitMemRef requires static shape` —— 与等价的 `@pl.program` 写法
 报出的错误完全相同）。
 
-真正无法解析的情况是：返回张量的 shape 特化器根本**触及不到** —— 例如目标 shape 非静态的
-`pl.reshape`（reshape 受源张量元素总数约束，因此不能用动态维度顶替），或者经过特化器未
-建模的操作重新绑定的结果。它会在**下一个**消费该张量的调用处报出
+`pl.reshape` 的目标维度也可以是张量维度别名的整数运算，例如先定义
+`rows = pl.tensor.dim(x, 0)`、`width = pl.tensor.dim(x, 1)`，再使用 `rows * width`。
+视图在 IR 中保留该表达式，消费者从实际描述符绑定动态维度；这种元数据传递并不证明
+任意 reshape 都保持了元素总数。
+
+真正无法解析的情况是：返回张量的 shape 特化器根本**触及不到** —— 例如用无关运行时标量
+（从另一个张量读取的值）决定尺寸的 `pl.reshape`，或者经过特化器未建模的操作重新绑定的
+结果。它会在**下一个**消费该张量的调用处报出
 `missing inferred tensor metadata for parameter '<name>'` —— 错误指向的是消费方，但要改的
 是生产方：让产生该张量的语句具有可静态推导的 shape，或者把缓冲区作为 `pl.Out[...]`
 参数传入。

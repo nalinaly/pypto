@@ -334,6 +334,58 @@ def bar_all(*, span: Span | None = None) -> Call:
     return _create_barrier_op("system.bar_all", span=span)
 
 
+def _local_signal_call(
+    name: str,
+    signal: Expr,
+    offsets: Sequence[int | Expr],
+    value: int | Expr,
+    span: Span | None,
+    *,
+    attributes: dict[str, int] | None = None,
+) -> Call:
+    actual_span = _get_span_or_capture(span)
+    if isinstance(value, int):
+        if not -(1 << 31) <= value < (1 << 31):
+            raise ValueError(f"{name} value is outside INT32: {value}")
+        value = ConstInt(value, DataType.INT32, actual_span)
+    return _ir_core.create_op_call(
+        name, [signal, _to_make_tuple(offsets, actual_span), value], attributes or {}, actual_span
+    )
+
+
+def signal_notify(
+    signal: Expr, offsets: Sequence[int | Expr], value: int | Expr, *, span: Span | None = None
+) -> Call:
+    """临时本地 GM 单写者通知，复用 TNOTIFY(Set)，只发布信号。
+
+    signal 必须为一维 INT32；每条信号 cacheline 独占且只有一个写者。
+    调用者负责 payload 完成、缓存发布和代际/溢出；通知不自动完成这些工作。
+    此接口用于显式 AIC/AIV 核体，不能推断自动 MIX 中应由哪条 lane 发布。
+    """
+    return _local_signal_call("system.signal_notify", signal, offsets, value, span)
+
+
+def signal_wait(
+    signal: Expr,
+    offsets: Sequence[int | Expr],
+    expected: int | Expr,
+    *,
+    backoff_ticks: int = 0,
+    span: Span | None = None,
+) -> Call:
+    """临时本地 GM 等待，复用 TWAIT(Ge)，不消费信号或建立全体 barrier。
+
+    signal 必须为一维 INT32；expected 为 INT32，消费者不得写信号所在 cacheline。
+    返回后仍须按业务数据的访问路径完成消费者缓存维护与内存顺序。
+    """
+    if type(backoff_ticks) is not int or not 0 <= backoff_ticks < (1 << 31):
+        raise ValueError(
+            f"backoff_ticks must be a compile-time integer in [0, INT32_MAX], got {backoff_ticks!r}"
+        )
+    attributes = {"backoff_ticks": backoff_ticks} if backoff_ticks else {}
+    return _local_signal_call("system.signal_wait", signal, offsets, expected, span, attributes=attributes)
+
+
 def fence(*, span: Span | None = None) -> Call:
     """Memory barrier over global memory.
 

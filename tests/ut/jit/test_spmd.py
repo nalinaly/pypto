@@ -25,6 +25,7 @@ import pypto.language as pl
 import pytest
 from pypto.jit.decorator import jit
 from pypto.pypto_core import ir
+from pypto.runtime import RunConfig
 
 # Module-level constants — the JIT specializer inlines module-level ints at
 # their use sites, but does NOT capture function-local closure variables.
@@ -33,6 +34,64 @@ _HIDDEN = 512
 _K_CHUNK = 128
 _HALF = _HIDDEN // 2  # columns of `hidden` handled by each SPMD block
 _CHUNKS = _HALF // _K_CHUNK  # pl.pipeline iterations per block
+
+
+def test_jit_inline_group_shared_inout_compiles_single_mix(tmp_path):
+    """Compile the actual JIT/cluster path, including post-call SSA aliases."""
+
+    @jit.incore
+    def cube(
+        a: pl.Tensor[[16, 16], pl.BF16],
+        b: pl.Tensor[[16, 16], pl.BF16],
+        c: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+    ):
+        left = pl.load(a, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+        right = pl.load(b, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+        c = pl.store(pl.matmul(left, right), [0, 0], c)
+        return c
+
+    @jit.incore
+    def vector(
+        c: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        x: pl.Tensor[[16, 16], pl.FP32],
+        y: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+    ):
+        value = pl.load(x, [0, 0], [16, 16])
+        y = pl.store(pl.add(value, value), [0, 0], y)
+        return c, y
+
+    @jit.inline
+    def group_wrapper(
+        a: pl.Tensor[[16, 16], pl.BF16],
+        b: pl.Tensor[[16, 16], pl.BF16],
+        c: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        x: pl.Tensor[[16, 16], pl.FP32],
+        y: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+    ):
+        with pl.cluster():
+            c = cube(a, b, c)
+            c, y = vector(c, x, y)
+        return c, y
+
+    @jit
+    def entry(
+        a: pl.Tensor[[16, 16], pl.BF16],
+        b: pl.Tensor[[16, 16], pl.BF16],
+        c: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        x: pl.Tensor[[16, 16], pl.FP32],
+        y: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+    ):
+        with pl.spmd(1, sync_start=True):
+            c, y = group_wrapper(a, b, c, x, y)
+        return c, y
+
+    compiled = entry.compile(
+        config=RunConfig(platform="a2a3", save_kernels=True, save_kernels_dir=str(tmp_path / "kernel"))
+    )
+    source = "\n".join(path.read_text() for path in (compiled.output_dir / "orchestration").glob("*.cpp"))
+    assert source.count("rt_submit_task(") == 1
+    assert "MixedKernels" in source
+    assert "set_require_sync_start(true)" in source
 
 
 def test_jit_spmd_for_loop():

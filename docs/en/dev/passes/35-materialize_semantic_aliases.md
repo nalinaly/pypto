@@ -52,6 +52,9 @@ its own fresh MemRef. This pass closes that gap:
    and its producer chain (following in-place `output-reuses-input` ops and
    view inputs). `IfStmt` return values are retargeted into both branch yields,
    then the collected type rewrites are applied.
+   The traversal also enters Scalar `WhileStmt` bodies, so nested `ForStmt`
+   carries retain the same alias rules. It does not retarget the `WhileStmt`
+   carry itself or move writes outside the loop.
 2. **Normalize peeled accumulator phis**: visit nested `IfStmt` nodes in
    post-order and recognize both direct in-place accumulator producers and
    branch-local loops carried by an accumulator seeded outside that branch.
@@ -67,8 +70,14 @@ its own fresh MemRef. This pass closes that gap:
 3. **Normalize semantic identity chains**
    (`NormalizeIdentityCopyBuffersMutator`): make bare SSA copies share their
    source allocation and make every registered in-place result share its reused
-   input allocation. This closes lowering-created type drift before any memory
-   planner observes lifetimes or PTOAS emits tile handles.
+   input allocation. Metadata views follow the current input in the same
+   forward traversal, including when an in-place result was just re-anchored.
+   Subviews retain their relative byte offset and window size; pipeline-slot
+   identity follows the input. A real data-moving `tile.transpose` still owns
+   separate storage. An unresolved `if` phi and its view/in-place alias chain
+   remain deferred until yield fixup chooses the phi storage. This closes
+   lowering-created type drift before any memory planner observes lifetimes or
+   PTOAS emits tile handles, without relaxing lifetime or pipeline constraints.
 
 The pass is a no-op when there is nothing to retarget (`Compute` returns no
 rewrites), and skips `Orchestration` functions (no TileType variables).

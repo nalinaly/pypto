@@ -445,10 +445,8 @@ static TypePtr DeduceTileGatherCompareType(const std::vector<ExprPtr>& args,
   std::vector<ExprPtr> dst_shape = {rows_expr, out_cols_expr};
   auto dst_type = std::make_shared<TileType>(dst_shape, DataType::INT32, std::nullopt, dst_view);
 
-  // cdst is shaped as [1, rows] (one count per src-row, laid out as a single
-  // row of `rows` int32s) — required by the PTOAS pto.tgather verifier
-  // (cdst must use row_major blayout) AND the PTO TileConfig 32-byte
-  // alignment static_assert (row_major + cols*sizeof(int) % 32 == 0).
+  // 每个源行产生一个连续计数；逻辑有效列数不变，物理列数必须覆盖完整
+  // 32B UB 单位。特别是单行源只能写一个计数，但不能分配 4B 的 Tile。
   // The compare-form ISA writes `cdstPtr + i` for i in [0, srcValidRow),
   // so the rows-many counts must be physically contiguous, which the
   // [1, rows] row_major layout provides.
@@ -456,7 +454,22 @@ static TypePtr DeduceTileGatherCompareType(const std::vector<ExprPtr>& args,
   TileView cdst_view;
   cdst_view.valid_shape = {one_expr, rows_expr};
   cdst_view.blayout = TileLayout::row_major;
-  std::vector<ExprPtr> cdst_shape = {one_expr, rows_expr};
+  constexpr int64_t kCountElementsPerUbBlock = 8;  // INT32/UINT32 均为 4B。
+  auto alignment = std::make_shared<ConstInt>(
+      kCountElementsPerUbBlock, DataType::INDEX, rows_expr->span_);
+  ExprPtr count_capacity;
+  if (auto rows_const = As<ConstInt>(rows_expr)) {
+    const int64_t rounded = ((rows_const->value_ + kCountElementsPerUbBlock - 1) /
+                             kCountElementsPerUbBlock) * kCountElementsPerUbBlock;
+    count_capacity = std::make_shared<ConstInt>(rounded, DataType::INDEX, rows_expr->span_);
+  } else {
+    auto padding = std::make_shared<ConstInt>(
+        kCountElementsPerUbBlock - 1, DataType::INDEX, rows_expr->span_);
+    count_capacity = MakeMul(
+        MakeFloorDiv(MakeAdd(rows_expr, padding, rows_expr->span_), alignment, rows_expr->span_),
+        alignment, rows_expr->span_);
+  }
+  std::vector<ExprPtr> cdst_shape = {one_expr, count_capacity};
   auto cdst_type = std::make_shared<TileType>(cdst_shape, count_dtype, std::nullopt, cdst_view);
 
   std::vector<TypePtr> elements{dst_type, cdst_type};

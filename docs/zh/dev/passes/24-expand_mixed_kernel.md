@@ -32,6 +32,13 @@ active lane 共用同一份 `CoreTaskArgs` payload。因此，两个已编译 ke
 或 `Submit`，使其转发完整参数列表。未使用的参数仍是合法的 wrapper 参数；克隆后的
 函数体依旧只引用原调用实际使用的值。
 
+`InOut` 返回值可以重新绑定后传给下一个成员，例如
+`sink = cube(sink); sink = vec(sink)`。返回值是同一个完整 GM 参数的 SSA 别名。
+克隆前，Pass 会沿写回关系追踪成员参数（包括 tuple 返回值和 `Submit`），
+将这些别名绑定到 adapter 中对应的新参数；`pl.no_dep` 覆盖位置也沿同一映射更新。
+Tensor view 和新分配的缓冲不属于完整参数别名，应在 Group 外绑定后作为显式
+Group 参数传入。
+
 当两个成员 kernel 都只属于该 Group 时，保留其原函数名。如果任一 kernel 还有其他
 调用点，Pass 会生成一对 Group 私有 adapter，并把
 `import_peer_buffer(peer_func=...)` 改写为 adapter 的 peer 名称，从而为其他调用者保留
