@@ -600,7 +600,7 @@ def _move_to_shared_storage_program(
 
 def _shared_storage_move_pto(program: _ir.Program) -> str:
     reset_for_testing()
-    set_backend_type(BackendType.Ascend910)
+    set_backend_type(BackendType.Ascend910B)
     return codegen.PTOCodegen().generate(program, emit_tile_addr=False)
 
 

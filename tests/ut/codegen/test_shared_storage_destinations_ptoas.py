@@ -27,7 +27,7 @@ _PACKED_FP4 = getattr(pl, "FP4E2M1X2", None)
 def _generate(
     program: ir.Program,
     *,
-    backend_type=BackendType.Ascend910,
+    backend_type=BackendType.Ascend910B,
     emit_tile_addr: bool = False,
 ) -> str:
     reset_for_testing()

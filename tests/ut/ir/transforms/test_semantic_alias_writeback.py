@@ -183,12 +183,13 @@ def _writeback_call(
         destination = tensor("destination", [16, 32])
         args = [destination, ir.ConstInt(8, DataType.INDEX, span), ir.ConstInt(32, DataType.INDEX, span)]
 
-    if kind == "gather":
-        kwargs["transpose"] = False
-    if kind == "gemv":
-        kwargs["acc_phase"] = int(ir.AccPhase.Unspecified)
-    if kind == "scatter_update":
-        kwargs["dim"] = -2
+    kwargs.update(
+        {
+            "gather": {"transpose": False},
+            "gemv": {"acc_phase": int(ir.AccPhase.Unspecified)},
+            "scatter_update": {"dim": -2},
+        }.get(kind, {})
+    )
     call = ir.create_op_call(op_name, args, kwargs, span)
     destination_type = destination.type
     assert isinstance(destination_type, ir.ShapedType) and destination_type.memref is not None

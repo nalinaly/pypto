@@ -376,7 +376,7 @@ def test_ptoas_loop_carry_is_in_place_single_handle():
 def test_ptoas_conditional_gather_phis_share_the_written_mat_window():
     """The second update and transpose must observe the first phi's repaired storage."""
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910)
+    backend.set_backend_type(BackendType.Ascend910B)
     with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS, enable_buffer_ir=False):
         initialized = passes.init_mem_ref()(passes.convert_to_ssa()(ConditionalGather))
         after = passes.materialize_semantic_aliases()(initialized)
@@ -742,7 +742,7 @@ def test_ptoas_repaired_mat_phi_preserves_partial_view_and_gather_storage():
     )
     before = ir.Program([function], "Before", span)
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910)
+    backend.set_backend_type(BackendType.Ascend910B)
     with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS, enable_buffer_ir=False):
         after = passes.materialize_semantic_aliases()(before)
     phis, tiles = _collect_tile_phi_storage(after)
@@ -978,7 +978,7 @@ def test_ptoas_if_alias_fixup_only_coalesces_same_tile_window(memory_space, diff
     )
     before = ir.Program([function], "Before", span)
     backend.reset_for_testing()
-    backend.set_backend_type(BackendType.Ascend910)
+    backend.set_backend_type(BackendType.Ascend910B)
     with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS, enable_buffer_ir=False):
         after = passes.materialize_semantic_aliases()(before)
 
