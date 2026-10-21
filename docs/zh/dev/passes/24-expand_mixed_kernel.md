@@ -32,12 +32,23 @@ active lane 共用同一份 `CoreTaskArgs` payload。因此，两个已编译 ke
 或 `Submit`，使其转发完整参数列表。未使用的参数仍是合法的 wrapper 参数；克隆后的
 函数体依旧只引用原调用实际使用的值。
 
-`InOut` 返回值可以重新绑定后传给下一个成员，例如
-`sink = cube(sink); sink = vec(sink)`。返回值是同一个完整 GM 参数的 SSA 别名。
-克隆前，Pass 会沿写回关系追踪成员参数（包括 tuple 返回值和 `Submit`），
-将这些别名绑定到 adapter 中对应的新参数；`pl.no_dep` 覆盖位置也沿同一映射更新。
-Tensor view 和新分配的缓冲不属于完整参数别名，应在 Group 外绑定后作为显式
-Group 参数传入。
+本 Pass 首先保存 producer 每个返回位置及其所属函数中的 SSA 表达式、类型和可选
+输出形参绑定。`GroupOutputBindings` 沿 consumer 实参的 SSA 别名和 tuple 投影，
+确定它对应哪个 producer 调用的哪个输出，再解析调用点实际传入的存储，将其绑定到
+统一的 Group 形参。producer 局部的 SSA 变量不会直接复制到 consumer 函数体。
+
+新计算的 Tensor 结果已由
+[`ConvertTensorToTileOps`](11-convert_tensor_to_tile_ops.md) 转为显式 `Out` 形参
+和 store。该 Pass 将内部输出存储提升为 Group 形参，由外层调用者分配，即使 Group
+不返回它也可以传递。已有完整参数的写回复用原存储。这同样覆盖 `Call`/`Submit`
+的乱序 tuple 返回、直接传入的 `pair[i]`，以及局部 tuple 别名或嵌套 tuple 投影。
+`pl.no_dep` 使用相同映射，同时考虑 Submit 的省略输出区间和尾部通信 context。
+被调函数的摘要只在一次归一化过程中共享，结束后释放。view 和 slice 不作为完整参数
+别名；没有调用者可见输出载体的结果会明确报错，避免生成自由变量（free variable）。
+按现有 kernel 返回约定，设备计算的标量结果需要显式 Tensor 输出。
+
+该绑定过程不会插入跨核握手。手写 Group 成员并发执行，仍需由原有同步协议保证
+producer 的 store 先于 consumer 的 load。
 
 当两个成员 kernel 都只属于该 Group 时，保留其原函数名。如果任一 kernel 还有其他
 调用点，Pass 会生成一对 Group 私有 adapter，并把
