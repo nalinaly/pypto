@@ -36,14 +36,14 @@ program_inlined = inline_pass(program)
 3. **Iterate to fixpoint** — each iteration walks every function (including the Inline ones, so that nested Inline-calls-Inline expands transitively):
    - For every top-level `LHS = inline_call(args)` or `EvalStmt(inline_call(args))` in a function body:
      - Build the param-substitution map (formal `Var` → actual `Expr`).
-     - Alpha-rename every locally-bound `Var` in the inlined body to a fresh name (`<orig>_inline<counter>`, with any trailing `_` trimmed off `<orig>`) to avoid collisions across multiple call sites.
+     - Alpha-rename every locally-bound `Var` in the inlined body to a fresh name (see naming rules below) to avoid collisions across multiple call sites.
      - Splice the renamed-and-substituted body's statements before the call site.
      - Wire up the callee's trailing return value according to the call-site form: `LHS = renamed_return` (single-return assign; omitted when `LHS` resolves to the same `Var` as the substituted value, to avoid a redundant SSA copy), per-element `TupleGetItemExpr` substitution instead of a `MakeTuple` binding (multi-return assign), a fresh `ReturnStmt` (`return inline_call(...)`), or a fresh `EvalStmt` when the value is discarded but its evaluation is observable (`EvalStmt` call site — see [Edge cases](#edge-cases)).
 4. **Drop** all Inline functions from the program.
 
-The pass uses a single underscore (`_inline`) in the rename suffix because `__` is reserved by the IR's auto-naming convention (see `auto_name_utils.h`).
+For names with a parsed auto-name role or version, `FreshName` inserts `inline<counter>` through `auto_name::AddQualifier`: `t__inline_arg_v0` becomes `t__inline7_inline_arg_v0`. This preserves the terminal role/version for `ConvertToSSA` through repeated inlining. Other names use a single-underscore (`_inline`) suffix because `__` is reserved by the IR's auto-naming convention (see `auto_name_utils.h`).
 
-A single-underscore suffix is not sufficient on its own: `<orig>` may itself end in `_` — `_` is Python's throwaway name and the documented loop variable of `for _ in pl.split_aiv(...)` — and plain concatenation would then fuse two individually-legal underscores into the reserved delimiter. `FreshName` therefore joins through `auto_name::JoinNameSuffix`, which trims that tail: `_` renames to `_inline7`, not `__inline7`. A `<orig>` that *already* contains `__` is passed through unchanged, so an author-written `a__b` stays the user-facing error `ValidateBaseName` reports rather than being silently normalized.
+A single-underscore suffix is not sufficient on its own: `<orig>` may itself end in `_` — `_` is Python's throwaway name and the documented loop variable of `for _ in pl.split_aiv(...)` — and plain concatenation would then fuse two individually-legal underscores into the reserved delimiter. For these names, `FreshName` joins through `auto_name::JoinNameSuffix`, which trims that tail: `_` renames to `_inline7`, not `__inline7`. An unrecognized name containing `__`, such as an author-written `a__b`, stays invalid for `ValidateBaseName` to report rather than being silently normalized.
 
 ## Example
 
