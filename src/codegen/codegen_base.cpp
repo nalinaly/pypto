@@ -94,6 +94,23 @@ std::string CodegenBase::GenerateExprString(const ir::ExprPtr& expr) const {
   if (auto ge = As<Ge>(expr)) {
     return "(" + GenerateExprString(ge->left_) + " >= " + GenerateExprString(ge->right_) + ")";
   }
+  // IR logical operators evaluate both operands. Normalize to bool before
+  // applying bitwise operators so C++ preserves eager evaluation and truth values.
+  if (auto logical_and = As<And>(expr)) {
+    return "static_cast<bool>(static_cast<bool>(" + GenerateExprString(logical_and->left_) +
+           ") & static_cast<bool>(" + GenerateExprString(logical_and->right_) + "))";
+  }
+  if (auto logical_or = As<Or>(expr)) {
+    return "static_cast<bool>(static_cast<bool>(" + GenerateExprString(logical_or->left_) +
+           ") | static_cast<bool>(" + GenerateExprString(logical_or->right_) + "))";
+  }
+  if (auto logical_xor = As<Xor>(expr)) {
+    return "(static_cast<bool>(" + GenerateExprString(logical_xor->left_) + ") != static_cast<bool>(" +
+           GenerateExprString(logical_xor->right_) + "))";
+  }
+  if (auto logical_not = As<Not>(expr)) {
+    return "(!" + GenerateExprString(logical_not->operand_) + ")";
+  }
   if (auto const_float = As<ConstFloat>(expr)) {
     return std::to_string(const_float->value_);
   }

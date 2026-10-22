@@ -9,7 +9,10 @@
 
 """Unit tests for orchestration code generation (core cases, part 2)."""
 
+import os
 import re
+import shutil
+import subprocess
 
 import pypto.language as pl
 import pytest
@@ -28,6 +31,126 @@ from pypto.pypto_core import DataType, ir
 
 class TestOrchestrationMore:
     """Orchestration codegen — additional core cases (continued)."""
+
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
+    def test_runtime_scalar_or_in_orchestration_if(self, backend_type):
+        """Issue #2984: a runtime OR must generate both orchestration task paths."""
+        backend.reset_for_testing()
+        backend.set_backend_type(backend_type)
+
+        @pl.program
+        class RuntimeOrProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def copy(
+                self,
+                output: pl.InOut[pl.Tensor[[1, 16], pl.BF16]],
+            ) -> pl.Tensor[[1, 16], pl.BF16]:
+                value = pl.load(output, [0, 0], [1, 16])
+                return pl.store(value, [0, 0], output)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                output: pl.InOut[pl.Tensor[[1, 16], pl.BF16]],
+                active: pl.Scalar[pl.INT32],
+                cache_rows: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[1, 16], pl.BF16]:
+                if active < 32 or cache_rows > active * 128:
+                    output = self.copy(output)
+                else:
+                    output = self.copy(output)
+                return output
+
+        code = _generate_orch_code(RuntimeOrProgram)
+        assert "orch_args.scalar<int32_t>(0)" in code
+        assert "orch_args.scalar<int32_t>(1)" in code
+        assert "if (" in code
+        assert code.count("rt_submit_aiv_task(") == 2
+
+    @pytest.mark.parametrize("operator", ["and", "or", "xor", "not", "nested"])
+    def test_logical_scalar_cpp_semantics(self, operator, tmp_path):
+        """Generated expressions have bool type, correct truth values, and eager operands."""
+        candidates = (os.environ.get("CXX"), "c++", "g++", "clang++")
+        compiler = next(
+            (found for name in candidates if name and (found := shutil.which(name))),
+            None,
+        )
+        if compiler is None:
+            pytest.skip("no C++ compiler available")
+
+        span = ir.Span.unknown()
+        ib = IRBuilder()
+        with ib.function("logical_scalar", type=ir.FunctionType.Orchestration) as function:
+            lhs = function.param("lhs", ir.ScalarType(DataType.INT32))
+            rhs = function.param("rhs", ir.ScalarType(DataType.INT32))
+            zero = ir.ConstInt(0, DataType.INT32, span)
+            left = ir.ne(lhs, zero)
+            right = ir.ne(rhs, zero)
+            expressions = {
+                "and": ir.and_(left, right),
+                "or": ir.or_(left, right),
+                "xor": ir.Xor(left, right, DataType.BOOL, span),
+                "not": ir.not_(left),
+                "nested": ir.or_(ir.and_(left, right), ir.not_(left)),
+            }
+            predicate = ib.let("predicate", expressions[operator])
+            function.return_type(ir.ScalarType(DataType.BOOL))
+            ib.return_stmt(predicate)
+        program = ir.Program([function.get_result()], "logical_scalar", span)
+        # Hand-built Xor IR is not round-trippable through the Python printer.
+        with passes.PassContext([]):
+            code = _generate_orch_code(program)
+        assignment = re.search(r"\bbool predicate = (.+);", code)
+        assert assignment is not None, code
+        expression = assignment[1]
+
+        expected = {
+            "and": "(lhs_value != 0) && (rhs_value != 0)",
+            "or": "(lhs_value != 0) || (rhs_value != 0)",
+            "xor": "(lhs_value != 0) != (rhs_value != 0)",
+            "not": "lhs_value == 0",
+            "nested": "((lhs_value != 0) && (rhs_value != 0)) || (lhs_value == 0)",
+        }[operator]
+        source = f"""
+#include <cassert>
+#include <cstdint>
+#include <type_traits>
+
+struct CountingScalar {{
+    int32_t value;
+    int* reads;
+    operator int32_t() const {{ ++*reads; return value; }}
+}};
+
+int main() {{
+    const int32_t values[] = {{-2, 0, 3}};
+    for (int32_t lhs_value : values) {{
+        for (int32_t rhs_value : values) {{
+            int lhs_reads = 0;
+            int rhs_reads = 0;
+            const CountingScalar lhs{{lhs_value, &lhs_reads}};
+            const CountingScalar rhs{{rhs_value, &rhs_reads}};
+            static_assert(std::is_same_v<decltype({expression}), bool>);
+            const bool actual = {expression};
+            assert(actual == ({expected}));
+            assert(lhs_reads == {2 if operator == "nested" else 1});
+            assert(rhs_reads == {0 if operator == "not" else 1});
+        }}
+    }}
+}}
+"""
+        executable = tmp_path / "logical_scalar"
+        compiled = subprocess.run(
+            [compiler, "-std=c++17", "-x", "c++", "-", "-o", str(executable)],
+            input=source,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert compiled.returncode == 0, compiled.stderr
+        executed = subprocess.run([str(executable)], capture_output=True, text=True, timeout=30, check=False)
+        assert executed.returncode == 0, executed.stderr
 
     def test_fp4_runtime_shapes_use_x2_carrier_only_at_abi_boundary(self):
         backend.reset_for_testing()
