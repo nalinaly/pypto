@@ -382,7 +382,7 @@ def test_hand_written_group_members_share_canonical_abi():
         assert [arg.name_hint for arg in call.args] == expected_names
 
 
-def test_hand_written_group_rebinds_shared_inout_results():
+def test_hand_written_group_rebinds_shared_inout_results_basic():
     """A preceding member's writeback must bind to a parameter in the next member."""
 
     @pl.program
@@ -2701,6 +2701,50 @@ def test_nested_yield_of_a_cross_core_result_is_not_rewritten():
     assert yielded.unique_id in defined_ids, (
         f"yield operand '{yielded.name_hint}' is not defined in the loop body"
     )
+
+
+def test_group_adapter_rebinds_member_tensor_dimensions():
+    """The Group ABI must retype local aliases and returns, not just parameters (#3138)."""
+    member_dim = pl.dynamic("MEMBER_EXTENT")
+    group_dim = pl.dynamic("GROUP_EXTENT")
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube(self, sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]]) -> pl.Tensor[[16, 16], pl.FP32]:
+            return sink
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vector(
+            self,
+            work: pl.InOut[pl.Tensor[[8, member_dim], pl.FP32]],
+            out: pl.Out[pl.Tensor[[1], pl.FP32]],
+        ) -> tuple[pl.Tensor[[8, member_dim], pl.FP32], pl.Tensor[[1], pl.FP32]]:
+            saved = work
+            value = pl.read(saved, [1, 0])
+            pl.write(out, [0], value)
+            return saved, out
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed(
+            self,
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            work: pl.InOut[pl.Tensor[[8, group_dim], pl.FP32]],
+            out: pl.Out[pl.Tensor[[1], pl.FP32]],
+        ) -> tuple[pl.Tensor[[8, group_dim], pl.FP32], pl.Tensor[[1], pl.FP32]]:
+            self.cube(sink)
+            work, out = self.vector(work, out)
+            return work, out
+
+    after = _run_pipeline(Program)
+    vector = after.get_function("vector")
+    assert vector is not None
+    expected_type = vector.params[1].type
+    ir.assert_structural_equal(vector.return_types[0], expected_type)
+    aliases = [stmt for stmt in ir.flatten_to_stmts(vector.body) if isinstance(stmt, ir.AssignStmt)]
+    saved = next(stmt for stmt in aliases if stmt.var.name_hint.startswith("saved"))
+    ir.assert_structural_equal(saved.var.type, expected_type)
+    assert "MEMBER_EXTENT" not in vector.as_python()
 
 
 if __name__ == "__main__":

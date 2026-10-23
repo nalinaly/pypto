@@ -21,6 +21,12 @@
 
 ### 手写 Group 的共享参数 ABI
 
+规范化还会把成员 Tensor 类型中的维度绑定到 Group 实际参数类型。例如成员的
+`Tensor[8, N]` 接收 Group 的 `Tensor[8, M]` 时，克隆后的局部别名、循环携带值
+和返回类型也必须使用 `M`。只替换形参 Var 会留下未绑定的 `N`，导致后续标量
+地址或 stride 无法生成。adapter 在克隆函数体前复用 `DeduceCallTypeBindings`
+建立这些类型映射。
+
 一次运行时 `MixedKernels` 提交会创建一个协同调度的 AIC/AIV task，其中所有
 active lane 共用同一份 `CoreTaskArgs` payload。因此，两个已编译 kernel wrapper
 必须按完全相同的 tensors-first 参数布局解包。由 mixed-kernel 拆分器生成的 Group

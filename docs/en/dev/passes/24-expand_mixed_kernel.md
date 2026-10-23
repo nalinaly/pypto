@@ -34,6 +34,13 @@ members to that Group signature and rewrites both inner `Call` or `Submit` nodes
 to forward the complete list. Unused parameters remain valid wrapper arguments;
 each cloned body still references only the values from its original call.
 
+Normalization also binds dimensions in each member's Tensor types to the actual
+Group argument types. For example, a member's `Tensor[8, N]` passed a Group
+`Tensor[8, M]` must use `M` in cloned local aliases, loop-carried types, and return
+types. Replacing only the parameter Var leaves an unbound `N` when codegen later
+materializes a scalar address or stride. The adapter uses the shared
+`DeduceCallTypeBindings` rules before cloning its body.
+
 The pass first records every producer return position, its callee-scoped SSA
 expression, type, and optional output-parameter binding. `GroupOutputBindings`
 then follows the consumer's SSA aliases and tuple projections to a particular

@@ -60,6 +60,7 @@
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/transforms/utils/wrapper_call_utils.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 
 namespace pypto {
 namespace ir {
@@ -2790,7 +2791,8 @@ FunctionPtr BuildGroupAbiAdapter(const FunctionPtr& group, const WrapperCallInfo
 
   // Bind every original member parameter to the corresponding Group call-site
   // expression, rewritten onto the adapter's fresh canonical parameters.
-  std::unordered_map<const Var*, ExprPtr> member_to_adapter;
+  std::vector<ExprPtr> adapter_args;
+  adapter_args.reserve(callee->params_.size());
   for (size_t i = 0; i < callee->params_.size(); ++i) {
     auto argument = substitute_arg.VisitExpr(call->args_[i]);
     var_collectors::VarDefUseCollector uses;
@@ -2809,7 +2811,14 @@ FunctionPtr BuildGroupAbiAdapter(const FunctionPtr& group, const WrapperCallInfo
                                      << "' argument " << i << ": Group-local value '" << var->name_hint_
                                      << "' has no output or parameter binding";
     }
-    member_to_adapter.emplace(callee->params_[i].get(), std::move(argument));
+    adapter_args.push_back(std::move(argument));
+  }
+  // The canonical Group ABI can use different physical extent symbols from
+  // the member signature. Rebind dimensions as well as parameter values so
+  // cloned aliases, loop-carried tensors and returns retain usable types.
+  auto member_to_adapter = DeduceCallTypeBindings(callee->params_, adapter_args);
+  for (size_t i = 0; i < callee->params_.size(); ++i) {
+    member_to_adapter[callee->params_[i].get()] = adapter_args[i];
   }
   auto cloned = DeepClone(callee->body_, member_to_adapter);
   StmtPtr adapter_body = cloned.cloned_body;
